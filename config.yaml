@@ -1,0 +1,209 @@
+# =============================================================================
+# FastVideoEdit — main configuration
+# Everything runs locally. Edit freely; every value has a sensible default,
+# and any key you omit falls back to the built-in default.
+# =============================================================================
+
+language: ru
+
+paths:
+  out_dir: ./out          # final deliverables (mp4, srt, vtt, chapters.txt)
+  cache_dir: ./cache      # transcription cache (keyed by input file hash)
+  work_dir: ./work        # temporary intermediates (extracted audio, censored audio)
+
+# --- ffmpeg / ffprobe --------------------------------------------------------
+ffmpeg:
+  ffmpeg_bin: ffmpeg      # name on PATH, or an absolute path
+  ffprobe_bin: ffprobe
+
+# --- Stage 2: transcription (faster-whisper) ---------------------------------
+transcribe:
+  model: large-v3         # large-v3 | large-v3-turbo | medium | small | ...
+  compute_type: int8_float16   # good fit for 8 GB VRAM
+  device: cuda            # cuda | cpu  (auto-falls back to cpu if cuda fails)
+  beam_size: 5
+  language: ru
+  vad_filter: true        # Silero VAD: drop non-speech before decoding
+  vad_min_silence_ms: 500
+  fallback_models: [medium, small]   # tried in order on CUDA OOM
+  cache: true             # reuse transcript for an unchanged input file
+
+# --- Stage 3a: pauses / dead air --------------------------------------------
+pauses:
+  enabled: true
+  min_silence: 0.6        # remove silent gaps longer than this (seconds)
+  pad_start: 0.15         # keep this much audio AFTER the previous word
+  pad_end: 0.15           # keep this much audio BEFORE the next word
+  min_keep: 0.05          # never create a cut shorter than this (after padding)
+
+# --- Stage 3b: filler words (see fillers_ru.yaml) ---------------------------
+fillers:
+  enabled: true
+  pad: 0.04               # tiny padding around a removed filler word (seconds)
+
+# --- Stage 3c: profanity (see profanity_ru.yaml) ----------------------------
+profanity:
+  enabled: true
+  action: censor          # censor | remove
+
+# --- Stage 4: profanity censoring (audio) -----------------------------------
+censor:
+  method: partial         # partial | pitch | lowpass | reverse
+  partial:                # default: audible onset + muted vocalic middle
+    onset: 0.09           # seconds of word start left audible
+    mute_fraction: 0.6    # fraction of the word duration to mute
+    keep_tail: true       # also leave the end audible (else mute to word end)
+    fade: 0.008           # boundary ramp seconds (avoids clicks)
+  pitch:
+    semitones: 6          # shift the segment up by this many semitones
+    use_rubberband: auto  # auto | true | false (auto = use it if available)
+  lowpass:
+    cutoff: 500           # Hz — lower = more muffled ("underwater")
+    poles: 2
+  reverse:
+    fade: 0.005           # splice ramp seconds
+
+# --- Stage 3d: bad takes (local LLM) ----------------------------------------
+bad_takes:
+  enabled: true           # needs the LLM; skipped with a notice if unavailable
+  default_enabled: false  # suggestions start UNCHECKED in the cut list
+
+# --- Stage 3e: акустические «заминки» (Silero VAD по 16 кГц wav) -------------
+# Ловит огрехи речи, которые ПРОПУСКАЮТ текстовые детекторы: растянутые «э-э-э/
+# м-м», микро-обрывы, бормотание и короткие НЕречевые провалы МЕЖДУ словами,
+# которые короче порога детектора пауз (pauses.min_silence). Помечаются только
+# провалы в [min_duration, max_duration); затем подрезаются внутрь и дедупятся
+# по доле перекрытия с уже найденными вырезами.
+# Совет: держите max_duration <= pauses.min_silence, чтобы не дублировать паузу.
+# hesitations:
+#   enabled: true
+#   min_duration: 0.08      # мин. длина неречевого провала для пометки (с)
+#   max_duration: 0.55      # верхняя граница (выше — это пауза, владеет детектор пауз)
+#   pad_start: 0.04         # сколько съесть с ПЕРЕДНЕГО края провала (с)
+#   pad_end: 0.04           # сколько съесть с ЗАДНЕГО края провала (с)
+#   overlap_threshold: 0.5  # дедуп: отбросить, если эта доля перекрывает существующий вырез
+#   vad_threshold: 0.35     # порог активации Silero (ниже — чувствительнее)
+#   vad_min_speech_ms: 100  # Silero min_speech_duration_ms
+#   vad_min_silence_ms: 30  # Silero min_silence_duration_ms (зернистость провалов)
+
+# --- Stage 6: render --------------------------------------------------------
+render:
+  encoder: nvenc          # nvenc | x264 (auto-falls back to x264 if no NVENC)
+  nvenc:
+    preset: p7            # p1 (fast) .. p7 (best)
+    tune: hq
+    rc: constqp           # constqp | vbr
+    qp: 19                # used when rc=constqp
+    cq: 19                # used when rc=vbr
+  x264:
+    crf: 17               # visually ~lossless for talking-head
+    preset: slow
+  audio_bitrate: 320k
+  faststart: true         # move moov atom to front for web/YouTube
+  # Вертикальный (9:16) клип под Shorts с авто-кадром лица. Когда enabled,
+  # рендер вырезает из горизонтального исходника колонку размера target
+  # (по умолчанию 1080x1920 = 9:16) и масштабирует ровно в этот размер.
+  # vertical:
+  #   enabled: false
+  #   target: "1080x1920"   # ШxВ выходного кадра
+  #   center: "auto"        # "auto" (детект X-центра лица) | "0.0".."1.0" (доля)
+  #   samples: 12           # кадров для авто-детекции лица
+  # Шумоподавление / улучшение речи ПОСЛЕ цензуры. По умолчанию ВЫКЛ: звук —
+  # необратимый выход рендера, а пере-агрессивный afftdn «металлизирует» голос,
+  # слишком высокий highpass_hz истончает низкий мужской голос. Включайте
+  # осознанно и проверяйте на своём материале.
+  # denoise:
+  #   enabled: false
+  #   highpass_hz: 80       # срез гула/рокота ниже этой частоты (0 = пропустить)
+  #   nf: -25.0             # шумовой порог afftdn в дБ (отриц.; -30 = сильнее/риск артефактов)
+  #   normalize: false      # добавить мягкую нормализацию громкости (dynaudnorm) после afftdn
+  #   deess: false          # мастеринг: мягкий де-эссер (свистящие «с»/«ш»); работает и без enabled
+  #   loudnorm: false       # мастеринг: loudnorm под YouTube (I=-14, TP=-1.5, LRA=11)
+  #                         # + aresample=48000 после него; работает и без enabled.
+  #   loudnorm_mode: dynamic # "dynamic" — однопроходный (как раньше, по умолчанию);
+  #                         # "2pass" — точный: быстрый измерительный пасс по ГОТОВОЙ
+  #                         # дорожке (резы+цензура+денойз+де-эссер), затем linear-
+  #                         # нормализация с measured_*-значениями. Если измерение
+  #                         # сорвалось — честный лог и фолбэк на dynamic (рендер
+  #                         # не падает). Имеет смысл только при loudnorm: true.
+  #   engine: afftdn        # "afftdn" — нативный ffmpeg (как раньше, по умолчанию);
+  #                         # "deepfilter" — нейроденойз DeepFilterNet 3 (CLI, CPU):
+  #                         # звук извлекается в 48кГц МОНО wav (для говорящей головы
+  #                         # — ок), чистится внешним exe и подставляется в граф;
+  #                         # highpass/afftdn/dynaudnorm при этом пропускаются
+  #                         # (deess/loudnorm работают как обычно). Нет exe / он
+  #                         # упал — честный лог и фолбэк на afftdn (рендер не падает).
+  #   deepfilter_bin: tools/deep-filter.exe  # путь к CLI: абсолютный, от корня репо
+  #                         # или имя на PATH (релиз v0.5.6, ~26 МБ,
+  #                         # github.com/Rikorose/DeepFilterNet)
+  #   post_filter: true     # --pf: чуть сильнее давит остаточный шум между словами
+
+# --- Stage 7: subtitles -----------------------------------------------------
+subtitles:
+  enabled: true
+  max_cps: 17             # Russian adult reading speed (chars/second)
+  max_line_chars: 42
+  max_lines: 2
+  min_dur: 1.0
+  max_dur: 6.0
+  min_gap: 0.05           # minimum gap forced between consecutive cues
+  new_cue_gap: 0.7        # a speech gap larger than this always starts a new cue
+  write_vtt: true
+  write_transcript: true  # also emit a plain transcript.txt (masked)
+  # Вшитые (burn-in, ASS/libass) субтитры. Цвета в ASS-нотации &HAABBGGRR
+  # (альфа-синий-зелёный-красный, AA=00 = непрозрачный). position → ASS
+  # Alignment (bottom=2, top=8, center=5). size/outline/shadow/margin_v —
+  # в пикселях PlayRes (= разрешение выхода).
+  # burn:
+  #   enabled: false
+  #   font: Arial
+  #   size: 52
+  #   primary_color: "&H00FFFFFF"   # &HAABBGGRR — белый, непрозрачный
+  #   outline_color: "&H00000000"   # чёрная обводка
+  #   karaoke_color: "&H0000FFFF"   # жёлтая подсветка для караоке-слов (\k)
+  #   outline: 2.0
+  #   shadow: 1.0
+  #   position: bottom              # bottom | top | center
+  #   karaoke: true                 # пословная подсветка
+  #   margin_v: 40                  # вертикальный отступ в пикселях PlayRes
+
+# How profanity is MASKED in subtitle / transcript TEXT (e.g. б***ь).
+masking:
+  keep_first: 1           # leading letters kept
+  keep_last: 1            # trailing letters kept (0 disables)
+  mask_char: "*"
+  min_stars: 2            # at least this many mask chars
+
+# --- Local LLM (bad takes + chapters) ---------------------------------------
+llm:
+  enabled: true
+  backend: ollama         # ollama | llama_server
+  model: qwen3:8b         # лучший баланс надёжность/качество (A/B 2026-06:
+                          # qwen3.5:9b — главы/метаданные лучше, но JSON хрупче
+                          # и медленнее; MoE быстрее ×4, но ошибки в фактах)
+  host: http://localhost:11434
+  temperature: 0
+  num_ctx: 16384          # bigger context so long videos don't truncate
+  timeout: 600            # seconds
+  max_segments_per_call: 80   # split long transcripts into windows of this size
+  segment_overlap: 5          # overlap between windows (catches boundary takes)
+  think: false            # qwen3 <think> wastes the budget on structured calls
+  # Ollama keep_alive: сколько секунд модель остаётся в VRAM после вызова.
+  # 0 = выгружать сразу, чтобы не делить 8 ГБ карты с Whisper. -1 = держать.
+  # keep_alive: 0
+
+# --- Stage 8: chapters ------------------------------------------------------
+chapters:
+  enabled: true           # uses the LLM; has a non-LLM fallback
+  min_chapters: 3         # YouTube requires >= 3
+  min_length: 10          # YouTube requires each chapter >= 10 s
+  max_chapters: 30
+
+# --- Авто-метаданные YouTube (локальный LLM) --------------------------------
+# Черновик заголовка/описания/тегов/хука по финальному транскрипту → metadata.txt
+# (можно скопировать из веб-редактора). Использует LLM; без него стадия пропускается.
+# metadata:
+#   enabled: true
+#   max_title_chars: 100  # лимит длины заголовка (YouTube ~100)
+#   n_tags: 15            # сколько тегов сгенерировать
+#   max_hook_chars: 200   # лимит длины «хука» (первые строки описания)

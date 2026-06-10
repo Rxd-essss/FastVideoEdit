@@ -1,0 +1,42 @@
+# FastVideoEdit — local YouTube video pipeline
+# Python 3.12 recommended. Everything below runs locally; nothing is sent to the cloud.
+
+# --- Transcription (GPU via CUDA, CPU fallback) ---
+faster-whisper>=1.2,<2
+ctranslate2>=4.0,<5            # inference backend for faster-whisper
+
+# Windows CUDA 12 runtime libraries needed by CTranslate2 (cuBLAS + cuDNN 9).
+# No full CUDA Toolkit required; your NVIDIA driver supplies the rest.
+# Harmless on a CPU-only machine (wheels just sit unused).
+# Pinned to the CUDA-12 majors CTranslate2 4.x is built against (cuBLAS 12.x +
+# cuDNN 9.x); an unpinned cuBLAS can pull a version mismatched with cuDNN 9 and
+# break with "DLL not found", which then falls back to slow CPU.
+nvidia-cublas-cu12>=12.4,<13;  platform_system == "Windows"
+nvidia-cudnn-cu12>=9,<10;      platform_system == "Windows"
+
+# --- Config / models / utils ---
+pydantic>=2,<3
+PyYAML>=6
+tqdm>=4
+
+# --- Web review UI (serve.py) ---
+fastapi>=0.110,<1
+uvicorn[standard]>=0.27,<1
+
+# After install, sanity-check CUDA with:  python scripts/check_gpu_whisper.py
+# (confirms faster-whisper loads on the GPU instead of silently using CPU).
+
+# NOTE: the local LLM (bad-takes + chapters) talks to Ollama over plain HTTP
+# (stdlib urllib) — no extra Python package required. Install Ollama separately
+# and `ollama pull qwen3:8b`.
+
+# P1-C: optional face detection for 9:16 auto-crop (graceful if absent).
+# Plan 2.3: the YuNet detector (vpipe/data/face_detection_yunet_2023mar.onnx)
+# runs via cv2.FaceDetectorYN — OpenCV executes the onnx itself, so YuNet needs
+# NO onnxruntime; without the model file the code falls back to the Haar cascade.
+opencv-python-headless>=4.8,<5
+
+# Plan 2.4 dependency hygiene: onnxruntime is already a de-facto dependency —
+# faster-whisper's Silero VAD runs on it — so we declare it explicitly instead
+# of relying on it arriving transitively. (NOT needed for YuNet, see above.)
+onnxruntime>=1.26,<2

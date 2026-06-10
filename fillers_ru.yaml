@@ -1,0 +1,58 @@
+# =============================================================================
+# Russian filler words / hesitation sounds to REMOVE.
+# Edit freely. Matching is case-insensitive; ё is treated as е; punctuation and
+# spaces around a word are ignored before matching.
+#
+# Three lists:
+#   mumbles  — regex patterns for stretched hesitation sounds (э-э-э, м-м-м, ...)
+#   words    — single words removed wherever they appear
+#   phrases  — sequences of consecutive words removed as a group
+#
+# TIP: every removed filler is shown in the review step with its timecode, so
+#      you can untick any that were cut by mistake before rendering.
+# =============================================================================
+
+# Stretched "thinking" sounds. These are full-word regexes (the whole spoken
+# token must match). '+' = one or more, so "ээээ", "эм", "м-м-м" all match.
+# IMPORTANT: patterns are written so they require a STRETCHED sound (>= 2 chars).
+# A bare single letter ("а", "э", "м") or a bare "ну" is usually a legitimate
+# conjunction / particle, not a hesitation, so it is intentionally NOT matched
+# here (the detector also enforces a min length of 2 for mumbles as a safety net).
+mumbles:
+  - "э{2,}"         # ээ, эээ  (NOT a lone "э")
+  - "м{2,}"         # мм, ммм  (NOT a lone "м")
+  - "э+м+"          # эм, эмм
+  - "м+э+"          # мэ
+  - "а{2,}"         # аа, ааа  (NOT the conjunction "а")
+  - "хм+"           # хм, хмм
+  - "нуу+"          # нуу, нууу  (stretched only; bare "ну" is a real particle)
+
+# Single-word fillers (exact match after normalization).
+words:
+  - вот
+  - короче
+  - типа
+  - значит
+  - блин
+  - собственно
+  - получается
+  - допустим
+  - скажем
+  - слушай
+  - смотри
+  - понимаешь
+  - короч
+
+# Multi-word fillers (consecutive words). Each inner list is one phrase.
+phrases:
+  - [как, бы]
+  - [это, самое]
+  - [так, сказать]
+  - [в, общем]
+  - [в, принципе]
+  - [на, самом, деле]
+  - [как, то, так]
+  - [то, есть]
+  - [ну, вот]
+  - [как, говорится]
+  - [скажем, так]

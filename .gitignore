@@ -1,0 +1,39 @@
+# Generated artifacts
+/out/
+/cache/
+/work/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Test media
+/tests/_media/
+
+# Verification / browser scratch
+/.playwright-mcp/
+/editor-*.png
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Internal working docs (not for the public repo)
+/COMPETITIVE_ANALYSIS.md
+/TECH_UPGRADE_PLAN.md
+/benchmark_results.md
+/benchmark_results.json
+/PILOTS_2026.md
+/HANDOFF.md
+/GLING_PLUS_PLAN.md
+/REMAINING.md
+/claude_code_video_pipeline_prompt.md
+
+# User's own media / session screenshots (never publish)
+/*.mp4
+/*.png
+
+# Large optional binaries — downloaded by the user (see README → Third-party)
+/tools/*.exe

@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FastVideoEdit — монтаж</title>
+  <!-- Inline SVG favicon (data URI) — avoids the /favicon.ico 404 and needs no extra file/request. -->
+  <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20width='16'%20height='16'%20rx='3'%20fill='%236c8cff'/%3E%3Ctext%20x='1.5'%20y='13'%20font-size='12'%3E%E2%9C%82%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header id="topbar">
+    <div class="brand">FastVideoEdit</div>
+    <button id="btnFiles" class="btn" aria-haspopup="dialog">📁 Файлы</button>
+    <button id="btnQueue" class="btn" aria-haspopup="dialog">📋 Очередь <span id="queueBadge" class="qBadge hidden">0</span></button>
+    <button id="btnModels" class="btn" title="Локальные модели: качество распознавания и ИИ" aria-haspopup="dialog">⚙ Модели</button>
+    <button id="netBadge" class="netBadge net-local" title="Приватность — всё локально" aria-haspopup="dialog">🔒 Локально</button>
+    <div id="filename" class="filename">Ролик не выбран</div>
+    <div id="censor" class="muted chip"></div>
+    <div id="savePill" class="savePill hidden" title="Состояние сохранения" role="status" aria-live="polite">Сохранено</div>
+    <div class="spacer"></div>
+    <button id="btnTranscribe" class="btn">Транскрибировать</button>
+    <button id="btnRedetect" class="btn">Передетектировать</button>
+    <button id="btnRender" class="btn btn-primary">Рендер <kbd>R</kbd></button>
+    <button id="btnHelp" class="btn btn-icon" title="Справка (?)" aria-label="Справка">?</button>
+  </header>
+
+  <div id="progress" class="progress hidden">
+    <div id="progressBar" class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div>
+    <span id="progressText" class="ptext"></span>
+    <button id="btnCancelTask" class="btn small cancelTask hidden" title="Отменить задачу">✕ Отмена</button>
+  </div>
+
+  <div id="toasts" class="toasts" aria-live="polite" aria-atomic="true"></div>
+
+  <main>
+    <!-- LEFT: transcript document -->
+    <section id="scriptPane">
+      <div class="paneHead">
+        <span class="paneTitle">Транскрипт</span>
+        <input id="search" class="search" type="search" placeholder="Поиск по тексту…" aria-label="Поиск по тексту транскрипта">
+        <span id="cutSummary" class="muted"></span>
+      </div>
+      <div id="transcript" class="transcript">
+        <div class="empty placeholder">Транскрипт появится здесь — нажми «Транскрибировать»</div>
+      </div>
+      <button id="cutFloat" class="cutFloat hidden">✂ Вырезать <kbd>X</kbd></button>
+    </section>
+
+    <!-- RIGHT: preview + AI suggestions -->
+    <section id="previewPane">
+      <div class="videoWrap">
+        <video id="video" preload="metadata" aria-label="Предпросмотр ролика"></video>
+        <div id="subOverlay" class="subOverlay hidden"></div>
+      </div>
+      <div class="sugHead">
+        <span class="paneTitle">Подсказки ИИ <span id="cutCount" class="muted"></span></span>
+        <span id="llmBadge" class="llmBadge hidden">ИИ выключен (Ollama не найдена)</span>
+        <div class="legend">
+          <span title="Длинная тишина между словами (по таймингам слов)"><i class="dot pause"></i>пауза</span>
+          <span title="Слова-паразиты: «ну», «как бы», «вот»…"><i class="dot filler"></i>паразит</span>
+          <span title="Мат — цензурируется в звуке"><i class="dot profanity"></i>мат</span>
+          <span title="Неудачный дубль / оборванная фраза (ИИ)"><i class="dot bad_take"></i>дубль</span>
+          <span title="Акустический сбой речи: затянутые «э-э», бормотание, микро-провалы, которых нет в тексте"><i class="dot hesitation"></i>заминка</span>
+          <span title="Ваш ручной вырез"><i class="dot manual"></i>ручной</span>
+        </div>
+      </div>
+      <div id="cutlist" class="cutlist">
+        <div class="empty placeholder">Вырезов пока нет — выдели текст или нажми «Передетектировать»</div>
+      </div>
+      <div id="chaptersPanel" class="chaptersPanel">
+        <div class="chaptersHead">
+          <span class="paneTitle">Главы</span>
+          <button id="btnChaptersToggle" class="btn small" title="Сгенерировать главы по финальному таймлайну">Предпросмотр глав</button>
+        </div>
+        <div id="chaptersList" class="chaptersList">
+          <div class="empty placeholder">Нажми «Предпросмотр глав» для генерации</div>
+        </div>
+      </div>
+      <div id="metadataPanel" class="metadataPanel">
+        <div class="metadataHead">
+          <span class="paneTitle">Метаданные YouTube</span>
+          <button id="btnMetaGenerate" class="btn small" title="Сгенерировать заголовок, описание и теги по финальному таймлайну">Сгенерировать</button>
+        </div>
+        <div id="metadataBody" class="metadataBody">
+          <div class="metaField">
+            <div class="metaLabel">Заголовок <span id="metaTitleLen" class="muted"></span>
+              <button class="btn small metaCopyBtn" data-field="title">Копировать</button></div>
+            <div id="metaTitle" class="metaText" contenteditable="true" spellcheck="false" data-placeholder="—" role="textbox" aria-label="Заголовок"></div>
+          </div>
+          <div class="metaField">
+            <div class="metaLabel">Описание
+              <button class="btn small metaCopyBtn" data-field="desc">Копировать</button></div>
+            <div id="metaDesc" class="metaText metaTextArea" contenteditable="true" spellcheck="false" data-placeholder="—" role="textbox" aria-label="Описание" aria-multiline="true"></div>
+          </div>
+          <div class="metaField">
+            <div class="metaLabel">Теги
+              <button class="btn small metaCopyBtn" data-field="tags">Копировать</button></div>
+            <div id="metaTags" class="metaText" contenteditable="true" spellcheck="false" data-placeholder="—" role="textbox" aria-label="Теги"></div>
+          </div>
+          <div class="metaField metaHookField">
+            <div class="metaLabel">Хук
+              <button class="btn small metaCopyBtn" data-field="hook">Копировать</button></div>
+            <div id="metaHook" class="metaText" contenteditable="true" spellcheck="false" data-placeholder="—" role="textbox" aria-label="Хук"></div>
+          </div>
+          <div class="metaActions">
+            <button id="btnMetaCopyAll" class="btn small">Копировать всё</button>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- TIMELINE -->
+  <section id="timelineArea">
+    <div id="ruler" class="ruler"></div>
+    <div id="waveform" class="waveform">
+      <div id="phLabel" class="phLabel">0:00</div>
+    </div>
+    <!-- «После» — финальный (пострезный) таймлайн: производная полоса, рисуется на canvas -->
+    <div id="afterWrap" class="afterWrap hidden">
+      <div class="afterLabel muted">После (итог)</div>
+      <canvas id="afterCanvas" class="afterCanvas"></canvas>
+      <div id="afterPh" class="afterPh"></div>
+    </div>
+  </section>
+
+  <!-- TRANSPORT -->
+  <footer id="transport">
+    <button id="btnPlay" class="btn btn-icon" title="Пуск/пауза (Space)" aria-label="Пуск/пауза">▶</button>
+    <button id="btnStop" class="btn btn-icon" title="Стоп" aria-label="Стоп">■</button>
+    <div id="tc" class="tc"><span id="tcCur">0:00.00</span> <span class="muted">/ <span id="tcTot">0:00</span></span></div>
+    <div id="tcFinal" class="tc tcFinal hidden" title="Итоговый таймкод (после вырезов)"></div>
+    <button id="btnAfterToggle" class="btn small" title="Переключить «До / После» (A)" aria-pressed="false">⧉ После</button>
+    <button id="btnSubsToggle" class="btn small" title="Показывать субтитры поверх плеера" aria-pressed="false">CC Субтитры</button>
+    <select id="speed" class="select" title="Скорость" aria-label="Скорость воспроизведения">
+      <option value="0.5">0.5×</option><option value="0.75">0.75×</option>
+      <option value="1" selected>1×</option><option value="1.25">1.25×</option>
+      <option value="1.5">1.5×</option><option value="2">2×</option>
+    </select>
+    <label class="chk"><input type="checkbox" id="showCuts" checked> Показывать вырезы</label>
+    <label class="chk"><input type="checkbox" id="skipCuts"> Пропускать вырезы <kbd>P</kbd></label>
+    <button id="btnSplit" class="btn small" title="Разрез у плейхеда">✂ Разрез</button>
+    <button id="btnPrevCut" class="btn btn-icon" title="Предыдущий вырез" aria-label="Предыдущий вырез">⟸</button>
+    <button id="btnNextCut" class="btn btn-icon" title="Следующий вырез" aria-label="Следующий вырез">⟹</button>
+    <div id="kept" class="kept muted"></div>
+    <div class="spacer"></div>
+    <button id="zoomOut" class="btn btn-icon" title="Отдалить" aria-label="Отдалить">−</button>
+    <input id="zoom" class="zoom" type="range" min="0" max="100" value="0" aria-label="Масштаб таймлайна">
+    <button id="zoomIn" class="btn btn-icon" title="Приблизить" aria-label="Приблизить">+</button>
+  </footer>
+
+  <div id="help" class="overlay hidden" role="dialog" aria-modal="true" aria-label="Горячие клавиши">
+    <div class="card">
+      <h2>Горячие клавиши</h2>
+      <table>
+        <tr><td><kbd>Space</kbd></td><td>пуск / пауза</td></tr>
+        <tr><td><kbd>←</kbd> <kbd>→</kbd></td><td>перемотка ∓5 с</td></tr>
+        <tr><td><kbd>,</kbd> <kbd>.</kbd></td><td>покадрово назад / вперёд</td></tr>
+        <tr><td><kbd>I</kbd> / <kbd>O</kbd></td><td>метка входа / выхода</td></tr>
+        <tr><td><kbd>M</kbd></td><td>создать вырез из меток</td></tr>
+        <tr><td><kbd>X</kbd></td><td>вырезать выделенный текст</td></tr>
+        <tr><td><kbd>Enter</kbd></td><td>вкл/выкл выбранный вырез</td></tr>
+        <tr><td><kbd>C</kbd></td><td>сменить действие (вырезать ↔ цензура)</td></tr>
+        <tr><td><kbd>Del</kbd></td><td>вырезать выделенный текст / удалить выбранный вырез</td></tr>
+        <tr><td><kbd>Ctrl</kbd>+<kbd>Z</kbd></td><td>отменить</td></tr>
+        <tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd></td><td>вернуть</td></tr>
+        <tr><td><kbd>[</kbd> <kbd>]</kbd></td><td>к предыдущему / следующему вырезу</td></tr>
+        <tr><td><kbd>P</kbd></td><td>пропускать вырезы (предпросмотр)</td></tr>
+        <tr><td><kbd>A</kbd></td><td>переключить «До / После» (финальный таймлайн)</td></tr>
+        <tr><td><kbd>+</kbd> <kbd>−</kbd></td><td>зум таймлайна</td></tr>
+        <tr><td><kbd>;</kbd> <kbd>'</kbd></td><td>сдвиг подсветки (синхрон) ∓50 мс</td></tr>
+        <tr><td><kbd>S</kbd> / <kbd>R</kbd></td><td>сохранить / рендер (настройки)</td></tr>
+        <tr><td><kbd>Esc</kbd></td><td>снять выделение / закрыть</td></tr>
+      </table>
+      <p class="muted">Выдели текст мышью → появится «✂ Вырезать» (или нажми <kbd>Del</kbd> — вырезать выделенное). Клик по слову — переход; клик по зачёркнутому — выбрать этот вырез (Enter — вернуть). Двойной клик по слову — править текст (Enter — сохранить, Esc — отмена); тайминги и вырезы при этом не меняются.</p>
+      <button class="btn" id="btnCloseHelp">Закрыть</button>
+    </div>
+  </div>
+
+  <div id="results" class="overlay hidden" role="dialog" aria-modal="true" aria-label="Результат рендера">
+    <div class="card" id="resultsCard"></div>
+  </div>
+
+  <div id="files" class="overlay hidden" role="dialog" aria-modal="true" aria-label="Открыть ролик">
+    <div class="card filesCard">
+      <div class="filesHead">
+        <h2>Открыть ролик</h2>
+        <button class="btn btn-icon" id="btnCloseFiles" title="Закрыть">✕</button>
+      </div>
+      <label id="dropzone" class="dropzone">
+        <input type="file" id="fileInput" accept="video/*" hidden>
+        Перетащи видео сюда или <span class="link">выбери файл</span>
+      </label>
+      <div class="muted hintline">Большой файл? Открой его из папок ниже (без копирования) или вставь полный путь.</div>
+      <div class="pathbar">
+        <button class="btn small" id="btnUp">↑ Вверх</button>
+        <span id="curDir" class="curdir muted"></span>
+        <button class="btn small hidden" id="btnPickDir">✓ Выбрать эту папку</button>
+      </div>
+      <div id="browser" class="browser"></div>
+      <div class="openByPath">
+        <input id="pathInput" class="search" type="text" placeholder="…или вставь полный путь к файлу" aria-label="Полный путь к видеофайлу">
+        <button class="btn" id="btnOpenPath">Открыть</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="renderModal" class="overlay hidden" role="dialog" aria-modal="true" aria-label="Настройки рендера">
+    <div class="card renderCard">
+      <div class="filesHead"><h2>Настройки рендера</h2><button class="btn btn-icon" id="btnCloseRender" title="Закрыть">✕</button></div>
+      <div class="rgrid">
+        <label>Кодек
+          <select id="rEncoder" class="select">
+            <option value="nvenc">NVENC (GPU, быстро)</option>
+            <option value="x264">x264 (CPU, чуть лучше сжатие)</option>
+          </select>
+        </label>
+        <label>Качество <span id="rQualVal" class="muted"></span>
+          <input id="rQuality" type="range" min="14" max="30" step="1">
+          <div class="hint muted">меньше = лучше качество и больше файл</div>
+        </label>
+        <label>Разрешение
+          <select id="rScale" class="select"><option value="">Как у источника</option>
+            <option value="2160">2160p (4K)</option><option value="1440">1440p</option>
+            <option value="1080">1080p</option><option value="720">720p</option><option value="480">480p</option>
+          </select>
+        </label>
+        <label>Частота кадров
+          <select id="rFps" class="select"><option value="">Как у источника</option>
+            <option value="60">60</option><option value="30">30</option><option value="24">24</option>
+          </select>
+        </label>
+        <label>Звук, битрейт
+          <select id="rAudio" class="select"><option>320k</option><option>256k</option><option>192k</option><option>128k</option></select>
+        </label>
+        <label>Цензура мата
+          <select id="rCensor" class="select">
+            <option value="partial">partial — онсет + глушение</option>
+            <option value="pitch">pitch — сдвиг тона</option>
+            <option value="lowpass">lowpass — приглушение</option>
+            <option value="reverse">reverse — реверс</option>
+          </select>
+        </label>
+      </div>
+      <div class="rtoggles">
+        <label class="chk"><input type="checkbox" id="rSubs" checked> Субтитры (.srt + .vtt)</label>
+        <label class="chk"><input type="checkbox" id="rChapters" checked> Главы (chapters.txt)</label>
+      </div>
+      <div class="rburn">
+        <label class="chk"><input type="checkbox" id="rBurn"> Вшить субтитры в видео (burn-in)</label>
+        <div id="rBurnOpts" class="rburnopts hidden">
+          <div class="rgrid">
+            <label>Шрифт
+              <select id="rBurnFont" class="select">
+                <option value="Arial">Arial</option>
+                <option value="Verdana">Verdana</option>
+                <option value="Tahoma">Tahoma</option>
+                <option value="Georgia">Georgia</option>
+                <option value="Impact">Impact</option>
+              </select>
+            </label>
+            <label>Размер <span id="rBurnSizeVal" class="muted"></span>
+              <input id="rBurnSize" type="range" min="24" max="96" step="2" value="52">
+            </label>
+            <label>Положение
+              <select id="rBurnPos" class="select">
+                <option value="bottom">Снизу</option>
+                <option value="top">Сверху</option>
+                <option value="center">По центру</option>
+              </select>
+            </label>
+            <label>Цвет текста
+              <input id="rBurnColor" type="color" value="#ffffff" class="rcolor">
+            </label>
+            <label>Цвет подсветки
+              <input id="rBurnKColor" type="color" value="#ffd400" class="rcolor">
+            </label>
+          </div>
+          <label class="chk"><input type="checkbox" id="rBurnKaraoke" checked> Караоке-подсветка по словам</label>
+          <div class="hint muted">Вшитые субтитры запекаются в кадр (один проход, перекодирование). Файлы .srt/.vtt пишутся отдельно как обычно.</div>
+        </div>
+      </div>
+      <div class="rvert">
+        <label class="chk"><input type="checkbox" id="rVertical"> Вертикальный клип (9:16) под Shorts</label>
+        <div class="hint muted">Авто-кадр по лицу: кадр обрезается до 1080×1920 так, чтобы говорящий оставался в кадре (если лицо не найдено — по центру). Совместимо со вшитыми субтитрами.</div>
+      </div>
+      <div class="rdenoise">
+        <label class="chk"><input type="checkbox" id="rDenoise"> Шумоподавление (звук)</label>
+        <div class="hint muted">Убирает фоновый гул и шипение (кондиционер, гул сети, эфир), делает речь чище. Нативные ffmpeg-фильтры (highpass + afftdn), применяются после цензуры мата. Включай осознанно: обработка звука необратима, проверь результат на своём материале.</div>
+        <div id="rDenoiseOpts" class="rdenoiseopts hidden">
+          <div class="rgrid">
+            <label>Движок
+              <select id="rDenoiseEngine">
+                <option value="afftdn" selected>Стандартный (afftdn)</option>
+                <option value="deepfilter">Нейро (DeepFilterNet)</option>
+              </select>
+            </label>
+          </div>
+          <div class="hint muted">Нейро-движок (DeepFilterNet 3) убирает фон заметно чище и почти не «металлизирует» голос; считает на CPU (≈4 мин на 20-мин ролик), звук становится моно (для речи в кадре — ок). Если tools/deep-filter.exe недоступен — автоматически обычный режим. Ползунок «Сила» действует только для стандартного движка.</div>
+          <div class="rgrid">
+            <label>Сила <span id="rDenoiseStrengthVal" class="muted"></span>
+              <input id="rDenoiseStrength" type="range" min="-40" max="-12" step="1" value="-25">
+            </label>
+          </div>
+          <label class="chk"><input type="checkbox" id="rDenoiseNorm"> Нормализовать громкость речи</label>
+          <div class="hint muted">Слабее (-12) — щадящее шумоподавление, голос натуральнее. Сильнее (-40) — глубже чистит, но рискует «металлизировать» тихую речь.</div>
+        </div>
+        <label class="chk"><input type="checkbox" id="rDeess"> Де-эссер (смягчить свистящие)</label>
+        <div class="hint muted">Мягко приглушает резкие «с», «ш», «ц» — частый артефакт петличек и близкого микрофона. Работает независимо от шумоподавления.</div>
+        <label class="chk"><input type="checkbox" id="rLoudnorm"> Громкость под YouTube (−14 LUFS)</label>
+        <div class="hint muted">Выравнивает громкость под стандарт YouTube (−14 LUFS, пик −1.5 дБ) — ролик звучит так же громко, как у других авторов, без ручной возни с уровнями. Работает независимо от шумоподавления.</div>
+        <label class="chk rsubopt"><input type="checkbox" id="rLoudnorm2p"> точный (2 прохода)</label>
+        <div class="hint muted rsubopt">Сначала быстро измеряет громкость готовой дорожки (после резов и цензуры), затем применяет точную linear-нормализацию: попадание ровно в −14 LUFS без «накачки» динамики. Дороже на несколько секунд. Если измерение не удалось — автоматически обычный режим.</div>
+      </div>
+      <div class="rsmooth">
+        <label>Сглаживание резов <span id="rCutFadeVal" class="muted"></span>
+          <input id="rCutFade" type="range" min="0" max="40" step="1" value="15" aria-label="Сглаживание резов (мягкость переходов)">
+        </label>
+        <div class="hint muted">Короткое затухание на каждом стыке убирает щелчки и делает переходы «мягкими». 0 — жёсткие резы (рубленый звук). 15 мс — рекомендуется. Длительность не меняется (звук остаётся синхронным с видео).</div>
+      </div>
+      <div class="rout">
+        <div class="routrow">
+          <input id="rOutDir" class="search" type="text" placeholder="папка вывода" aria-label="Папка вывода">
+          <button class="btn" id="rBrowseOut">📁 Обзор</button>
+        </div>
+        <div class="routrow">
+          <input id="rFilename" class="search" type="text" placeholder="имя файла" aria-label="Имя файла">
+          <span class="muted">.mp4</span>
+        </div>
+      </div>
+      <div class="rnle">
+        <div class="rnleHead">
+          <span class="rnleTitle">🎬 Экспорт в монтажку</span>
+          <span class="hint muted">Отдать монтаж как проект-таймлайн в Premiere Pro / DaVinci Resolve / Final Cut — без рендера, мгновенно. Доводи там: B-roll, цвет, переходы.</span>
+        </div>
+        <div class="rnlerow">
+          <label>Формат
+            <select id="rNleFormat" class="select">
+              <option value="fcpxml">FCPXML (Premiere / Resolve / FCP)</option>
+              <option value="edl">EDL (CMX3600, универсальный)</option>
+            </select>
+          </label>
+          <button class="btn" id="btnExportNle">Экспортировать таймлайн</button>
+        </div>
+        <div id="nleResult" class="nleResult muted hidden"></div>
+      </div>
+      <div class="ractions">
+        <button class="btn" id="btnCancelRender">Отмена</button>
+        <button class="btn btn-primary" id="btnDoRender">▶ Рендер</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="queueModal" class="overlay hidden" role="dialog" aria-modal="true" aria-label="Очередь рендера">
+    <div class="card queueCard">
+      <div class="filesHead">
+        <h2>Очередь рендера</h2>
+        <button class="btn btn-icon" id="btnCloseQueue" title="Закрыть">✕</button>
+      </div>
+      <div class="muted hintline">Несколько роликов подряд: каждый автоматически транскрибируется (если нужно), детектируется и рендерится. Обработка по одному — модели не грузят GPU одновременно с редактором.</div>
+      <div id="queueList" class="qList">
+        <div class="empty placeholder">Очередь пуста</div>
+      </div>
+      <div class="qAddRow">
+        <input id="queuePathInput" class="search" type="text" placeholder="…вставь полный путь к видеофайлу и нажми «+ Файл»" aria-label="Путь к видеофайлу для очереди">
+        <button class="btn" id="btnAddFileToQueue">+ Файл</button>
+      </div>
+      <div class="qActions">
+        <button class="btn" id="btnAddToQueue">+ Добавить текущий клип</button>
+        <button class="btn btn-primary" id="btnQueueStart">▶ Старт</button>
+        <button class="btn hidden" id="btnQueueStop">■ Стоп</button>
+        <button class="btn" id="btnQueueClear">Очистить завершённые</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="privacyModal" class="overlay hidden" role="dialog" aria-modal="true" aria-label="Приватность">
+    <div class="card privacyCard">
+      <div class="filesHead">
+        <h2>🔒 Приватность · всё локально</h2>
+        <button class="btn btn-icon" id="btnClosePrivacy" title="Закрыть">✕</button>
+      </div>
+      <p class="privacyLead">
+        Ваше видео никуда не загружается. Распознавание речи (Whisper) идёт на вашей видеокарте,
+        ИИ-подсказки (Ollama) — на <code>localhost</code>, монтаж (ffmpeg) — на этой машине.
+        Исходный файл и транскрипт остаются у вас — в отличие от облачных редакторов,
+        куда ролик физически загружается на чужие серверы.
+      </p>
+      <div class="privacyStats">
+        <div class="pStat"><div class="pStatNum" id="pStatExternal">0</div><div class="pStatLbl">внешних соединений</div></div>
+        <div class="pStat"><div class="pStatNum" id="pStatLocal">0</div><div class="pStatLbl">к localhost / Ollama</div></div>
+        <div class="pStat"><div class="pStatNum" id="pStatBlocked">0</div><div class="pStatLbl">заблокировано</div></div>
+      </div>
+      <div id="pHosts" class="pHosts hidden"></div>
+      <label class="pToggle">
+        <input type="checkbox" id="pOfflineToggle">
+        <span class="pToggleText">
+          <span class="pToggleTitle">Оффлайн-режим — блокировать любые исходящие в интернет</span>
+          <span class="hint muted">Первая загрузка модели Whisper требует интернета. Если модель уже скачана — можно работать полностью оффлайн, и тогда исходящие сетевые соединения процесса блокируются (Whisper и Ollama работают локально).</span>
+        </span>
+      </label>
+      <div id="pSummary" class="pSummary muted"></div>
+    </div>
+  </div>
+
+  <div id="modelsModal" class="overlay hidden" role="dialog" aria-modal="true" aria-label="Локальные модели">
+    <div class="card modelsCard">
+      <div class="filesHead">
+        <h2>⚙ Локальные модели</h2>
+        <button class="btn btn-icon" id="btnCloseModels" title="Закрыть">✕</button>
+      </div>
+      <p class="modelsLead">
+        Подберите баланс «качество ↔ скорость» под вашу задачу и видеокарту.
+        Всё считается локально — выбор сохраняется и становится новым умолчанием.
+      </p>
+
+      <section class="modelsBlock">
+        <div class="modelsBlockHead">
+          <span class="modelsBlockTitle">Распознавание речи · Whisper</span>
+          <span id="mWhisperTranscript" class="muted modelsNote"></span>
+        </div>
+        <div id="mWhisperList" class="mPresetList" role="radiogroup" aria-label="Модель распознавания речи">
+          <div class="empty placeholder">Загрузка…</div>
+        </div>
+        <div class="hint muted">Применится при следующей транскрипции. Текущий транскрипт не перезаписывается.</div>
+      </section>
+
+      <section class="modelsBlock">
+        <div class="modelsBlockHead">
+          <span class="modelsBlockTitle">ИИ-подсказки · Ollama</span>
+          <span id="mLlmStatus" class="muted modelsNote"></span>
+        </div>
+        <div class="mLlmRow">
+          <label class="mLlmLabel" for="mLlmSelect">Модель</label>
+          <select id="mLlmSelect" class="select" aria-label="ИИ-модель"></select>
+        </div>
+        <div id="mLlmHint" class="hint muted"></div>
+      </section>
+
+      <div class="modelsActions">
+        <button class="btn" id="btnModelsCancel">Закрыть</button>
+        <button class="btn btn-primary" id="btnModelsSave">Сохранить</button>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>

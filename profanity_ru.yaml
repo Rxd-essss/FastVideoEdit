@@ -1,0 +1,134 @@
+# =============================================================================
+# Russian profanity — matched by ROOT/STEM so derived forms are caught too.
+# These words are CENSORED in audio (so a human still recognizes them but
+# YouTube's ASR does not) and MASKED in subtitle text (e.g. б***ь).
+#
+# Matching: each entry in `roots` is a regex tested against the normalized word
+# (lowercased, ё→е, non-letters stripped). If a root matches AND the word is
+# not in `allow`, the word is flagged. Edit both lists to taste.
+#
+# `allow` is a CURATED whitelist of innocent words that happen to contain a
+# root (e.g. "ребёнок" contains the еб stem) — add any false positives you see.
+# It is matched EXACTLY against the normalized word (lowercase, ё→е).
+#
+# -----------------------------------------------------------------------------
+# GUARANTEED TEST CASES — do not regress these when editing roots/allow:
+#   is_profane('блядь')      == True
+#   is_profane('Бляяя!')     == True
+#   is_profane('заёб')       == True
+#   is_profane('подъёб')     == True
+#   is_profane('ёбаный')     == True
+#   is_profane('мандавошка') == True
+#   is_profane('хлеб')       == False
+#   is_profane('ребёнок')    == False   (ё-folded, allow-listed)
+#   is_profane('команда')    == False
+#   is_profane('мандарин')   == False
+#   detect() censors 'блядь' but not 'хлеб'
+# After any edit, re-run: pytest tests/test_detect.py tests/test_subtitles.py
+# -----------------------------------------------------------------------------
+#
+# Some short roots use a negative lookbehind to skip large families of innocent
+# words while still catching every profane form (no Russian profanity has the
+# excluded left-context):
+#   * "бля"  never legitimately follows о / р / "ре"  → excludes
+#            употреблять, истреблять, оскорбления, … but keeps ебля, блядь.
+#   * "еб/ёб" never legitimately follows р / н / л / с / т  → excludes the
+#            требовать / погреб / небеса / лебеда / себе / тебе families
+#            but keeps заёб, подъёб, ёбаный, ебать, ебло, ебля, наебка, …
+# Whenever a lookbehind is impossible (the profane and innocent stems share the
+# same left-context, e.g. "ебля" vs "требля"), the curated allow-list below
+# handles the remaining innocent inflections explicitly.
+# =============================================================================
+
+roots:
+  - "(?<![ор])(?<!ре)бля"  # блядь, блять, бляд… (skips употреблять/истреблять/…)
+  - "ху[йяёе]"             # хуй, хуя, хуе, хуё… (kept narrow to avoid "худой")
+  - "пизд"                 # пизда, пиздец, спиздил…
+  - "(?<![рнлст])еб[аёуниыл]"  # ебать, ебёт, ебу, ебни, ебло… (skips требу-/неб-/леб-…)
+  - "уеб"                  # уёбок (ё→е), уебать
+  - "(?<![рнлст])ёб"       # ёбаный, заёб, подъёб (also matched after ё→е fold)
+  - "муд[аоие]"            # мудак, мудила (not "мудрый")
+  - "сук[аиоуе]"           # сука, суки, суке (not "сукно")
+  - "пид[оае]р"            # пидор, пидар, педор
+  - "гандон"
+  - "гондон"
+  - "залуп"                # залупа
+  - "мандав"               # мандавошка (narrow: avoids команда / мандарин / мандат)
+  - "дроч"                 # дрочить
+  - "хер"                  # хер, херня, нахер (short root — see allow-list below)
+  - "елда"
+  - "пердо"                # выпердыш и т.п. (mild) — remove if undesired
+
+# Curated allow-list: innocent words that contain a root above (the matcher is
+# substring-based, so short roots like "хер"/"еб"/"бля" collide with normal
+# words). The lookbehinds on the roots above already remove most collisions;
+# the entries here cover the inflections a lookbehind cannot separate (e.g.
+# "ебля" vs "требля"). Add your own as you spot them — matching is EXACT on the
+# normalized word (lowercase, ё→е), so list each inflected form you care about.
+allow:
+  # — ребёнок / ребята family (еб stem) —
+  - ребенок
+  - ребёнок
+  - ребята
+  - ребяческий
+  # — небо / лебеда / себе / тебе (еб stem, не/ле/се/те context) —
+  - небо
+  - небеса
+  - небесный
+  - небосвод
+  - небосклон
+  - небоскрёб
+  - небоскреб
+  - себе
+  - тебе
+  - лебеда
+  - лебедь
+  - лебединый
+  - теребить
+  # — хлеб family (еб stem) —
+  - хлеб
+  - хлеба
+  - хлебобулочный
+  # — требовать / требование family (еб stem) —
+  - требовать
+  - требуется
+  - требование
+  - требования
+  - требовательный
+  - потребность
+  - потребности
+  - потребовать
+  # — употреблять / истреблять family (бля + еб stems) —
+  - потреблять
+  - потребление
+  - употребление
+  - употреблять
+  - употребляя
+  - употребляли
+  - употребляемый
+  - употребляемых
+  - истреблять
+  - истребление
+  # — колеблется (бля? no — еб stem in "колеб") —
+  - колеблется
+  - колеблются
+  - колебание
+  # — серебро (еб stem) —
+  - серебро
+  - серебряный
+  # — сук / муд roots —
+  - сукно
+  - мудрый
+  - мудрость
+  # — хер root: херувим / cities / sherry —
+  - херувим
+  - херувимы
+  - херувимский
+  - херес          # sherry (wine)
+  - херсон         # city
+  # — мандав root neighbours (already excluded by narrow root, kept for clarity) —
+  - суета
+  - команда
+  - командир
+  - мандарин
+  - мандат
