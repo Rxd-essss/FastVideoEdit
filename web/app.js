@@ -8,11 +8,13 @@ import TimelinePlugin from './vendor/plugins/timeline.esm.js'
 import HoverPlugin from './vendor/plugins/hover.esm.js'
 
 const $ = (s) => document.querySelector(s)
-const COLORS = { pause: '59,130,246', filler: '234,140,30', profanity: '224,69,63', bad_take: '168,110,224', hesitation: '20,184,166', manual: '40,180,110' }
+const COLORS = { pause: '79,141,249', filler: '245,158,11', profanity: '239,68,68', bad_take: '167,139,250', hesitation: '45,212,191', manual: '52,211,153' }
 const TYPE_RU = { pause: 'пауза', filler: 'паразит', profanity: 'мат', bad_take: 'дубль', hesitation: 'заминка', manual: 'ручной' }
-const colorOf = (seg) => `rgba(${COLORS[seg.type] || '120,120,120'},${seg.enabled ? 0.34 : 0.10})`
+const colorOf = (seg) => `rgba(${COLORS[seg.type] || '120,120,120'},${seg.enabled ? 0.22 : 0.08})`
 const round = (x) => Math.round(x * 1000) / 1000
 const escapeHtml = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
+// SVG-иконка из спрайта index.html (<symbol id="i-...">) — замена эмодзи-глифов.
+const icon = (name) => `<svg class="ic" aria-hidden="true"><use href="#i-${name}"/></svg>`
 const fmt = (t) => { t = Math.max(0, t || 0); return `${Math.floor(t / 60)}:${String(Math.floor(t % 60)).padStart(2, '0')}` }
 const fmtcs = (t) => { t = Math.max(0, t || 0); return `${fmt(t)}.${String(Math.floor((t % 1) * 100)).padStart(2, '0')}` }
 
@@ -61,9 +63,11 @@ function toast(msg, kind = 'info', opts = {}) {
   const el = document.createElement('div')
   el.className = 'toast ' + kind
   el.setAttribute('role', 'status')
+  const ic = document.createElement('span'); ic.className = 'ticon'
+  ic.innerHTML = icon(kind === 'success' ? 'check' : kind === 'error' ? 'x' : 'info')
   const m = document.createElement('div'); m.className = 'tmsg'; m.textContent = msg
-  const x = document.createElement('button'); x.className = 'tclose'; x.textContent = '✕'; x.title = 'Закрыть'
-  el.appendChild(m); el.appendChild(x)
+  const x = document.createElement('button'); x.className = 'tclose'; x.innerHTML = icon('x'); x.title = 'Закрыть'; x.setAttribute('aria-label', 'Закрыть')
+  el.appendChild(ic); el.appendChild(m); el.appendChild(x)
   const remove = () => { if (el.parentNode) el.remove() }
   x.onclick = remove
   layer.appendChild(el)
@@ -151,8 +155,8 @@ async function init() {
 
   video.addEventListener('timeupdate', () => { if (video.paused) onFrame() })
   video.addEventListener('seeked', onFrame)
-  video.addEventListener('play', () => { $('#btnPlay').textContent = '⏸'; cancelAnimationFrame(raf); raf = requestAnimationFrame(loop) })
-  video.addEventListener('pause', () => { $('#btnPlay').textContent = '▶'; cancelAnimationFrame(raf); onFrame() })
+  video.addEventListener('play', () => { $('#btnPlay').innerHTML = icon('pause'); cancelAnimationFrame(raf); raf = requestAnimationFrame(loop) })
+  video.addEventListener('pause', () => { $('#btnPlay').innerHTML = icon('play'); cancelAnimationFrame(raf); onFrame() })
 }
 
 const flash = (t) => { $('#cutSummary').textContent = t }
@@ -282,12 +286,12 @@ function renderTranscript() {
   const box = $('#transcript'); box.replaceChildren()
   if (!st.paras.length) {
     const ph = document.createElement('div'); ph.className = 'empty placeholder'
-    ph.textContent = 'Транскрипт появится здесь — нажми «Транскрибировать»'
+    ph.innerHTML = icon('edit') + '<div>Транскрипт появится здесь — нажми «Транскрибировать»</div>'
     box.appendChild(ph); st.spans = null; return
   }
   st.paras.forEach((para, p) => {
     const el = document.createElement('p'); el.className = 'para'
-    const g = document.createElement('span'); g.className = 'gutter'; g.textContent = '✂'; g.title = 'Вырезать абзац'; g.dataset.p = p
+    const g = document.createElement('span'); g.className = 'gutter'; g.innerHTML = icon('scissors'); g.title = 'Вырезать абзац'; g.dataset.p = p
     el.appendChild(g)
     for (const w of para.words) {
       const sp = document.createElement('span'); sp.className = 'w'; sp.dataset.i = w.i
@@ -434,7 +438,7 @@ function setAfterMode(on) {
   $('#afterWrap').classList.toggle('hidden', !st.afterMode)
   $('#tcFinal').classList.toggle('hidden', !st.afterMode)
   const btn = $('#btnAfterToggle')
-  if (btn) { btn.setAttribute('aria-pressed', String(st.afterMode)); btn.textContent = st.afterMode ? '⧉ До' : '⧉ После' }
+  if (btn) { btn.setAttribute('aria-pressed', String(st.afterMode)); btn.innerHTML = icon('split') + (st.afterMode ? 'До' : 'После') }
   // «После» включает пропуск вырезов; при возврате в «До» восстанавливаем
   // прежний выбор пользователя (P / чекбокс), а не затираем его в false.
   const skip = $('#skipCuts')
@@ -517,7 +521,7 @@ function renderChapters(chapters) {
   box.replaceChildren()
   if (!st.chaptersData.length) {
     const ph = document.createElement('div'); ph.className = 'empty placeholder'
-    ph.textContent = 'Главы не получены'
+    ph.innerHTML = icon('clock') + '<div>Глав пока нет — нажми «Предпросмотр глав»</div>'
     box.appendChild(ph); return
   }
   for (const ch of st.chaptersData) {
@@ -619,7 +623,7 @@ function renderCutlist() {
   box.replaceChildren()
   if (!segs.length) {
     const ph = document.createElement('div'); ph.className = 'empty placeholder'
-    ph.textContent = 'Вырезов пока нет — выдели текст или нажми «Передетектировать»'
+    ph.innerHTML = icon('scissors') + '<div>Вырезов пока нет — выдели текст или нажми «Передетектировать»</div>'
     box.appendChild(ph); return
   }
   for (const seg of segs) {
@@ -630,14 +634,14 @@ function renderCutlist() {
     row.innerHTML = `
       <input type="checkbox" class="en" ${seg.enabled ? 'checked' : ''}>
       <div class="meta">
-        <div class="tline"><span class="badge" style="background:rgb(${rgb})">${TYPE_RU[seg.type] || seg.type}/${seg.action === 'censor' ? 'цензура' : 'вырезать'}</span>
+        <div class="tline"><span class="badge" style="background:rgba(${rgb},.15);color:rgb(${rgb})">${TYPE_RU[seg.type] || seg.type}/${seg.action === 'censor' ? 'цензура' : 'вырезать'}</span>
           <span class="muted">${fmt(seg.start)}–${fmt(seg.end)} (${(seg.end - seg.start).toFixed(2)}s)</span></div>
         <div class="ttext">${(seg.reason || seg.text || '').replace(/</g, '&lt;')}</div>
       </div>
       <div class="acts">
-        <button class="jump" title="перейти" aria-label="Перейти к вырезу">→</button>
-        <button class="act" title="вырезать/цензура" aria-label="Вкл/выкл вырез">⇄</button>
-        <button class="del" title="удалить" aria-label="Удалить вырез">⌫</button>
+        <button class="jump" title="перейти" aria-label="Перейти к вырезу">${icon('arrow-right')}</button>
+        <button class="act" title="вырезать/цензура" aria-label="Вкл/выкл вырез">${icon('swap')}</button>
+        <button class="del" title="удалить" aria-label="Удалить вырез">${icon('backspace')}</button>
       </div>`
     const cb = row.querySelector('.en')
     cb.onclick = (e) => e.stopPropagation()   // don't let the click bubble to row (would re-render before 'change')
@@ -1222,7 +1226,7 @@ function showResults(r) {
   }
   $('#resultsCard').innerHTML = `
     <h2>Готово ✓</h2>
-    <p>Длительность: <b>${fmt(r.old_duration)} → ${fmt(r.new_duration)}</b> · кодек ${r.encoder}</p>
+    <p>Длительность: <b>${fmt(r.old_duration)} &rarr; ${fmt(r.new_duration)}</b> · кодек ${r.encoder}</p>
     <p>Видео: ${link(r.mp4, 'открыть .mp4')}${r.vertical ? ' · вертикальный 9:16 ✓' : ''}</p>
     <p>Субтитры: ${link(r.srt, '.srt')} · ${link(r.vtt, '.vtt')} (${r.cues} реплик)${r.burned_subtitles ? ' · вшиты в видео ✓' : ''}</p>
     <p>Главы: ${link(r.chapters, 'chapters.txt')} (${r.n_chapters})</p>
@@ -1320,8 +1324,8 @@ function bindUI() {
   $('#btnPrevCut').onclick = prevCut
   $('#btnNextCut').onclick = nextCut
   $('#btnSplit').onclick = () => {
-    if (st.splitMark == null) { st.splitMark = video.currentTime; $('#btnSplit').textContent = `✂ до: ${fmt(st.splitMark)}` }
-    else { addManual(Math.min(st.splitMark, video.currentTime), Math.max(st.splitMark, video.currentTime)); st.splitMark = null; $('#btnSplit').textContent = '✂ Разрез' }
+    if (st.splitMark == null) { st.splitMark = video.currentTime; $('#btnSplit').innerHTML = icon('scissors') + `до: ${fmt(st.splitMark)}` }
+    else { addManual(Math.min(st.splitMark, video.currentTime), Math.max(st.splitMark, video.currentTime)); st.splitMark = null; $('#btnSplit').innerHTML = icon('scissors') + 'Разрез' }
   }
   $('#zoom').oninput = (e) => zoomTo(+e.target.value)
   $('#zoomIn').onclick = () => { $('#zoom').value = Math.min(100, +$('#zoom').value + 12); zoomTo(+$('#zoom').value) }
@@ -1463,13 +1467,13 @@ async function browseDir(dir) {
   if (!j.folders.length && !j.files.length) { box.innerHTML = '<div class="empty">Нет видео в этой папке</div>'; return }
   for (const name of j.folders) {
     const el = document.createElement('div'); el.className = 'fitem folder'
-    el.textContent = '📁 ' + name
+    el.innerHTML = `${icon('folder')} <span>${esc(name)}</span>`
     el.onclick = () => browseDir(pathJoin(j.dir, name))
     box.appendChild(el)
   }
   for (const f of j.files) {
     const el = document.createElement('div'); el.className = 'fitem video'
-    el.innerHTML = `🎬 <span>${esc(f.name)}</span> <span class="fsize">${mb(f.size)}</span>`
+    el.innerHTML = `${icon('film')} <span>${esc(f.name)}</span> <span class="fsize">${mb(f.size)}</span>`
     el.onclick = () => openPath(pathJoin(j.dir, f.name))
     box.appendChild(el)
   }
@@ -1651,7 +1655,7 @@ function queueResultLink(job) {
   const base = mp4.split(/[\\/]/).pop()
   if (!base) return ''
   const dur = (r.old_duration != null && r.new_duration != null)
-    ? ` · ${fmt(r.old_duration)} → ${fmt(r.new_duration)}` : ''
+    ? ` · ${fmt(r.old_duration)} &rarr; ${fmt(r.new_duration)}` : ''
   return `<a href="/api/output/${encodeURIComponent(base)}" target="_blank">открыть .mp4</a>${dur}`
 }
 
@@ -1661,7 +1665,7 @@ function renderQueueList() {
   const jobs = st.queueJobs
   if (!jobs.length) {
     const ph = document.createElement('div'); ph.className = 'empty placeholder'
-    ph.textContent = 'Очередь пуста'
+    ph.innerHTML = icon('queue') + '<div>Очередь пуста</div>'
     box.appendChild(ph); return
   }
   for (const job of jobs) {
@@ -1672,7 +1676,7 @@ function renderQueueList() {
     status.className = 'qJob-status status-' + job.status
     status.textContent = Q_STATUS_RU[job.status] || job.status
     const del = document.createElement('button')
-    del.className = 'qJob-del'; del.textContent = '⌫'; del.title = 'Убрать из очереди'
+    del.className = 'qJob-del'; del.innerHTML = icon('x'); del.title = 'Убрать из очереди'; del.setAttribute('aria-label', 'Убрать из очереди')
     del.disabled = job.status === 'running'
     del.onclick = () => removeQueueJob(job.id)
     row.appendChild(name); row.appendChild(status); row.appendChild(del)
@@ -1717,13 +1721,13 @@ function renderNetBadge(net) {
   st.network = net
   b.classList.remove('net-local', 'net-offline', 'net-warn')
   if (net.offline) {
-    b.classList.add('net-offline'); b.textContent = '🔒 Оффлайн'
+    b.classList.add('net-offline'); b.innerHTML = icon('shield') + '<span>Оффлайн</span>'
     b.title = 'Оффлайн-режим — исходящие соединения в интернет заблокированы'
   } else if ((net.external_allowed || 0) > 0) {
-    b.classList.add('net-warn'); b.textContent = `🔒 ${net.external_allowed} внешн.`
+    b.classList.add('net-warn'); b.innerHTML = icon('globe-warn') + `<span>${escapeHtml(String(net.external_allowed))} внешн.</span>`
     b.title = `Внешних соединений: ${net.external_allowed} (вероятно, загрузка модели). Клик — подробности.`
   } else {
-    b.classList.add('net-local'); b.textContent = '🔒 Локально · 0 внешних'
+    b.classList.add('net-local'); b.innerHTML = icon('shield') + '<span>Локально · 0 внешних</span>'
     b.title = 'Всё локально — ни одного внешнего соединения. Клик — подробности.'
   }
 }
@@ -1756,7 +1760,7 @@ async function refreshNetwork() {
       const rows = names.map((h) => {
         const a = ext[h] || 0, d = blk[h] || 0
         const tag = d && !a ? 'заблокировано' : (a ? 'разовая загрузка модели' : 'заблокировано')
-        return `<div class="pHostRow"><span class="pHostName">${escapeHtml(h)}</span><span class="pHostTag muted">${tag}${a ? ' · ' + a : ''}${d ? ' · ✕' + d : ''}</span></div>`
+        return `<div class="pHostRow"><span class="pHostName">${escapeHtml(h)}</span><span class="pHostTag muted">${tag}${a ? ' · ' + a : ''}${d ? ' · ×' + d : ''}</span></div>`
       }).join('')
       hostsEl.innerHTML = `<div class="pHostsHead muted">Внешние адреса (не ваши данные — служебная загрузка моделей):</div>${rows}`
       hostsEl.classList.remove('hidden')
