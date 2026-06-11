@@ -1239,10 +1239,17 @@ def put_transcript_word(payload: dict = Body(...)):
     segs[si].text = _join_words(words)
     # Атомарная запись кэша: пишем .tmp и подменяем os.replace — обрыв/краш
     # посреди записи никогда не оставляет полу-файл под живым именем.
+    # Имя tmp УНИКАЛЬНО на вызов (audit D-1): два параллельных PUT (быстрые
+    # правки соседних слов) с общим .tmp на Windows ловили PermissionError на
+    # os.replace → ложный 500 при уже применённой в памяти правке. С uuid каждый
+    # пишет свой файл, последний replace побеждает с полным состоянием памяти.
     cache_file = s.cache_dir / f"{s.audio_hash}.transcript.json"
-    tmp = cache_file.with_name(cache_file.name + ".tmp")
-    s.transcript.save(tmp)
-    os.replace(tmp, cache_file)
+    tmp = cache_file.with_name(f"{cache_file.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        s.transcript.save(tmp)
+        os.replace(tmp, cache_file)
+    finally:
+        tmp.unlink(missing_ok=True)   # no-op после удачного replace
     return {"ok": True, "text": w.word, "segment_text": segs[si].text}
 
 

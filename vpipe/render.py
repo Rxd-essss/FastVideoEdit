@@ -430,6 +430,7 @@ def enhance_audio(ff: FFmpeg, src: str, cfg: Config, work_dir: str | Path,
                total=total, on_progress=on_progress, desc="extract wav (DFN)")
     except Exception as e:  # noqa: BLE001 — enhancement is strictly best-effort
         log(f"  DeepFilterNet: извлечение WAV не удалось ({e}) — использую afftdn.")
+        _cleanup_dfn_temp(wd)   # a partial dfn_in.wav must not pile up (audit C-1)
         return None
     post_filter = bool(getattr(d, "post_filter", True))
     cmd = [binp] + (["--pf"] if post_filter else []) + \
@@ -441,11 +442,13 @@ def enhance_audio(ff: FFmpeg, src: str, cfg: Config, work_dir: str | Path,
                            encoding="utf-8", errors="replace")
     except OSError as e:
         log(f"  DeepFilterNet: запуск не удался ({e}) — использую afftdn.")
+        _cleanup_dfn_temp(wd)
         return None
     if r.returncode != 0:
         tail = " | ".join((r.stderr or r.stdout or "").strip().splitlines()[-3:])
         log(f"  DeepFilterNet: exe завершился с ошибкой (exit {r.returncode})"
             + (f": {tail}" if tail else "") + " — использую afftdn.")
+        _cleanup_dfn_temp(wd)
         return None
     try:
         ok = out_wav.exists() and out_wav.stat().st_size > 0
@@ -453,6 +456,7 @@ def enhance_audio(ff: FFmpeg, src: str, cfg: Config, work_dir: str | Path,
         ok = False
     if not ok:
         log("  DeepFilterNet: выходной файл не появился — использую afftdn.")
+        _cleanup_dfn_temp(wd)
         return None
     return str(out_wav)
 
@@ -638,10 +642,14 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
             log("  no cuts — remuxing (video copied).")
             args = ["-i", media.path, "-map", "0:v", "-map", "0:a",
                     "-c:v", "copy", "-c:a", "copy", *_faststart(cfg), out_path]
-        _run_atomic(ff, args, out_path, total=media.duration,
-                    on_progress=encode_prog, desc="remux")
-        if enhanced:
-            _cleanup_dfn_temp(work_dir)
+        # finally: the ~220 MB DFN temp wavs must not survive a failed/cancelled
+        # encode either (audit C-1) — same in the other two _run_atomic branches.
+        try:
+            _run_atomic(ff, args, out_path, total=media.duration,
+                        on_progress=encode_prog, desc="remux")
+        finally:
+            if enhanced:
+                _cleanup_dfn_temp(work_dir)
         return {"out": out_path, "new_duration": media.duration,
                 "removed": 0.0, "censored": len(censors),
                 "encoder": "copy", "denoise": bool(apost) or bool(enhanced)}
@@ -665,10 +673,12 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
             args = [*inputs, "-filter_complex", graph, "-map", "[outv]",
                     "-an", *venc, *_faststart(cfg), out_path]
         log(f"  re-encoding (no cuts, {vpost_s or 'reencode'}) -> {enc_name}")
-        _run_atomic(ff, args, out_path, total=media.duration,
-                    on_progress=encode_prog, desc="render")
-        if enhanced:
-            _cleanup_dfn_temp(work_dir)
+        try:
+            _run_atomic(ff, args, out_path, total=media.duration,
+                        on_progress=encode_prog, desc="render")
+        finally:
+            if enhanced:
+                _cleanup_dfn_temp(work_dir)
         return {"out": out_path, "new_duration": media.duration,
                 "removed": 0.0, "censored": len(censors),
                 "encoder": enc_name, "denoise": bool(apost) or bool(enhanced)}
@@ -710,10 +720,12 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
         args = [*inputs, "-filter_complex", graph, "-map", "[outv]",
                 "-an", *venc, *_faststart(cfg), out_path]
     log(f"  encoding {len(kept)} kept segment(s) -> {new_dur:.1f}s ({enc_name})")
-    _run_atomic(ff, args, out_path, total=new_dur,
-                on_progress=encode_prog, desc="render")
-    if enhanced:
-        _cleanup_dfn_temp(work_dir)
+    try:
+        _run_atomic(ff, args, out_path, total=new_dur,
+                    on_progress=encode_prog, desc="render")
+    finally:
+        if enhanced:
+            _cleanup_dfn_temp(work_dir)
     return {"out": out_path, "new_duration": new_dur, "removed": tl.total_removed,
             "censored": len(censors), "encoder": enc_name,
             "denoise": bool(apost) or bool(enhanced)}
