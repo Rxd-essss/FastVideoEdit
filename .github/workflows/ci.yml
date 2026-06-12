@@ -1,0 +1,42 @@
+# CI: the full pytest suite on Linux + Windows, Python 3.11/3.12.
+#
+# Deliberately NO ffmpeg, NO Ollama, NO GPU on the runners: every test mocks
+# the binaries and the network (FakeFF / monkeypatch), so the suite passing
+# here proves the tests stay hermetic. Do not add an ffmpeg install step —
+# a test that starts needing the real binary is a regression, not a CI gap.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11", "3.12"]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      # httpx: required by fastapi.testclient (starlette TestClient); it only
+      # arrives transitively via huggingface_hub today, so pin the intent here.
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt pytest httpx
+
+      # PYTHONIOENCODING: the suite logs Russian strings; Windows runners
+      # default to cp1252 and would crash on print/log. Harmless on Linux.
+      - name: Run tests
+        run: python -m pytest -q
+        env:
+          PYTHONIOENCODING: utf-8

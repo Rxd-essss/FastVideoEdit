@@ -38,9 +38,12 @@ class OllamaClient:
             return json.loads(r.read().decode("utf-8"))
 
     # --- health --------------------------------------------------------------
-    def available(self) -> bool:
+    def available(self, timeout: float = 5.0) -> bool:
+        """True when the Ollama server answers /api/version. ``timeout`` lets a
+        fast caller (e.g. /api/health) cap the wait without duplicating this
+        helper. Never raises."""
         try:
-            self._get("/api/version")
+            self._get("/api/version", timeout=timeout)
             return True
         except Exception:
             return False

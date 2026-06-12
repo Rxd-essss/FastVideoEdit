@@ -3,6 +3,7 @@
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 ![Python 3.11–3.12](https://img.shields.io/badge/python-3.11–3.12-blue)
 ![Platform: Windows 11](https://img.shields.io/badge/platform-Windows%2011-0078D4)
+[![CI](https://github.com/Rxd-essss/FastVideoEdit/actions/workflows/ci.yml/badge.svg)](https://github.com/Rxd-essss/FastVideoEdit/actions/workflows/ci.yml)
 
 A **local** talking-head video pipeline for YouTube, with a visual web editor
 (UI in Russian). Transcription runs on your GPU, the "smart" steps run on a local
@@ -104,7 +105,9 @@ winget install Gyan.FFmpeg    # one-time; open a NEW terminal afterwards
   README (launcher `run.bat` / `run.ps1`, NVENC render, CUDA transcription) is
   verified here.
 - **Linux** — the core pipeline and the unit tests are cross-platform (pure
-  Python + ffmpeg; `pytest` needs no GPU), but the **end-to-end flow has not been
+  Python + ffmpeg; `pytest` needs no GPU). The unit-test suite runs in CI on
+  every push, on **Ubuntu and Windows × Python 3.11/3.12** (no ffmpeg/Ollama on
+  the runners — the tests mock both), but the **end-to-end flow has not been
   tested on Linux**. There is no launcher: create a venv, `pip install -r
   requirements.txt`, then run `python serve.py` from the venv. Install ffmpeg
   from your package manager (`apt install ffmpeg` etc.).

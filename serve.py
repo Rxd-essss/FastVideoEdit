@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import logging
 import math
 import os
 import sys
@@ -76,6 +77,7 @@ from vpipe.models import (ACTION_REMOVE, CutList, CutSegment, Transcript,
                           TYPE_MANUAL)
 from vpipe.probe import extract_audio, hash_input, probe_media
 from vpipe.timeline import Timeline, remap_words
+from vpipe import transcribe as transcribe_mod
 from vpipe.transcribe import transcribe_audio
 from vpipe.waveform import compute_peaks
 
@@ -1498,6 +1500,64 @@ def network_offline(body: dict = Body(default={})):
             "summary": _network_summary(offline, st)}
 
 
+# --- A7: dependency health check ----------------------------------------------
+def _whisper_model_cached(model: str) -> bool:
+    """True when the configured Whisper model already sits in the local HF cache.
+
+    Pure filesystem check — reuses the vpipe.transcribe first-run-download
+    helpers (no network, no model load). Any error -> False, never raises.
+    """
+    try:
+        repo_id = transcribe_mod._hf_repo_id(model)
+        if repo_id is None:
+            return False
+        return bool(transcribe_mod._model_in_cache(
+            transcribe_mod._hf_model_dir(repo_id)))
+    except Exception:  # noqa: BLE001 — health must report, not crash
+        return False
+
+
+@app.get("/api/health")
+def health():
+    """Non-mutating self-diagnosis: are the external dependencies in place?
+
+    Fast (<1.5s: path lookups + a 0.8s-capped localhost ping + an fs stat) and
+    NEVER raises — every probe is individually shielded, a broken dependency is
+    a ``false`` in the payload, not a 500. ``ok`` covers only the hard
+    requirements (ffmpeg + ffprobe); Ollama and a cached Whisper model are
+    optional conveniences the UI can warn about.
+    """
+    cfg = APP.get("cfg")
+    ffmpeg_found, ffmpeg_path = False, None
+    ffprobe_found = False
+    try:
+        ffmpeg_path = ffmpeg_utils.resolve_bin(
+            cfg.ffmpeg.ffmpeg_bin if cfg else "ffmpeg", "ffmpeg")
+        ffmpeg_found = True
+    except Exception:  # noqa: BLE001 — FFmpegError or anything else: not found
+        ffmpeg_found, ffmpeg_path = False, None
+    try:
+        ffmpeg_utils.resolve_bin(
+            cfg.ffmpeg.ffprobe_bin if cfg else "ffprobe", "ffprobe")
+        ffprobe_found = True
+    except Exception:  # noqa: BLE001
+        ffprobe_found = False
+    ollama_found = False
+    try:
+        if cfg is not None:
+            ollama_found = OllamaClient(cfg.llm).available(timeout=0.8)
+    except Exception:  # noqa: BLE001 — Ollama off/unreachable: just False
+        ollama_found = False
+    whisper_cached = _whisper_model_cached(cfg.transcribe.model) if cfg else False
+    return {
+        "ok": ffmpeg_found and ffprobe_found,
+        "ffmpeg": {"found": ffmpeg_found, "path": ffmpeg_path},
+        "ffprobe": {"found": ffprobe_found},
+        "ollama": {"found": bool(ollama_found)},
+        "whisper_model_cached": bool(whisper_cached),
+    }
+
+
 # --- P2-#5: swappable local models (Whisper recognition + LLM) ----------------
 def _llm_snapshot(cfg: Config) -> dict:
     """Read-only LLM snapshot for the UI: current model + installed list.
@@ -2051,6 +2111,50 @@ async def events(request: Request):
                                       "X-Accel-Buffering": "no"})
 
 
+# --- A7: silence Windows client-disconnect noise -------------------------------
+class _ConnectionResetFilter(logging.Filter):
+    """Drop ONLY the ConnectionResetError / WinError 10054 noise.
+
+    On Windows, uvicorn + the asyncio proactor loop dump a full traceback
+    («ConnectionResetError [WinError 10054]», often via
+    ``_ProactorBasePipeTransport._call_connection_lost``) every time the browser
+    aborts an in-flight response — which happens constantly while seeking the
+    <video> element (each seek kills the previous /api/video range request).
+    That is normal client behaviour, not a server fault, so it is pure console
+    spam.
+
+    The filter is deliberately NARROW: it matches the exception type in
+    ``exc_info`` and the exact marker strings in the formatted message, and
+    nothing else — any other error on these loggers (real socket faults, h11
+    protocol errors, unhandled exceptions in tasks) still gets through, so we
+    never hide a genuine problem.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:  # True -> keep record
+        exc = record.exc_info[1] if isinstance(record.exc_info, tuple) and \
+            len(record.exc_info) > 1 else None
+        if isinstance(exc, ConnectionResetError):
+            return False
+        try:
+            msg = record.getMessage()
+        except Exception:  # noqa: BLE001 — unformattable record: keep it
+            return True
+        if "ConnectionResetError" in msg or "WinError 10054" in msg:
+            return False
+        return True
+
+
+def _install_connection_reset_filter() -> None:
+    """Attach the filter to the two loggers that emit the disconnect spam.
+
+    Logger-level filters survive uvicorn's dictConfig (it replaces handlers but
+    never strips existing filters), so installing before ``uvicorn.run`` works.
+    """
+    flt = _ConnectionResetFilter()
+    for name in ("uvicorn.error", "asyncio"):
+        logging.getLogger(name).addFilter(flt)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="FastVideoEdit web editor")
     ap.add_argument("--video", default=None, help="video to open (optional — you can pick one in the UI)")
@@ -2141,6 +2245,9 @@ def main() -> int:
             webbrowser.open(url)
         except Exception:
             pass
+    # A7: mute the «ConnectionResetError [WinError 10054]» tracebacks the
+    # proactor loop prints whenever the browser drops a video stream mid-read.
+    _install_connection_reset_filter()
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
     return 0
 
