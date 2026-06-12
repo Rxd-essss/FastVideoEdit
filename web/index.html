@@ -555,6 +555,25 @@
         </label>
         <div class="hint muted">Короткое затухание на каждом стыке убирает щелчки и делает переходы «мягкими». 0 — жёсткие резы (рубленый звук). 15 мс — рекомендуется. Длительность не меняется (звук остаётся синхронным с видео).</div>
       </div>
+      <div class="rmusic">
+        <label class="chk"><input type="checkbox" id="rMusic"> Фоновая музыка</label>
+        <div class="hint muted">Музыка стелется под речь и автоматически приглушается, когда вы говорите. Авто-дакинг считается локально (ffmpeg sidechaincompress) — без облака и Pro-подписок. Трек зацикливается на всю длину ролика.</div>
+        <div id="rMusicOpts" class="rmusicopts hidden">
+          <div class="routrow">
+            <input id="rMusicPath" class="search" type="text" placeholder="путь к файлу музыки (mp3, wav, flac…)" aria-label="Путь к файлу музыки">
+            <button class="btn" id="rMusicBrowse"><svg class="ic" aria-hidden="true"><use href="#i-folder-open"/></svg>Обзор</button>
+          </div>
+          <div class="rgrid">
+            <label>Громкость музыки <span id="rMusicGainVal" class="muted"></span>
+              <input id="rMusicGain" type="range" min="-40" max="0" step="1" value="-18" aria-label="Громкость музыки, дБ">
+            </label>
+            <label>Приглушение при речи <span id="rMusicDuckVal" class="muted"></span>
+              <input id="rMusicDuck" type="range" min="-30" max="0" step="1" value="-12" aria-label="Приглушение музыки при речи, дБ">
+            </label>
+          </div>
+          <div class="hint muted">Громкость — уровень подложки относительно речи (−18 дБ — рекомендуется). Приглушение — насколько музыка дополнительно «ныряет», когда звучит голос (−12 дБ — рекомендуется); в паузах плавно возвращается. В клипы Shorts музыка не добавляется.</div>
+        </div>
+      </div>
       <div class="rout">
         <div class="routrow">
           <input id="rOutDir" class="search" type="text" placeholder="папка вывода" aria-label="Папка вывода">
@@ -595,6 +614,17 @@
         <button class="btn btn-ghost btn-icon" id="btnCloseQueue" title="Закрыть" aria-label="Закрыть"><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg></button>
       </div>
       <div class="muted hintline">Несколько роликов подряд: каждый автоматически транскрибируется (если нужно), детектируется и рендерится. Обработка по одному — модели не грузят GPU одновременно с редактором.</div>
+      <div class="qWatch">
+        <label class="qWatchToggle">
+          <input type="checkbox" id="watchEnabled">
+          <span><strong>Папка-наблюдатель</strong> — новые видео из папки сами встают в очередь и рендерятся («кинул в папку — утром готово»). Файлы, уже лежащие в папке на момент включения, не трогаются.</span>
+        </label>
+        <div class="qAddRow">
+          <input id="watchFolderInput" class="search" type="text" placeholder="…папка, куда кидать видео" aria-label="Папка для наблюдения">
+          <button class="btn" id="btnWatchBrowse"><svg class="ic" aria-hidden="true"><use href="#i-folder"/></svg>Папка…</button>
+        </div>
+        <div id="watchStatus" class="muted qWatchStatus">Выключено</div>
+      </div>
       <div id="queueList" class="qList">
         <div class="empty placeholder"><svg class="ic ic-empty" aria-hidden="true"><use href="#i-queue"/></svg><div>Очередь пуста</div></div>
       </div>

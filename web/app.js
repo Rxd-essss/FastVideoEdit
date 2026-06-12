@@ -23,7 +23,7 @@ const st = {
   selected: null, selRange: null, preview: false, showCuts: true,
   manualN: 0, addingRegion: false, activeWord: -1, splitMark: null,
   inP: null, outP: null, fitPx: 0,
-  hasSession: false, curDir: null, outDir: '', rdefaults: {}, pickFolderCb: null, cb: '',
+  hasSession: false, curDir: null, outDir: '', rdefaults: {}, pickFolderCb: null, pickFileCb: null, cb: '',
   syncOffset: parseFloat(localStorage.getItem('fve_sync') || '0') || 0,
   spans: null,            // cached NodeList of .w spans (perf)
   _merged: null,          // memoized mergedRemoves() result
@@ -43,6 +43,9 @@ const st = {
   queueJobs: [],          // последний снимок [{id,name,status,percent,stage,result,error,...}]
   queueRunning: false,    // крутится ли воркер очереди
   queuePollTimer: 0,      // setInterval id опроса GET /api/queue
+  // C5 — папка-наблюдатель (секция сверху #queueModal)
+  watch: null,            // последний снимок GET /api/watch {enabled,folder,processed,error,...}
+  watchTimer: 0,          // setInterval id обновления статуса (живёт, пока модалка открыта)
   // F4 — Clip Maker: кандидаты Shorts (план §4) в ОРИГИНАЛЬНЫХ координатах
   clipsData: [],          // кандидаты [{id,start,end,score,hook_phrase,...}], сорт. по score desc
   clipsSel: new Set(),    // id карточек, выбранных чекбоксами под рендер
@@ -2477,6 +2480,17 @@ function seedRenderModal() {
     $('#rCutFade').value = ms
     setCutFadeLabel(ms)
   }
+  // C3: фоновая музыка + авто-дакинг — посев из дефолтов сервера (config.yaml).
+  if ($('#rMusic')) {
+    const mu = d.music || {}
+    $('#rMusic').checked = !!mu.enabled
+    $('#rMusicOpts').classList.toggle('hidden', !mu.enabled)
+    $('#rMusicPath').value = mu.path || ''
+    const g = (mu.gain_db != null) ? Math.round(mu.gain_db) : -18
+    const dk = (mu.duck_db != null) ? Math.round(mu.duck_db) : -12
+    $('#rMusicGain').value = g; setMusicGainLabel(g)
+    $('#rMusicDuck').value = dk; setMusicDuckLabel(dk)
+  }
   // Сбросить прошлый результат экспорта в NLE — иначе показывает устаревшую
   // ссылку на файл от прежнего набора вырезов (риск отдать не тот таймлайн).
   const nle = $('#nleResult'); if (nle) { nle.classList.add('hidden'); nle.classList.remove('error'); nle.textContent = '' }
@@ -2675,6 +2689,18 @@ function setCutFadeLabel(ms) {
   el.textContent = v === 0 ? '0 мс (жёстко)' : `${v} мс` + (v === 15 ? ' (реком.)' : '')
 }
 
+// C3: подписи слайдеров фоновой музыки (дБ + отметка рекомендованного).
+function setMusicGainLabel(v) {
+  const n = parseInt(v, 10)
+  const el = $('#rMusicGainVal'); if (!el) return
+  el.textContent = `${n} дБ` + (n === -18 ? ' (реком.)' : '')
+}
+function setMusicDuckLabel(v) {
+  const n = parseInt(v, 10)
+  const el = $('#rMusicDuckVal'); if (!el) return
+  el.textContent = n === 0 ? '0 дБ (без приглушения)' : `${n} дБ` + (n === -12 ? ' (реком.)' : '')
+}
+
 // Collect the burn-in subtitle opts from the render modal (or null if off).
 function burnOptsFromUI() {
   if (!$('#rBurn') || !$('#rBurn').checked) return null
@@ -2720,6 +2746,15 @@ function collectRenderOpts() {
     // "dynamic" = прежний однопроходный. Сервер принимает только эти два.
     loudnorm_mode: ($('#rLoudnorm2p') && $('#rLoudnorm2p').checked) ? '2pass' : 'dynamic',
     cut_fade: $('#rCutFade') ? parseInt($('#rCutFade').value, 10) / 1000 : undefined,  // ms -> s
+    // C3: фоновая музыка + авто-дакинг. Сервер валидирует путь/расширение
+    // (400 до старта задачи) и клампит дБ; клипы Shorts музыку не получают —
+    // clips_render/autopack принудительно шлют music=null в _resolve_render_opts.
+    music: {
+      enabled: !!($('#rMusic') && $('#rMusic').checked),
+      path: $('#rMusicPath') ? $('#rMusicPath').value.trim() : '',
+      gain_db: $('#rMusicGain') ? parseInt($('#rMusicGain').value, 10) : -18,
+      duck_db: $('#rMusicDuck') ? parseInt($('#rMusicDuck').value, 10) : -12,
+    },
     out_dir: $('#rOutDir').value.trim(),
     filename: $('#rFilename').value.trim(),
   }
@@ -3042,6 +3077,17 @@ function bindUI() {
     $('#rDenoise').onchange = (e) => $('#rDenoiseOpts').classList.toggle('hidden', !e.target.checked)
     $('#rDenoiseStrength').oninput = (e) => $('#rDenoiseStrengthVal').textContent = denoiseStrengthLabel(e.target.value)
   }
+  // C3: фоновая музыка — чекбокс раскрывает опции; «Обзор» переиспользует
+  // модалку #files в режиме выбора ФАЙЛА (kind=music: аудио + видео).
+  if ($('#rMusic')) {
+    $('#rMusic').onchange = (e) => $('#rMusicOpts').classList.toggle('hidden', !e.target.checked)
+    $('#rMusicGain').oninput = (e) => setMusicGainLabel(e.target.value)
+    $('#rMusicDuck').oninput = (e) => setMusicDuckLabel(e.target.value)
+    $('#rMusicBrowse').onclick = () => {
+      $('#renderModal').classList.add('hidden')
+      openFiles(true, null, (p) => { if (p) $('#rMusicPath').value = p; openOverlay('#renderModal') })
+    }
+  }
   // C2: форматы вывода — каждый чекбокс пишет выбор в localStorage и обновляет
   // честную подпись «время рендера ×N»; пустой выбор откатывается к «Исходный».
   for (const id of Object.values(RENDER_FMT_IDS)) {
@@ -3151,7 +3197,7 @@ function bindKeys() {
       if (k === 'Tab') { trapTab(e, ov); return }
       if (k === 'Escape') {
         e.preventDefault()
-        if (ov.id === 'files') { if (st.hasSession || st.pickFolderCb) closeFiles(null) }   // no-session opener: keep it modal
+        if (ov.id === 'files') { if (st.hasSession || st.pickFolderCb || st.pickFileCb) closeFiles(null) }   // no-session opener: keep it modal
         else closeOverlay('#' + ov.id)
         return
       }
@@ -3228,10 +3274,13 @@ const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&l
 const mb = (b) => b >= 1073741824 ? (b / 1073741824).toFixed(2) + ' ГБ' : (b / 1048576).toFixed(1) + ' МБ'
 const pathJoin = (dir, name) => { const s = dir.includes('\\') ? '\\' : '/'; return dir.endsWith(s) ? dir + name : dir + s + name }
 
-function openFiles(closable, pickCb) {
+function openFiles(closable, pickCb, fileCb) {
   st.pickFolderCb = pickCb || null
+  // C3: режим выбора ФАЙЛА (фоновая музыка): /api/browse?kind=music показывает
+  // аудио+видео, клик по файлу возвращает путь в колбэк вместо открытия сессии.
+  st.pickFileCb = fileCb || null
   $('#btnPickDir').classList.toggle('hidden', !pickCb)
-  $('#btnCloseFiles').style.display = (closable || pickCb) ? '' : 'none'
+  $('#btnCloseFiles').style.display = (closable || pickCb || fileCb) ? '' : 'none'
   lastFocus = document.activeElement
   $('#files').classList.remove('hidden')
   // A6/A7 — онбординг первого запуска: no-session пикер модален и неотключаем,
@@ -3252,17 +3301,22 @@ function openFiles(closable, pickCb) {
   const fi = $('#pathInput'); if (fi) fi.focus()
   browseDir(st.curDir)
 }
-// Single exit path for #files: always clears pickFolderCb (fixes Escape/close leak), restores focus.
-function closeFiles(pickedDir) {
+// Single exit path for #files: always clears pickFolderCb/pickFileCb (fixes Escape/close leak), restores focus.
+function closeFiles(picked) {
   $('#files').classList.add('hidden')
   const cb = st.pickFolderCb; st.pickFolderCb = null
+  const fcb = st.pickFileCb; st.pickFileCb = null
   if (lastFocus && document.contains(lastFocus)) { try { lastFocus.focus() } catch {} }
   lastFocus = null
-  if (cb) cb(pickedDir != null ? pickedDir : null)
+  if (cb) cb(picked != null ? picked : null)
+  else if (fcb) fcb(picked != null ? picked : null)
 }
 
 async function browseDir(dir) {
-  const url = '/api/browse' + (dir ? ('?dir=' + encodeURIComponent(dir)) : '')
+  const qs = []
+  if (dir) qs.push('dir=' + encodeURIComponent(dir))
+  if (st.pickFileCb) qs.push('kind=music')   // C3: аудио+видео для файл-пикера музыки
+  const url = '/api/browse' + (qs.length ? '?' + qs.join('&') : '')
   const res = await fetch(url)
   if (!res.ok) { $('#browser').innerHTML = '<div class="empty">Не удалось открыть папку</div>'; return }
   const j = await res.json()
@@ -3281,7 +3335,9 @@ async function browseDir(dir) {
   for (const f of j.files) {
     const el = document.createElement('div'); el.className = 'fitem video'
     el.innerHTML = `${icon('film')} <span>${esc(f.name)}</span> <span class="fsize">${mb(f.size)}</span>`
-    el.onclick = () => openPath(pathJoin(j.dir, f.name))
+    // C3: в режиме файл-пикера клик возвращает путь (closeFiles -> fileCb),
+    // а не открывает файл как новую сессию редактора.
+    el.onclick = () => st.pickFileCb ? closeFiles(pathJoin(j.dir, f.name)) : openPath(pathJoin(j.dir, f.name))
     box.appendChild(el)
   }
 }
@@ -3363,11 +3419,17 @@ function bindQueue() {
   on('#btnQueueStop', stopQueue)
   on('#btnQueueClear', clearQueue)
   const pi = $('#queuePathInput'); if (pi) pi.addEventListener('keydown', (e) => { if (e.key === 'Enter') addFileToQueue() })
+  // C5 — папка-наблюдатель: чекбокс применяет сразу, Enter в поле — тоже
+  on('#btnWatchBrowse', pickWatchFolder)
+  const we = $('#watchEnabled'); if (we) we.onchange = applyWatch
+  const wf = $('#watchFolderInput'); if (wf) wf.addEventListener('keydown', (e) => { if (e.key === 'Enter') applyWatch() })
 }
 
 async function openQueueModal() {
   await loadQueueList()
+  loadWatch()
   openOverlay('#queueModal')
+  startWatchRefresh()
 }
 
 // Текущие настройки рендера для постановки клипа в очередь: дефолты + текущая папка вывода.
@@ -3513,6 +3575,70 @@ function startQueuePoll() {
 }
 function stopQueuePoll() {
   if (st.queuePollTimer) { clearInterval(st.queuePollTimer); st.queuePollTimer = 0 }
+}
+
+/* ---------- C5: папка-наблюдатель («кинул в папку — утром готово») ---------- */
+function renderWatchStatus(j) {
+  const el = $('#watchStatus'); if (!el) return
+  el.classList.remove('error')
+  if (!j || !j.enabled) { el.textContent = 'Выключено — новые файлы из папки не подхватываются.'; return }
+  if (j.error) { el.classList.add('error'); el.textContent = j.error; return }
+  el.textContent = `Наблюдаю: ${j.folder} · обработано ${j.processed}`
+}
+
+async function loadWatch() {
+  let j
+  try { const res = await fetch('/api/watch'); if (!res.ok) throw new Error('HTTP ' + res.status); j = await res.json() }
+  catch { return }   // молча: статус-строка не критична, повторим следующим тиком
+  st.watch = j
+  const en = $('#watchEnabled'); if (en) en.checked = !!j.enabled
+  // Не перетирать путь под руками пользователя, пока он печатает в поле.
+  const inp = $('#watchFolderInput'); if (inp && document.activeElement !== inp) inp.value = j.folder || ''
+  renderWatchStatus(j)
+}
+
+async function applyWatch() {
+  const en = $('#watchEnabled'), inp = $('#watchFolderInput')
+  const enabled = !!(en && en.checked)
+  const folder = (inp && inp.value || '').trim()
+  if (enabled && !folder) { toast('Укажи папку для наблюдения', 'info'); if (en) en.checked = false; if (inp) inp.focus(); return }
+  let res
+  try {
+    res = await fetch('/api/watch', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled, folder }) })
+  } catch (e) { toast('Сеть: не удалось сохранить наблюдение (' + e + ')', 'error'); loadWatch(); return }
+  if (!res.ok) { await failToast(res, 'Наблюдатель'); loadWatch(); return }   // вернуть чекбокс/поле к фактическому состоянию сервера
+  const j = await res.json().catch(() => null)
+  if (j) { st.watch = j; renderWatchStatus(j); if (en) en.checked = !!j.enabled }
+  // C1: сервер при включении сидирует реестр содержимым папки — уже лежащие
+  // файлы НЕ встают в очередь. Говорим это явно, с числом (seeded из ответа).
+  const seeded = (j && j.seeded) || 0
+  toast(enabled
+    ? 'Наблюдение включено — в очередь встанут только новые видео' + (seeded ? ` (уже лежащие ${seeded} не трогаю)` : '')
+    : 'Наблюдение выключено', 'success')
+}
+
+function pickWatchFolder() {
+  // Паттерн #rBrowseOut: спрятать модалку, открыть «Файлы» в режиме выбора папки.
+  $('#queueModal').classList.add('hidden')
+  openFiles(true, (dir) => {
+    if (dir) { const inp = $('#watchFolderInput'); if (inp) inp.value = dir }
+    openOverlay('#queueModal')
+    // Наблюдение уже включено -> смена папки применяется сразу (поток перезапустится).
+    const en = $('#watchEnabled')
+    if (dir && en && en.checked) applyWatch()
+  })
+}
+
+// Пока модалка очереди открыта — освежать строку «Наблюдаю … · обработано N»
+// раз в 10 с (бейдж очереди обновляет свой polling). Интервал гасит себя сам,
+// когда модалку закрыли, — не нужен хук в closeOverlay.
+function startWatchRefresh() {
+  if (st.watchTimer) return
+  st.watchTimer = setInterval(() => {
+    const ov = $('#queueModal')
+    if (!ov || ov.classList.contains('hidden')) { clearInterval(st.watchTimer); st.watchTimer = 0; return }
+    loadWatch()
+  }, 10000)
 }
 
 /* ---------- P2-#4: бейдж «zero-upload» + модалка приватности ---------- */

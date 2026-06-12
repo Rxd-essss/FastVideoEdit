@@ -91,6 +91,10 @@ EXT_MIME = {".mp4": "video/mp4", ".m4v": "video/mp4", ".mov": "video/quicktime",
             ".ts": "video/mp2t", ".flv": "video/x-flv", ".wmv": "video/x-ms-wmv",
             ".mpg": "video/mpeg", ".mpeg": "video/mpeg"}
 MAX_UPLOAD_BYTES = 30 * 1024**3   # 30 GB upload cap
+# C3 (фоновая музыка): белый список расширений для music.path — аудио либо
+# видео (из видеоконтейнера ffmpeg возьмёт звуковую дорожку).
+AUDIO_EXT = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".wma"}
+MUSIC_EXT = AUDIO_EXT | VIDEO_EXT
 # Extensions /api/output is allowed to serve — exactly the artifacts the pipeline
 # produces (rendered video, sidecar subs, chapters/metadata txt, NLE projects).
 OUTPUT_EXT_ALLOWED = {".mp4", ".mov", ".mkv", ".webm", ".m4v",
@@ -903,6 +907,41 @@ def _resolve_render_opts(s: Session, opts: dict):
         except (TypeError, ValueError):
             pass
 
+    # --- C3: фоновая музыка + авто-дакинг (sidechaincompress) ----------------
+    # Контракт как у denoise: без явного opts.music музыка ВЫКЛЮЧЕНА — даже
+    # если config.yaml включил её в сессии. Именно это серверно гарантирует
+    # клипам Clip Maker рендер БЕЗ подложки: clips_render и Авто-пак шлют
+    # сюда render_opts с music=None. Битый путь/расширение — 400 на запросе
+    # (а не ошибка задачи); громкости клампятся, мусор в них игнорируется.
+    mu = opts.get("music")
+    if isinstance(mu, dict) and mu.get("enabled"):
+        mc = cfg.render.music
+        p = str(mu.get("path") or "").strip()
+        if not p:
+            raise HTTPException(400, "Фоновая музыка: укажи путь к аудиофайлу")
+        pp = Path(p).expanduser()
+        if pp.suffix.lower() not in MUSIC_EXT:
+            raise HTTPException(
+                400, "Фоновая музыка: неподдерживаемый формат "
+                     f"«{pp.suffix or 'без расширения'}». Аудио: "
+                     + ", ".join(sorted(AUDIO_EXT)) + " или видеофайл.")
+        if not pp.is_file():
+            raise HTTPException(400, f"Фоновая музыка: файл не найден: {p}")
+        mc.enabled = True
+        mc.path = str(pp.resolve())
+        if mu.get("gain_db") is not None:
+            try:                              # слайдер «Громкость музыки», дБ
+                mc.gain_db = max(-40.0, min(0.0, float(mu["gain_db"])))
+            except (TypeError, ValueError):
+                pass
+        if mu.get("duck_db") is not None:
+            try:                              # слайдер «Приглушение при речи»
+                mc.duck_db = max(-30.0, min(0.0, float(mu["duck_db"])))
+            except (TypeError, ValueError):
+                pass
+    else:
+        cfg.render.music.enabled = False
+
     # --- scale_h: None (source) or an int in [144, 4320] ---------------------
     # When vertical is on, the exact target scale is baked into the crop filter,
     # so the generic height resize is ignored (forced to None) to avoid a double
@@ -1398,6 +1437,276 @@ def _start_queue_worker() -> None:
     _queue_worker_thread.start()
 
 
+# --- C5: папка-наблюдатель («кинул в папку — утром готово») -------------------
+# Фоновый daemon-поток раз в WATCH_SCAN_INTERVAL секунд сканирует выбранную
+# папку и ставит каждый НОВЫЙ видеофайл в существующую batch-очередь
+# (транскрипция -> детекция -> рендер с дефолтными опциями), затем автостартует
+# воркер очереди. «Новый» = файла нет в реестре обработанных И его (size, mtime)
+# не менялись между двумя последовательными сканами — файл, который ещё
+# копируется в папку, растёт между сканами и честно ждёт следующего прохода.
+#
+# «Новый» отсчитывается от МОМЕНТА ВКЛЮЧЕНИЯ: watch_set при включении (или
+# смене папки) сидирует реестр текущим содержимым папки, поэтому включение
+# наблюдателя на архиве из 50 роликов НЕ ставит их все в очередь — ровно то,
+# что обещает UI («новые видео из папки встанут в очередь»).
+#
+# Состояние {enabled, folder} и реестр обработанных персистятся в
+# cache_dir/watch.json (atomic .tmp -> os.replace, как queue.json), чтобы
+# рестарт сервера не пережёвывал всю папку заново. Реестр ключуется
+# os.path.normcase(абсолютный путь): Windows-пути регистронезависимы.
+
+WATCH_SCAN_INTERVAL = 15.0           # секунд между сканами папки
+WATCH_LOCK = threading.Lock()        # guards WATCH / WATCH_PROCESSED / WATCH_STATUS
+WATCH: dict = {"enabled": False, "folder": None, "render_opts_preset": "current"}
+WATCH_PROCESSED: dict[str, dict] = {}   # normcase(path) -> {"size": int, "mtime": float}
+WATCH_STATUS: dict = {"error": None, "last_scan": None}
+_watch_thread: Optional[threading.Thread] = None
+_watch_stop = threading.Event()      # личный Event ТЕКУЩЕГО потока (см. _watch_apply)
+
+
+def _watch_path() -> Path:
+    """``cache_dir/watch.json`` — персист состояния наблюдателя + реестра."""
+    return Path(APP["cfg"].paths.cache_dir) / "watch.json"
+
+
+def _save_watch() -> None:
+    """Persist WATCH + реестр атомарно. Best-effort: never raises (паттерн
+    _save_queue — память истина, диск бонус)."""
+    with WATCH_LOCK:
+        snapshot = {"enabled": bool(WATCH["enabled"]),
+                    "folder": WATCH["folder"],
+                    "render_opts_preset": WATCH.get("render_opts_preset", "current"),
+                    "processed": {k: dict(v) for k, v in WATCH_PROCESSED.items()}}
+    p = _watch_path()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(snapshot, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, p)
+    except Exception:  # noqa: BLE001 — best-effort
+        pass
+
+
+def _load_watch() -> None:
+    """Восстановить watch.json при старте. Отсутствует/битый -> выключено.
+
+    Реестр фильтруется по типам (паттерн _load_queue: мусорная запись не валит
+    загрузку). enabled без папки невозможен — гасится."""
+    try:
+        raw = json.loads(_watch_path().read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 — missing / unreadable / bad JSON
+        return
+    if not isinstance(raw, dict):
+        return
+    folder = raw.get("folder")
+    folder = folder if isinstance(folder, str) and folder else None
+    processed = raw.get("processed")
+    with WATCH_LOCK:
+        WATCH["enabled"] = bool(raw.get("enabled", False)) and folder is not None
+        WATCH["folder"] = folder
+        WATCH["render_opts_preset"] = "current"
+        WATCH_PROCESSED.clear()
+        if isinstance(processed, dict):
+            for k, v in processed.items():
+                if (isinstance(k, str) and k and isinstance(v, dict)
+                        and isinstance(v.get("size"), (int, float))
+                        and not isinstance(v.get("size"), bool)
+                        and isinstance(v.get("mtime"), (int, float))
+                        and not isinstance(v.get("mtime"), bool)):
+                    WATCH_PROCESSED[k] = {"size": int(v["size"]),
+                                          "mtime": float(v["mtime"])}
+
+
+def _watch_list_videos(folder: Path) -> dict[str, tuple[Path, int, float]]:
+    """Снимок видеофайлов папки: normcase(resolve) -> (Path, size, mtime).
+
+    Те же правила, что /api/browse: белый список VIDEO_EXT, без dot-файлов,
+    только обычные файлы. Используется и сканером (scan_once), и сидированием
+    реестра при включении наблюдения (watch_set) — критерий «что считается
+    видео в этой папке» один на двоих. Папка недоступна -> OSError наружу.
+    """
+    seen: dict[str, tuple[Path, int, float]] = {}
+    for e in sorted(folder.iterdir(), key=lambda p: p.name.lower()):
+        if e.name.startswith(".") or e.suffix.lower() not in VIDEO_EXT:
+            continue
+        try:
+            if not e.is_file():
+                continue
+            st_ = e.stat()
+        except OSError:
+            continue   # файл исчез между iterdir и stat — подождёт следующего скана
+        key = os.path.normcase(str(e.resolve()))
+        seen[key] = (e, int(st_.st_size), float(st_.st_mtime))
+    return seen
+
+
+def scan_once(folder: Path, registry: dict[str, dict],
+              pending: dict[str, tuple[int, float]]) -> list[Path]:
+    """Один проход сканера — чистая list/dict-логика (без enqueue и без локов),
+    чтобы тесты гоняли её напрямую.
+
+    * ``registry`` — обработанные: normcase(path) -> {"size", "mtime"}.
+    * ``pending``  — кандидаты прошлого скана: normcase(path) -> (size, mtime).
+
+    Возвращает видеофайлы (белый список VIDEO_EXT, как /api/browse), которые
+    НОВЫЕ (нет в registry, либо файл заменён — size/mtime не совпали с записью)
+    И СТАБИЛЬНЫЕ (size+mtime не изменились с прошлого скана — копирование
+    закончилось). Оба словаря мутируются на месте: исчезнувшие из ЭТОЙ папки
+    файлы вычищаются (записи других папок не трогаем — смена папки наблюдения
+    не убивает их историю), стабильные переезжают pending -> registry.
+
+    Папка недоступна (сетевой диск отвалился) -> OSError наружу: вызывающий
+    показывает статус «папка недоступна», поток живёт.
+    """
+    seen = _watch_list_videos(folder)
+
+    # Удалённый из папки файл вычищаем из реестра и кандидатов — но только
+    # записи ПОД этой папкой (ключи нормализованы normcase(resolve())).
+    prefix = os.path.normcase(str(folder.resolve())).rstrip("\\/") + os.sep
+    for d in (registry, pending):
+        for key in [k for k in d if k.startswith(prefix) and k not in seen]:
+            d.pop(key, None)
+
+    new_files: list[Path] = []
+    for key, (path, size, mtime) in seen.items():
+        rec = registry.get(key)
+        if rec is not None and rec.get("size") == size and rec.get("mtime") == mtime:
+            pending.pop(key, None)
+            continue                        # уже обработан и не менялся
+        if pending.get(key) == (size, mtime):
+            # Двухфазная стабильность: размер/время не менялись целый скан.
+            pending.pop(key, None)
+            registry[key] = {"size": size, "mtime": mtime}
+            new_files.append(path)
+        else:
+            pending[key] = (size, mtime)    # ждём подтверждения следующим сканом
+    return new_files
+
+
+def _watch_busy_paths() -> set[str]:
+    """normcase-пути, уже идущие через UI: всё в QUEUE (любой статус — done/error
+    тоже: их уже обработали) + клип, открытый в редакторе. Сканер их не трогает."""
+    busy: set[str] = set()
+    with QUEUE_LOCK:
+        for j in QUEUE:
+            busy.add(os.path.normcase(j.path))
+    s = SESSION
+    if s is not None:
+        try:
+            busy.add(os.path.normcase(str(s.inp.resolve())))
+        except OSError:
+            pass
+    return busy
+
+
+def _watch_tick(folder_str: str, pending: dict[str, tuple[int, float]]) -> int:
+    """Один проход наблюдателя: скан -> enqueue новых -> persist. Возвращает
+    число поставленных в очередь файлов. Никогда не raise'ит (поток живёт).
+
+    Реестр копируется под WATCH_LOCK, скан (диск, возможно сетевой) идёт БЕЗ
+    лока, результат пишется обратно под локом — GET/POST /api/watch не ждут I/O.
+    """
+    log = logging.getLogger("fastvideoedit.watch")
+    with WATCH_LOCK:
+        before = {k: dict(v) for k, v in WATCH_PROCESSED.items()}
+    registry = {k: dict(v) for k, v in before.items()}
+
+    try:
+        new_files = scan_once(Path(folder_str), registry, pending)
+    except OSError as e:
+        with WATCH_LOCK:
+            WATCH_STATUS["error"] = "Папка недоступна: " + folder_str
+            WATCH_STATUS["last_scan"] = time.time()
+        log.warning("watch: folder unavailable %s (%s)", folder_str, e)
+        return 0
+
+    busy = _watch_busy_paths()
+    enqueued = 0
+    for p in new_files:
+        rp = str(p.resolve())
+        if os.path.normcase(rp) in busy:
+            continue   # уже в очереди/редакторе — не дублируем (в реестр попал)
+        job = QueueJob(id=uuid.uuid4().hex[:8], path=rp,
+                       out_dir=str(APP["out_dir"]), render_opts={})
+        with QUEUE_LOCK:
+            QUEUE.append(job)
+        enqueued += 1
+        log.info("watch: добавлен в очередь %s", p.name)
+    if enqueued:
+        _save_queue()
+
+    with WATCH_LOCK:
+        WATCH_PROCESSED.clear()
+        WATCH_PROCESSED.update(registry)
+        WATCH_STATUS["error"] = None
+        WATCH_STATUS["last_scan"] = time.time()
+    if registry != before:
+        _save_watch()
+    return enqueued
+
+
+def _watch_worker(stop: threading.Event) -> None:
+    """Daemon-цикл наблюдателя. ``stop`` — ЛИЧНЫЙ Event этого потока (передан
+    при создании), так что сигнал старому потоку не глушит новый после
+    перезапуска через POST /api/watch.
+
+    ``pending`` (кандидаты двухфазной проверки) живёт локально в потоке: смена
+    папки = новый поток = чистые кандидаты, никаких гонок на общем состоянии.
+    Автостарт очереди ретраится каждый проход, пока редактор занят (409)."""
+    pending: dict[str, tuple[int, float]] = {}
+    want_start = False
+    while not stop.is_set():
+        with WATCH_LOCK:
+            enabled, folder = bool(WATCH["enabled"]), WATCH["folder"]
+        if not enabled or not folder:
+            break
+        if _watch_tick(folder, pending):
+            want_start = True
+        if want_start and not stop.is_set():
+            try:
+                _start_queue_worker()
+                want_start = False
+            except HTTPException:
+                pass   # редактор выполняет задачу — повторим через интервал
+        if stop.wait(WATCH_SCAN_INTERVAL):
+            break
+
+
+def _watch_apply() -> None:
+    """Привести фоновый поток в соответствие WATCH (вызов из main() и из
+    POST /api/watch — без рестарта сервера).
+
+    Текущий поток (если был) останавливается СВОИМ Event'ом; новый получает
+    СВЕЖИЙ Event, поэтому сигнал старому никогда не убивает новый. Старый поток
+    может дорабатывать последний tick параллельно со стартом нового — это
+    безопасно: его pending локален, а новый поток начинает с пустых кандидатов
+    (до первого enqueue минимум два скана), дублей не возникает."""
+    global _watch_thread, _watch_stop
+    _watch_stop.set()
+    with WATCH_LOCK:
+        enabled = bool(WATCH["enabled"]) and bool(WATCH["folder"])
+    if not enabled:
+        _watch_thread = None
+        return
+    _watch_stop = threading.Event()
+    _watch_thread = threading.Thread(target=_watch_worker, args=(_watch_stop,),
+                                     daemon=True, name="watch-folder")
+    _watch_thread.start()
+
+
+def _watch_state_dict() -> dict:
+    """Снимок состояния для GET/POST /api/watch (всё под одним локом)."""
+    with WATCH_LOCK:
+        return {
+            "enabled": bool(WATCH["enabled"]),
+            "folder": WATCH["folder"],
+            "render_opts_preset": WATCH.get("render_opts_preset", "current"),
+            "processed": len(WATCH_PROCESSED),
+            "error": WATCH_STATUS.get("error"),
+            "last_scan": WATCH_STATUS.get("last_scan"),
+        }
+
+
 def S() -> Session:
     if SESSION is None:
         raise HTTPException(409, "No video opened")
@@ -1465,6 +1774,13 @@ def state():
             "denoise_loudnorm": s.cfg.render.denoise.loudnorm,
             "loudnorm_mode": s.cfg.render.denoise.loudnorm_mode,
             "cut_fade": s.cfg.render.cut_fade,
+            # C3: фоновая музыка + авто-дакинг — посев секции renderModal.
+            "music": {
+                "enabled": s.cfg.render.music.enabled,
+                "path": s.cfg.render.music.path or "",
+                "gain_db": s.cfg.render.music.gain_db,
+                "duck_db": s.cfg.render.music.duck_db,
+            },
             # P2-#5: current model choices (defaults for the «⚙ Модели» modal).
             "whisper_model": s.cfg.transcribe.model,
             "llm_model": s.cfg.llm.model,
@@ -1495,11 +1811,14 @@ def _network_state() -> dict:
 
 
 @app.get("/api/browse")
-def browse(dir: Optional[str] = None):
+def browse(dir: Optional[str] = None, kind: Optional[str] = None):
     base = Path(dir).expanduser() if dir else Path(APP.get("start_dir", str(Path.cwd())))
     base = base.resolve()
     if not base.exists() or not base.is_dir():
         raise HTTPException(404, "Folder not found")
+    # kind="music": файл-пикер фоновой музыки (C3) — показываем аудио и видео
+    # из MUSIC_EXT; любой другой kind — прежний список видеофайлов.
+    exts = MUSIC_EXT if kind == "music" else VIDEO_EXT
     folders, files = [], []
     try:
         for e in sorted(base.iterdir(), key=lambda p: p.name.lower()):
@@ -1508,7 +1827,7 @@ def browse(dir: Optional[str] = None):
             try:
                 if e.is_dir():
                     folders.append(e.name)
-                elif e.suffix.lower() in VIDEO_EXT:
+                elif e.suffix.lower() in exts:
                     files.append({"name": e.name, "size": e.stat().st_size})
             except OSError:
                 continue
@@ -2326,6 +2645,81 @@ def queue_clear():
     return {"ok": True, "removed": removed}
 
 
+# --- C5: watch-folder endpoints ----------------------------------------------
+@app.get("/api/watch")
+def watch_get():
+    return _watch_state_dict()
+
+
+@app.post("/api/watch")
+def watch_set(body: dict = Body(...)):
+    """Вкл/выкл наблюдение и/или смена папки. Мутирующий POST /api/* — CSRF
+    закрыт общим _csrf_guard. Поток перезапускается сразу (_watch_apply),
+    без рестарта сервера.
+
+    Включение (или смена папки) СИДИРУЕТ реестр текущим содержимым папки:
+    обрабатываются только файлы, появившиеся ПОСЛЕ включения, — как и обещает
+    UI. В ответе ``seeded`` — сколько уже лежавших видео помечено «не трогать»."""
+    enabled = bool(body.get("enabled", False))
+    folder_raw = str(body.get("folder") or "").strip()
+    folder: Optional[str] = folder_raw or None
+    if enabled:
+        if not folder_raw:
+            raise HTTPException(400, "Укажи папку для наблюдения / "
+                                     "Watch folder is required")
+        p = Path(folder_raw).expanduser()
+        if not p.exists() or not p.is_dir():
+            raise HTTPException(404, "Папка не найдена / Folder not found")
+        folder = str(p.resolve())
+        # folder == out_dir -> каждый отрендеренный mp4 попадал бы обратно в
+        # скан и рендерился заново — бесконечная рекурсия. Жёсткий отказ.
+        try:
+            out_res = str(Path(str(APP["out_dir"])).expanduser().resolve())
+        except OSError:
+            out_res = str(Path(str(APP["out_dir"])).expanduser())
+        if os.path.normcase(folder) == os.path.normcase(out_res):
+            raise HTTPException(400, "Папка наблюдения совпадает с папкой "
+                                     "вывода рендера — готовые файлы попадали "
+                                     "бы обратно в очередь. Выбери другую папку.")
+
+    # C1: «новые» = появившиеся ПОСЛЕ включения. При включении (или смене папки
+    # под включённым наблюдением) всё, что уже лежит в папке, сидируется в
+    # реестр как обработанное — иначе первый же скан поставил бы в очередь весь
+    # старый архив, а UI обещает обратное. Повторный POST с той же папкой при
+    # УЖЕ включённом наблюдении НЕ сидирует: файл, ждущий двухфазного
+    # подтверждения сканера, не должен «проглатываться». Файл, копирующийся
+    # прямо в момент включения, попадает в реестр с промежуточным size/mtime и
+    # будет подхвачен сканером как «заменённый», когда докопируется, — его
+    # бросили в папку уже при включённом наблюдателе, обработать честно.
+    with WATCH_LOCK:
+        was_active = bool(WATCH["enabled"]) and bool(WATCH["folder"])
+        prev_folder = WATCH["folder"]
+    seed: dict[str, dict] = {}
+    if enabled and (not was_active or
+                    os.path.normcase(prev_folder or "") != os.path.normcase(folder)):
+        try:
+            seed = {k: {"size": size, "mtime": mtime}
+                    for k, (_p, size, mtime)
+                    in _watch_list_videos(Path(folder)).items()}
+        except OSError:
+            # Не включаем наблюдение с несидированным реестром — иначе бэклог
+            # молча уехал бы в очередь при первом удачном скане.
+            raise HTTPException(400, "Папка недоступна — не удалось прочитать "
+                                     "её содержимое. Проверь путь и попробуй "
+                                     "ещё раз.")
+    with WATCH_LOCK:
+        WATCH["enabled"] = enabled
+        WATCH["folder"] = folder
+        WATCH_PROCESSED.update(seed)
+        if not enabled:
+            WATCH_STATUS["error"] = None
+    _save_watch()
+    _watch_apply()
+    out = _watch_state_dict()
+    out["seeded"] = len(seed)
+    return out
+
+
 # --- F2: lightweight previews (no ffmpeg / no video render) -----------------
 @app.post("/api/preview/subtitles")
 def preview_subtitles():
@@ -2728,8 +3122,11 @@ def clips_render(body: dict = Body(default={})):
     if not isinstance(render_opts, dict):
         render_opts = {}
     # Сервер принудительно глушит главы/метаданные для клипов (план §2.4) —
-    # независимо от того, что прислал клиент.
-    render_opts = {**render_opts, "chapters": False, "metadata": False}
+    # независимо от того, что прислал клиент. music=None — клипы Shorts НИКОГДА
+    # не получают фоновую подложку (C3): _resolve_render_opts при не-dict
+    # music принудительно выключает cfg.render.music.
+    render_opts = {**render_opts, "chapters": False, "metadata": False,
+                   "music": None}
 
     duration = float(s.media.duration)
     clips_in: list[dict] = []
@@ -2909,7 +3306,9 @@ def autopack(body: dict = Body(default={})):
 
     # Сервер принудительно глушит главы/метаданные для клипов (паттерн
     # /api/clips/render) — иначе каждый клип гонял бы LLM и тёр metadata.txt.
-    clip_opts = {**render_opts, "chapters": False, "metadata": False}
+    # music=None — подложка (C3) только в ОСНОВНОМ ролике, клипы без музыки.
+    clip_opts = {**render_opts, "chapters": False, "metadata": False,
+                 "music": None}
     cl_duration = float(s.media.duration)
 
     def run():
@@ -3139,6 +3538,11 @@ def main() -> int:
     # (server died mid-render) is reset to 'pending'; done/error jobs keep their
     # result/error. The worker is NOT auto-started — the user presses «Старт».
     _load_queue()
+
+    # C5: папка-наблюдатель — восстановить watch.json и, если включён, поднять
+    # фоновый сканер (реестр обработанных не даст пережевать папку заново).
+    _load_watch()
+    _watch_apply()
 
     # Startup offline state: persisted flag from privacy.json, overridden by --offline.
     start_offline = _read_privacy_offline() or args.offline

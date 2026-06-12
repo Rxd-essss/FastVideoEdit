@@ -480,6 +480,12 @@ main { flex: 1; display: flex; min-height: 0; }
 .rsmooth .hint { margin-top: 4px; }
 .rdenoiseopts { margin-top: 10px; padding: 12px 14px; border: 1px solid var(--line); border-radius: var(--r-md); background: rgba(255,255,255,.02); }
 .rdenoiseopts .rgrid { margin: 0 0 10px; grid-template-columns: 1fr; }
+/* C3 — фоновая музыка + авто-дакинг: секция renderModal (паттерн .rdenoise) */
+.rmusic { padding: 4px 0 12px; border-top: 1px solid var(--line); }
+.rmusic .hint { margin-top: 4px; }
+.rmusicopts { margin-top: 10px; padding: 12px 14px; border: 1px solid var(--line); border-radius: var(--r-md); background: rgba(255,255,255,.02); }
+.rmusicopts .routrow { margin: 0 0 10px; }
+.rmusicopts .rgrid { margin: 0 0 10px; }
 .rburnopts { margin-top: 10px; padding: 12px 14px; border: 1px solid var(--line); border-radius: var(--r-md); background: rgba(255,255,255,.02); }
 .rburnopts .rgrid { margin: 0 0 10px; }
 .rcolor { width: 100%; height: 32px; padding: 2px; border: 1px solid var(--line); border-radius: 6px; background: transparent; cursor: pointer; }
@@ -683,6 +689,17 @@ main { flex: 1; display: flex; min-height: 0; }
   align-items: center; margin-top: 8px; flex-wrap: wrap; }
 .qAddRow { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
 .qAddRow .search { flex: 1; min-width: 0; }
+
+/* C5 — папка-наблюдатель (секция сверху #queueModal) */
+.qWatch { border: 1px solid var(--line); border-radius: var(--r-md); background: var(--surface2);
+  padding: 12px 14px; margin-bottom: 4px; flex: none; }
+.qWatch .qAddRow { margin-top: 8px; }
+.qWatchToggle { display: flex; gap: 10px; align-items: flex-start; cursor: pointer;
+  font-size: 13px; color: var(--muted); }
+.qWatchToggle input { margin-top: 2px; flex: none; }
+.qWatchToggle strong { color: var(--text); }
+.qWatchStatus { font-size: 12px; margin-top: 8px; }
+.qWatchStatus.error { color: #ff8d8d; }
 
 /* ---------- a11y: видимый фокус для клавиатуры (P0-15) ---------- */
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }

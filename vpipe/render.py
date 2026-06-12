@@ -296,9 +296,94 @@ def build_loudnorm_measure_chain(cfg: Config) -> str:
     return ",".join(build_apost(mcfg) + [_LOUDNORM_MEASURE])
 
 
+# --- background music bed + auto-duck (C3, render.music) ---------------------
+def music_source(cfg: Config, log=print) -> Optional[str]:
+    """The validated background-music path, or ``None`` (disabled / missing).
+
+    Render-side safety net: serve validates ``music.path`` with a 400 up
+    front, but a config-file user can point it anywhere — a missing file logs
+    an honest message and the render continues WITHOUT music (the bed must
+    never fail a render)."""
+    m = getattr(cfg.render, "music", None)
+    if m is None or not getattr(m, "enabled", False):
+        return None
+    p = str(getattr(m, "path", "") or "").strip()
+    if not p:
+        log("  Фоновая музыка: путь к файлу не задан — рендер без музыки.")
+        return None
+    if not Path(p).is_file():
+        log(f"  Фоновая музыка: файл не найден ({p}) — рендер без музыки.")
+        return None
+    return p
+
+
+def build_music_mix(m, music_idx: int, speech_lbl: str, out_lbl: str,
+                    out_dur: float) -> str:
+    """Filtergraph block: looped bed -> gain -> sidechain duck -> sum w/ speech.
+
+    ``[music_idx:a]`` is the looped (``-stream_loop -1``) music input: atrim
+    caps it at the FINAL program duration (after cuts), ``volume`` drops it to
+    ``gain_db``. The speech is split in two: one copy stays the on-air voice,
+    the other is the sidechain KEY — ``sidechaincompress`` (main=music,
+    key=speech) pushes the bed down while the host talks; ``duck_db`` maps to
+    the filter's ``mix`` (see :class:`vpipe.config.MusicCfg`). ``amix`` sums
+    voice + ducked bed with ``normalize=0`` (no -6 dB penalty on the speech)
+    and ``duration=first`` (the SPEECH defines the program length)."""
+    duck = min(0.0, float(getattr(m, "duck_db", -12.0) or 0.0))
+    mix = min(1.0, max(0.0, 1.0 - 10.0 ** (duck / 20.0)))
+    gain = float(getattr(m, "gain_db", -18.0) or 0.0)
+    return (
+        f"[{music_idx}:a]atrim=start=0:end={_f(out_dur)},asetpts=PTS-STARTPTS,"
+        f"volume={gain:g}dB[bgm];"
+        f"{speech_lbl}asplit=2[spd][spk];"
+        f"[bgm][spk]sidechaincompress=threshold={float(m.threshold):g}"
+        f":ratio={float(m.ratio):g}:attack={float(m.attack):g}"
+        f":release={float(m.release):g}:mix={mix:.3f}[duck];"
+        f"[spd][duck]amix=inputs=2:duration=first:dropout_transition=0"
+        f":normalize=0{out_lbl}"
+    )
+
+
+def _split_apost_at_loudnorm(apost: list[str]) -> tuple[list[str], list[str]]:
+    """Split the audio post chain into (speech-only, mastering) halves.
+
+    Everything BEFORE the loudnorm filter (highpass/afftdn/dynaudnorm/deesser)
+    treats the SPEECH and must run before the music is mixed in — denoising the
+    bed would be wrong. loudnorm and its trailing aresample master the FINAL
+    mix, so they run after. Without loudnorm the whole chain is speech-only."""
+    for i, f in enumerate(apost):
+        if f.startswith("loudnorm"):
+            return apost[:i], apost[i:]
+    return list(apost), []
+
+
+def _music_audio_graph(cfg: Config, speech_lbl: str, music_idx: int,
+                       out_dur: float, apost: list[str],
+                       efades: list[str]) -> str:
+    """Full audio sub-graph with the music bed, ending in ``[outa]``.
+
+    Order contract (КРИТИЧНО): speech-only treatment (denoise trio + deesser)
+    -> ducked-music mix -> loudnorm(+aresample) -> edge fades. loudnorm MUST
+    master the FINAL mix — running it before amix would normalise the speech
+    alone and the published loudness would be off by up to ``gain_db``."""
+    pre, master = _split_apost_at_loudnorm(apost)
+    parts: list[str] = []
+    sp = speech_lbl
+    if pre:
+        parts.append(f"{sp}{','.join(pre)}[sp]")
+        sp = "[sp]"
+    tail = master + efades
+    parts.append(build_music_mix(cfg.render.music, music_idx, sp,
+                                 "[mix]" if tail else "[outa]", out_dur))
+    if tail:
+        parts.append(f"[mix]{','.join(tail)}[outa]")
+    return ";".join(parts)
+
+
 def measure_loudness(ff: FFmpeg, cfg: Config, inputs: list[str], asrc_idx: str,
                      kept: Optional[list[tuple[float, float]]], *,
                      cut_fade: float = 0.0, total: Optional[float] = None,
+                     music_idx: Optional[int] = None, music_dur: float = 0.0,
                      log=print) -> Optional[dict]:
     """Loudnorm measurement pass: replay the FINAL audio into ``-f null``.
 
@@ -309,22 +394,44 @@ def measure_loudness(ff: FFmpeg, cfg: Config, inputs: list[str], asrc_idx: str,
     on stderr. Only the audio stream is mapped, so the video is never decoded
     and the pass takes seconds.
 
+    ``music_idx`` (C3, the background-music bed): when set, the measurement
+    includes the SAME ducked-music mix the encode pass will feed into loudnorm
+    (speech treatment -> :func:`build_music_mix` -> measure) — otherwise the
+    measured I/TP/LRA would describe the bare speech, not loudnorm's real
+    input, and the linear pass 2 would land off-target by up to ``gain_db``.
+    ``music_dur`` is the FINAL audio duration the bed is trimmed to.
+
     Graceful degradation: ANY failure (ffmpeg error, no/broken JSON) logs an
     honest message and returns ``None`` — the caller falls back to the one-pass
     dynamic loudnorm and the render NEVER fails because of the measurement.
     """
     log("Измеряю громкость…")
-    chain = build_loudnorm_measure_chain(cfg)
     asrc = f"[{asrc_idx}:a]"
     if kept:
         n_kept = len(kept)
         aparts = [_audio_seg_filter(asrc, a, b, i, n_kept, cut_fade) + f"[a{i}]"
                   for i, (a, b) in enumerate(kept)]
         labels = "".join(f"[a{i}]" for i in range(n_kept))
-        graph = (";".join(aparts) + ";" + labels
-                 + f"concat=n={n_kept}:v=0:a=1[mraw];[mraw]{chain}[mout]")
+        head = (";".join(aparts) + ";" + labels
+                + f"concat=n={n_kept}:v=0:a=1[mraw];")
+        sp = "[mraw]"
     else:
-        graph = f"{asrc}{chain}[mout]"
+        head, sp = "", asrc
+    if music_idx is not None:
+        # 2-pass symmetry with the bed: pre-loudnorm speech chain (build_apost
+        # with loudnorm off — the build_loudnorm_measure_chain recipe), then
+        # the IDENTICAL build_music_mix block, then the measurement loudnorm.
+        mcfg = cfg.model_copy(deep=True)
+        mcfg.render.denoise.loudnorm = False
+        pre = build_apost(mcfg)
+        if pre:
+            head += f"{sp}{','.join(pre)}[mpre];"
+            sp = "[mpre]"
+        head += build_music_mix(cfg.render.music, music_idx, sp,
+                                "[mmix]", music_dur) + ";"
+        graph = head + f"[mmix]{_LOUDNORM_MEASURE}[mout]"
+    else:
+        graph = head + f"{sp}{build_loudnorm_measure_chain(cfg)}[mout]"
     args = [*inputs, "-filter_complex", graph, "-map", "[mout]",
             "-f", "null", "-"]
     try:
@@ -537,6 +644,12 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
     :func:`_edge_fade_filters` for the loudnorm-ordering rationale). The caller
     sets it EXPLICITLY and only for Shorts-clip renders; the default 0.0 keeps
     every regular full-video render byte-for-byte unchanged. Clamped to 0..0.2.
+
+    Background music (C3): when ``cfg.render.music`` is enabled with a valid
+    file, the bed enters as the LAST (looped) input and is auto-ducked by the
+    FINAL speech, mixed in BEFORE loudnorm (see :func:`_music_audio_graph`).
+    Disabled (the default) keeps every graph byte-for-byte unchanged. Clip
+    Maker renders never receive it — serve strips ``music`` from clip opts.
     """
     removed, censors = resolve(cl)
     tl = Timeline(removed, media.duration)
@@ -642,17 +755,40 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
     audio_src = enhanced or censored
     asrc_idx = "1" if audio_src else "0"
     inputs = ["-i", media.path] + (["-i", audio_src] if audio_src else [])
+    # The FINAL audio duration (after cuts): anchors the F8 edge fade-out and
+    # caps the looped music bed (kept already excludes sub-min_segment slivers).
+    out_adur = sum(b - a for a, b in kept)
+    # C3: background music bed — a looped LAST input, auto-ducked by the speech
+    # (sidechaincompress) and mixed in BEFORE loudnorm. Disabled / missing file
+    # / video-only source -> music_idx stays None and every graph below is
+    # byte-for-byte the legacy one.
+    music_path = music_source(cfg, log=log) if has_audio else None
+    if not has_audio and getattr(cfg.render, "music", None) is not None \
+            and cfg.render.music.enabled:
+        log("  Фоновая музыка: у источника нет звуковой дорожки — пропускаю.")
+    music_idx: Optional[int] = None
+    if music_path:
+        music_idx = 2 if audio_src else 1
+        # -stream_loop -1 loops the bed for the whole program; the graph's
+        # atrim + amix duration=first cap it at the final duration.
+        inputs = inputs + ["-stream_loop", "-1", "-i", music_path]
+        log(f"  фоновая музыка: {Path(music_path).name} "
+            f"(громкость {cfg.render.music.gain_db:g} дБ, "
+            f"приглушение при речи {cfg.render.music.duck_db:g} дБ)")
     # Two-pass loudnorm (opt-in via denoise.loudnorm_mode="2pass"): measure the
-    # FINAL audio (cuts + censor + denoise + deesser, WITHOUT loudnorm) first,
-    # then hand the stats to build_apost for the accurate linear pass. The
-    # measurement runs AFTER censoring (it consumes the censored FLAC) and is
-    # audio-only, so it costs seconds. None (failure) -> dynamic fallback.
+    # FINAL audio (cuts + censor + denoise + deesser + the ducked music bed,
+    # WITHOUT loudnorm) first, then hand the stats to build_apost for the
+    # accurate linear pass. The measurement runs AFTER censoring (it consumes
+    # the censored FLAC) and is audio-only, so it costs seconds. None (failure)
+    # -> dynamic fallback.
     measured: Optional[dict] = None
     if has_audio and _wants_loudnorm_2pass(cfg):
         m_fade = max(0.0, float(getattr(cfg.render, "cut_fade", 0.0) or 0.0))
         measured = measure_loudness(ff, cfg, inputs, asrc_idx,
                                     kept if removed else None,
-                                    cut_fade=m_fade, total=new_dur, log=log)
+                                    cut_fade=m_fade, total=new_dur,
+                                    music_idx=music_idx, music_dur=out_adur,
+                                    log=log)
     # Audio post-chain (denoise). Empty list when disabled -> the audio path stays
     # byte-for-byte identical to before (copy / passthrough fast-paths preserved).
     apost = build_apost(cfg, loudnorm_measured=measured) if has_audio else []
@@ -660,10 +796,9 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
     # F8: de-click fades on the clip's TRUE edges, appended AFTER the whole
     # apost chain (incl. loudnorm — ordering rationale in _edge_fade_filters).
     # The fade-out anchors to the FINAL audio duration: with cuts that is the
-    # exact concat length (kept already excludes sub-min_segment slivers),
-    # otherwise the full source duration. [] when edge_fade<=0 (every regular
-    # full-video render) -> all fast-paths/graphs stay byte-for-byte identical.
-    out_adur = sum(b - a for a, b in kept)
+    # exact concat length, otherwise the full source duration. [] when
+    # edge_fade<=0 (every regular full-video render) -> all fast-paths/graphs
+    # stay byte-for-byte identical.
     efades = _edge_fade_filters(edge_fade, out_adur) if has_audio else []
 
     if not removed and not vpost:
@@ -673,11 +808,19 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
             log("  no cuts — remuxing (video copied).")
             args = ["-i", media.path, "-map", "0:v",
                     "-c:v", "copy", "-an", *_faststart(cfg), out_path]
-        elif apost or efades:
-            achain = ",".join(apost + efades)   # == apost_s for regular renders
-            log(f"  no cuts — remuxing (video copied); denoise audio ({achain}).")
-            asrc_label = f"[{asrc_idx}:a]"  # DFN wav / FLAC if any, else original
-            graph = f"{asrc_label}{achain}[outa]"
+        elif apost or efades or music_path:
+            if music_path:
+                # C3: speech treatment -> ducked-bed mix -> loudnorm — the bed
+                # forces the audio through filter_complex even with apost off.
+                log("  no cuts — remuxing (video copied); музыка + авто-дакинг"
+                    " (sidechaincompress).")
+                graph = _music_audio_graph(cfg, f"[{asrc_idx}:a]", music_idx,
+                                           out_adur, apost, efades)
+            else:
+                achain = ",".join(apost + efades)   # == apost_s for regular renders
+                log(f"  no cuts — remuxing (video copied); denoise audio ({achain}).")
+                asrc_label = f"[{asrc_idx}:a]"  # DFN wav / FLAC if any, else original
+                graph = f"{asrc_label}{achain}[outa]"
             args = [*inputs, "-filter_complex", graph,
                     "-map", "0:v", "-map", "[outa]",
                     "-c:v", "copy", *_audio_args(cfg), *_faststart(cfg), out_path]
@@ -699,15 +842,21 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
                 _cleanup_dfn_temp(work_dir)
         return {"out": out_path, "new_duration": media.duration,
                 "removed": 0.0, "censored": len(censors),
-                "encoder": "copy", "denoise": bool(apost) or bool(enhanced)}
+                "encoder": "copy", "denoise": bool(apost) or bool(enhanced),
+                "music": bool(music_path)}
 
     if not removed:
         # No cuts but rescale/fps requested -> re-encode video; pass audio through.
-        if has_audio and (apost or efades):
-            # Audio must enter the graph to apply the denoise/edge-fade filters.
-            achain = ",".join(apost + efades)
-            graph = (f"[0:v]{vpost_s}[outv];"
-                     f"[{asrc_idx}:a]{achain}[outa]")
+        if has_audio and (apost or efades or music_path):
+            # Audio must enter the graph for the denoise/edge-fade/music filters.
+            if music_path:
+                graph = (f"[0:v]{vpost_s}[outv];"
+                         + _music_audio_graph(cfg, f"[{asrc_idx}:a]", music_idx,
+                                              out_adur, apost, efades))
+            else:
+                achain = ",".join(apost + efades)
+                graph = (f"[0:v]{vpost_s}[outv];"
+                         f"[{asrc_idx}:a]{achain}[outa]")
             args = [*inputs, "-filter_complex", graph, "-map", "[outv]",
                     "-map", "[outa]", *venc, *_audio_args(cfg),
                     *_faststart(cfg), out_path]
@@ -729,7 +878,8 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
                 _cleanup_dfn_temp(work_dir)
         return {"out": out_path, "new_duration": media.duration,
                 "removed": 0.0, "censored": len(censors),
-                "encoder": enc_name, "denoise": bool(apost) or bool(enhanced)}
+                "encoder": enc_name, "denoise": bool(apost) or bool(enhanced),
+                "music": bool(music_path)}
 
     # Cuts (optionally + rescale/fps): one frame-accurate pass.
     if has_audio:
@@ -742,18 +892,23 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
             aparts.append(_audio_seg_filter(asrc, a, b, i, n_kept, cut_fade) + f"[a{i}]")
             concat.append(f"[v{i}][a{i}]")
         base = ";".join(vparts + aparts) + ";" + "".join(concat)
-        # When denoise/edge fades are on, the concat's audio leaves as
+        # When denoise/edge fades/music are on, the concat's audio leaves as
         # [outa_raw] and the post chain produces the final [outa] — so it runs
         # on the FULL retimed (already-censored) audio, never per-segment.
         # efades come strictly AFTER apost (i.e. after loudnorm) — see
         # _edge_fade_filters for why that order protects the de-click ramp.
         afinal = apost + efades
-        a_lbl = "[outa_raw]" if afinal else "[outa]"
+        a_lbl = "[outa_raw]" if (afinal or music_path) else "[outa]"
         if vpost:
             graph = base + f"concat=n={len(kept)}:v=1:a=1[vc]{a_lbl};[vc]{vpost_s}[outv]"
         else:
             graph = base + f"concat=n={len(kept)}:v=1:a=1[outv]{a_lbl}"
-        if afinal:
+        if music_path:
+            # C3: the retimed speech is the duck KEY; loudnorm (inside apost)
+            # masters the final mix — see _music_audio_graph's order contract.
+            graph += ";" + _music_audio_graph(cfg, "[outa_raw]", music_idx,
+                                              out_adur, apost, efades)
+        elif afinal:
             graph += f";[outa_raw]{','.join(afinal)}[outa]"
         args = [*inputs, "-filter_complex", graph, "-map", "[outv]", "-map", "[outa]",
                 *venc, *_audio_args(cfg), *_faststart(cfg), out_path]
@@ -779,4 +934,5 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
             _cleanup_dfn_temp(work_dir)
     return {"out": out_path, "new_duration": new_dur, "removed": tl.total_removed,
             "censored": len(censors), "encoder": enc_name,
-            "denoise": bool(apost) or bool(enhanced)}
+            "denoise": bool(apost) or bool(enhanced),
+            "music": bool(music_path)}

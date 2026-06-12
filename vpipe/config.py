@@ -216,6 +216,44 @@ class DenoiseCfg(_Base):
     post_filter: bool = True           # deep-filter --pf (post-filter)
 
 
+class MusicCfg(_Base):
+    """Background music bed with LOCAL auto-ducking (render.music).
+
+    CapCut sells «Auto-Duck» as a Pro cloud feature (keyframes computed
+    server-side); here the same effect is one ffmpeg ``sidechaincompress`` on
+    this machine. The music file enters the render as a SECOND, looped input
+    (``-stream_loop -1``), is trimmed to the final program duration, dropped to
+    ``gain_db`` and compressed with the FINAL speech track (after cuts and
+    censoring) as the sidechain KEY: while the host talks the bed dives, in
+    pauses it breathes back up. The ducked bed and the speech are summed
+    (``amix`` with ``normalize=0`` — no -6 dB penalty on the voice) BEFORE
+    loudnorm, so the -14 LUFS master measures the actual published mix.
+
+    ``duck_db`` is the ducking DEPTH — how far the bed is pushed down while
+    speech is present. It maps to sidechaincompress's ``mix`` (dry/wet blend):
+    ``mix = 1 - 10^(duck_db/20)``. With ratio 8 and the low threshold the wet
+    path is squashed to near-silence during speech, so the output floor is
+    ``dry·(1-mix)`` → an attenuation of ~``duck_db``. 0 = no ducking (plain
+    bed), -30 ≈ the music all but vanishes under speech.
+
+    Defaults follow the «подложка под голос» practice: bed at -18 dB under the
+    speech, ducked a further ~12 dB while talking; threshold 0.02 (≈ -34 dBFS —
+    even quiet speech triggers the duck), ratio 8 (firm), attack 20 ms (dives
+    fast when a word starts), release 400 ms (returns smoothly, no pumping).
+
+    Scope: ONLY the main full-video render. Clip Maker Shorts never get the
+    bed — serve.py strips ``music`` from clip render_opts server-side.
+    """
+    enabled: bool = False
+    path: Optional[str] = None    # audio file (or any video — ffmpeg takes its track)
+    gain_db: float = -18.0        # bed level relative to speech, dB (<= 0)
+    duck_db: float = -12.0        # extra attenuation while speech plays, dB (<= 0)
+    threshold: float = 0.02       # sidechain level (linear) that starts the duck
+    ratio: float = 8.0            # compression ratio above threshold
+    attack: float = 20.0          # ms — how fast the bed dives
+    release: float = 400.0        # ms — how fast it comes back in pauses
+
+
 class RenderCfg(_Base):
     encoder: str = "nvenc"
     nvenc: NvencCfg = Field(default_factory=NvencCfg)
@@ -224,6 +262,7 @@ class RenderCfg(_Base):
     faststart: bool = True
     vertical: VerticalCfg = Field(default_factory=VerticalCfg)
     denoise: DenoiseCfg = Field(default_factory=DenoiseCfg)
+    music: MusicCfg = Field(default_factory=MusicCfg)
     # Smoothing at every cut seam. Without it the kept audio segments are
     # hard-concatenated and each join is a waveform discontinuity → an audible
     # click and an overall "choppy" feel. A short equal-length fade-out/fade-in
