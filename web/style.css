@@ -180,10 +180,12 @@ main { flex: 1; display: flex; min-height: 0; }
 /* overflow-y:auto — последний рубеж: если контент колонки всё же выше окна
    (низкий экран + всё развёрнуто), колонка скроллится, а не давит панели в
    ноль и не прячет их шапки за границей. */
+/* container-type — якорь для @container-квирей таб-бара: медиа-квири по окну
+   врут, колонка занимает 38% окна. */
 #previewPane { width: 38%; min-width: 360px; display: flex; flex-direction: column;
-  min-height: 0; background: var(--surface); overflow-y: auto; }
+  min-height: 0; background: var(--surface); overflow-y: auto; container-type: inline-size; }
 
-.paneHead, .sugHead { display: flex; align-items: center; gap: 10px; padding: 9px 14px;
+.paneHead { display: flex; align-items: center; gap: 10px; padding: 9px 14px;
   border-bottom: 1px solid var(--line); background: var(--surface); }
 .paneTitle { font-weight: 700; font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
   color: var(--muted); white-space: nowrap; flex: none; }
@@ -235,10 +237,9 @@ main { flex: 1; display: flex; min-height: 0; }
 .dot.hesitation { background: var(--hesitation); color: var(--hesitation); }
 .dot.manual { background: var(--manual); color: var(--manual); }
 
-/* The AI-suggestions list is the primary feature of this pane — guarantee it a
-   floor so the (secondary) chapters/metadata panels below can never crush it to
-   a sliver. They have min-height:0 + internal scroll, so they yield space first. */
-.cutlist { flex: 1 1 auto; min-height: 148px; overflow-y: auto; padding: 8px; }
+/* Список вырезов — контент вкладки «Вырезы»: активная вкладка одна, делить
+   вертикаль больше не с кем, floor не нужен (вся высота под видео — его). */
+.cutlist { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 8px; }
 .cutlist .emptyHint { color: var(--muted); font-size: 12px; padding: 10px 6px; }
 .cut-row { display: grid; grid-template-columns: 18px 1fr auto; gap: 8px; align-items: start;
   padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--r-md); margin-bottom: 6px;
@@ -260,34 +261,65 @@ main { flex: 1; display: flex; min-height: 0; }
 .cut-row .acts button:hover { color: var(--text); background: var(--bg); border-color: var(--line-strong); }
 .cut-row .acts .ic { width: 14px; height: 14px; }
 
-/* F2 — панель глав (под списком вырезов) */
-/* ============ Аккордеон вторичных панелей (Главы/Метаданные/Клипы) ============
-   Четыре панели «стопкой» не помещаются на ноутбучной высоте: проценты
-   схлопывали их до нуля и заголовки наезжали друг на друга. Теперь вторичные
-   панели сворачиваемые: свёрнутая = только 40px-шапка (flex: none — кнопки
-   физически не могут вылезти), развёрнутая получает свой max-height. Раскрытие
-   автоматическое при появлении данных (см. setPanelExpanded в app.js). */
-.collapsible > .accHead { cursor: pointer; user-select: none; flex: none; min-height: 40px; }
-.collapsible > .accHead:hover { background: var(--surface2); }
-.collapsible > .accHead .chev { transition: transform .18s ease; color: var(--muted); }
-.collapsible.collapsed > .accHead .chev { transform: rotate(-90deg); }
-.collapsible.collapsed { max-height: none !important; flex: none !important; }
-.collapsible.collapsed > :not(.accHead) { display: none !important; }
-/* Развёрнутая панель получает РЕАЛЬНОЕ место (не полоску): минимум 180px;
-   если суммарно не влезает — правая колонка скроллится (#previewPane). */
-.collapsible:not(.collapsed) { min-height: 180px; flex: 1 1 auto; }
+/* ============ Микро-таб-бар правой колонки (Вырезы/Главы/Мета/Клипы) ============
+   Аккордеон заменён вкладками: активная панель получает ВСЮ высоту под видео,
+   хром фиксированный (36px табы + 36px тулбар). Панели смонтированы всегда —
+   скрытие только атрибутом hidden (display:none), DOM и фокус-логика целы. */
+.paneTabs { display: flex; align-items: stretch; height: 36px; flex: none;
+  background: var(--surface); border-bottom: 1px solid var(--line); }
+.paneTab { position: relative; display: flex; align-items: center; gap: 6px; padding: 0 9px;
+  font-family: inherit; font-size: 12px; font-weight: 600; letter-spacing: -0.01em;
+  color: var(--muted); background: none; border: 0; cursor: pointer; white-space: nowrap;
+  transition: color .12s; }
+.paneTab:hover { color: var(--text); }
+.paneTab[aria-selected="true"] { color: var(--text); box-shadow: inset 0 -2px 0 var(--accent); }
+.paneTab > .ic { width: 14px; height: 14px; }
+/* Бейдж-счётчик (пилюля в духе .qBadge); пустой — скрыт (Главы/Клипы при 0). */
+.tCount { font-size: 10.5px; font-variant-numeric: tabular-nums; padding: 1px 6px;
+  border-radius: 8px; background: var(--elevated); color: var(--muted); }
+.tCount:empty { display: none; }
+.paneTab[aria-selected="true"] .tCount { background: rgba(124,149,255,.18); color: var(--text); }
+/* Конечный пульс «свежие данные» (переиспользует @keyframes pulse). */
+.tCount.fresh, .tDot.fresh, .tHas.fresh { animation: pulse 1.3s 2; }
+/* Точка «непрочитано» — правый-верх таба, гаснет при первой активации. */
+.tDot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent);
+  position: absolute; top: 6px; right: 4px; }
+/* Точка наличия данных у «Меты» (счётчика нет — есть/нет). */
+.tHas { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); flex: none; opacity: .85; }
+/* Busy: пока задача вкладки в работе — спиннер вместо бейджа. */
+.paneTab .tSpin { display: none; width: 12px; height: 12px; animation: spin .8s linear infinite; }
+.paneTab.busy .tSpin { display: inline-block; }
+.paneTab.busy .tCount, .paneTab.busy .tHas { display: none; }
+/* Компактный ⚠ «ИИ выключен» (полный текст в title). */
+.llmBadge--compact { display: flex; align-items: center; padding: 0 10px; flex: none;
+  color: #f0a76c; font-size: 13px; cursor: help; user-select: none; }
 
-/* Низкие экраны: видео и карточки уступают место шапкам трёх панелей,
-   чтобы правая колонка вмещалась без скролла в типовом состоянии. */
-@media (max-height: 850px) {
-  #video { max-height: 26vh; }
-  .cutlist { min-height: 110px; }
+.tabPanel { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0;
+  animation: tabIn .12s ease-out; }
+.tabPanel[hidden] { display: none; }
+@keyframes tabIn { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
+.tabTools { display: flex; align-items: center; gap: 8px; height: 36px; flex: none;
+  padding: 0 10px; border-bottom: 1px solid var(--line); background: var(--surface); }
+.tabTools .legend { flex-wrap: nowrap; overflow: hidden; min-width: 0; }
+@media (prefers-reduced-motion: reduce) {
+  .tabPanel { animation: none; }
+  .tCount.fresh, .tDot.fresh, .tHas.fresh { animation: none; }
+}
+/* Адаптив по ширине КОЛОНКИ (container queries на #previewPane). */
+@container (max-width: 519px) { #panel-cuts .legend { display: none; } }
+@container (max-width: 479px) { .paneTab > .ic:not(.tSpin) { display: none; } }
+@container (max-width: 399px) {
+  /* «12/47» → «12»: текст гасим font-size:0, короткое значение — из data-short. */
+  #cutCount { font-size: 0; padding: 1px 5px; }
+  #cutCount::before { content: attr(data-short); font-size: 10.5px; }
 }
 
-.chaptersPanel { border-top: 1px solid var(--line); display: flex; flex-direction: column; max-height: 32%; min-height: 0; }
-.chaptersHead { display: flex; align-items: center; gap: 10px; padding: 8px 14px;
-  border-bottom: 1px solid var(--line); background: var(--surface); }
-.chaptersHead .btn { margin-left: auto; }
+/* Низкие экраны: хром вкладки фиксированный (72px), так что видео можно
+   поднять 26vh→30vh — списку всё равно остаётся ~4.5 строки (SPEC §4.4). */
+@media (max-height: 850px) {
+  #video { max-height: 30vh; }
+}
+
 .chaptersList { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 6px 8px; }
 .chapter-row { display: flex; gap: 10px; align-items: baseline; padding: 6px 10px; border-radius: var(--r-sm);
   cursor: pointer; border: 1px solid transparent; transition: background .12s, border-color .12s; }
@@ -295,12 +327,9 @@ main { flex: 1; display: flex; min-height: 0; }
 .chapter-row .chTime { font-variant-numeric: tabular-nums; font-size: 12px; color: var(--accent); font-weight: 700; min-width: 44px; }
 .chapter-row .chTitle { font-size: 13px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-/* B — панель метаданных YouTube (под главами) */
-.metadataPanel { border-top: 1px solid var(--line); display: flex; flex-direction: column; max-height: 40%; min-height: 0; }
-.metadataHead { display: flex; align-items: center; gap: 10px; padding: 8px 14px;
-  border-bottom: 1px solid var(--line); background: var(--surface); }
-.metadataHead .btn { margin-left: auto; }
+/* B — вкладка метаданных YouTube */
 .metadataBody { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 8px 12px 12px; display: flex; flex-direction: column; gap: 10px; }
+.metaFields { display: flex; flex-direction: column; gap: 10px; }
 .metaField { display: flex; flex-direction: column; gap: 4px; }
 .metaLabel { display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 600; color: var(--muted); }
 .metaLabel .muted { font-weight: 400; }
@@ -310,7 +339,6 @@ main { flex: 1; display: flex; min-height: 0; }
 .metaText:focus { outline: none; border-color: var(--accent); }
 .metaText:empty::before { content: attr(data-placeholder); color: var(--muted); }
 .metaTextArea { min-height: 70px; max-height: 180px; overflow-y: auto; }
-.metaActions { display: flex; justify-content: flex-end; padding-top: 2px; }
 
 /* ============ Таймлайн ============ */
 #timelineArea { background: var(--surface); border-top: 1px solid var(--line); padding: 4px 12px 8px; }
@@ -641,11 +669,7 @@ main { flex: 1; display: flex; min-height: 0; }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }
 button:focus-visible, .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
-/* ============ F4 — Clip Maker: панель «Клипы (Shorts)» ============ */
-.clipsPanel { border-top: 1px solid var(--line); display: flex; flex-direction: column; max-height: 40%; min-height: 0; }
-.clipsHead { display: flex; align-items: center; gap: 10px; padding: 8px 14px;
-  border-bottom: 1px solid var(--line); background: var(--surface); }
-.clipsHeadBtns { margin-left: auto; display: flex; gap: 6px; }
+/* ============ F4 — Clip Maker: вкладка «Клипы (Shorts)» ============ */
 .clipsList { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 6px 8px; }
 
 /* Карточка кандидата — паттерн .cut-row: грид, hover-подъём, левая кромка.
@@ -678,7 +702,8 @@ button:focus-visible, .btn:focus-visible { outline: 2px solid var(--accent); out
 .clipResult { grid-column: 1 / -1; font-size: 12px; }
 .clipResult a { color: var(--accent); }
 .clipResult.error { color: #ff8d8d; }
-.clipsFoot { padding: 8px 12px; border-top: 1px solid var(--line); background: var(--surface); display: flex; }
+/* flex:none — футер прижат к низу вкладки, вне скролла списка. */
+.clipsFoot { padding: 8px 12px; border-top: 1px solid var(--line); background: var(--surface); display: flex; flex: none; }
 .clipsFoot .btn { flex: 1; }
 
 /* Модалка пресета рендера клипов */

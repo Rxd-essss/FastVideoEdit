@@ -172,7 +172,6 @@
       <button id="netBadge" class="netBadge net-local" title="Приватность — всё локально" aria-haspopup="dialog"><svg class="ic" aria-hidden="true"><use href="#i-shield"/></svg><span>Локально</span></button>
       <span class="tbSep" aria-hidden="true"></span>
       <button id="btnTranscribe" class="btn btn-ghost">Транскрибировать</button>
-      <button id="btnRedetect" class="btn btn-ghost"><svg class="ic" aria-hidden="true"><use href="#i-redetect"/></svg>Передетектировать</button>
       <button id="btnRender" class="btn btn-primary"><svg class="ic" aria-hidden="true"><use href="#i-render"/></svg>Рендер <kbd>R</kbd></button>
       <button id="btnHelp" class="btn btn-ghost btn-icon" title="Справка (?)" aria-label="Справка"><svg class="ic" aria-hidden="true"><use href="#i-help"/></svg></button>
     </div>
@@ -206,76 +205,107 @@
         <video id="video" preload="metadata" aria-label="Предпросмотр ролика"></video>
         <div id="subOverlay" class="subOverlay hidden"></div>
       </div>
-      <div class="sugHead">
-        <span class="paneTitle">Подсказки ИИ <span id="cutCount" class="muted"></span></span>
-        <span id="llmBadge" class="llmBadge hidden">ИИ выключен (Ollama не найдена)</span>
-        <span id="cpuBadge" class="llmBadge cpuBadge hidden" title="Транскрипция шла на CPU — CUDA недоступна (медленнее в разы). Проверьте драйвер NVIDIA.">CPU</span>
-        <div class="legend">
-          <span title="Длинная тишина между словами (по таймингам слов)"><i class="dot pause"></i>пауза</span>
-          <span title="Слова-паразиты: «ну», «как бы», «вот»…"><i class="dot filler"></i>паразит</span>
-          <span title="Мат — цензурируется в звуке"><i class="dot profanity"></i>мат</span>
-          <span title="Неудачный дубль / оборванная фраза (ИИ)"><i class="dot bad_take"></i>дубль</span>
-          <span title="Акустический сбой речи: затянутые «э-э», бормотание, микро-провалы, которых нет в тексте"><i class="dot hesitation"></i>заминка</span>
-          <span title="Ваш ручной вырез"><i class="dot manual"></i>ручной</span>
+      <!-- Микро-таб-бар правой колонки: 4 вкладки, панели смонтированы ВСЕГДА
+           (переключение — только атрибут hidden), бейджи/точки живут в табах. -->
+      <nav class="paneTabs" role="tablist" aria-label="Панели предпросмотра">
+        <button id="tab-cuts" class="paneTab" role="tab" aria-selected="true" aria-controls="panel-cuts" title="Вырезы — подсказки ИИ" aria-label="Вырезы">
+          <svg class="ic" aria-hidden="true"><use href="#i-scissors"/></svg>
+          <span class="tLabel">Вырезы</span>
+          <span id="cutCount" class="tCount" aria-hidden="true"></span>
+          <svg class="ic tSpin" aria-hidden="true"><use href="#i-spinner"/></svg>
+          <span class="tDot hidden" aria-hidden="true"></span>
+        </button>
+        <button id="tab-chapters" class="paneTab" role="tab" aria-selected="false" tabindex="-1" aria-controls="panel-chapters" title="Главы" aria-label="Главы">
+          <svg class="ic" aria-hidden="true"><use href="#i-clock"/></svg>
+          <span class="tLabel">Главы</span>
+          <span class="tCount" aria-hidden="true"></span>
+          <svg class="ic tSpin" aria-hidden="true"><use href="#i-spinner"/></svg>
+          <span class="tDot hidden" aria-hidden="true"></span>
+        </button>
+        <button id="tab-meta" class="paneTab" role="tab" aria-selected="false" tabindex="-1" aria-controls="panel-meta" title="Метаданные YouTube" aria-label="Метаданные YouTube">
+          <svg class="ic" aria-hidden="true"><use href="#i-edit"/></svg>
+          <span class="tLabel">Мета</span>
+          <span class="tHas hidden" aria-hidden="true"></span>
+          <svg class="ic tSpin" aria-hidden="true"><use href="#i-spinner"/></svg>
+          <span class="tDot hidden" aria-hidden="true"></span>
+        </button>
+        <button id="tab-clips" class="paneTab" role="tab" aria-selected="false" tabindex="-1" aria-controls="panel-clips" title="Клипы (Shorts)" aria-label="Клипы (Shorts)">
+          <svg class="ic" aria-hidden="true"><use href="#i-film"/></svg>
+          <span class="tLabel">Клипы</span>
+          <span class="tCount" aria-hidden="true"></span>
+          <svg class="ic tSpin" aria-hidden="true"><use href="#i-spinner"/></svg>
+          <span class="tDot hidden" aria-hidden="true"></span>
+        </button>
+        <span class="spacer"></span>
+        <span id="llmBadge" class="llmBadge--compact hidden" title="ИИ выключен (Ollama не найдена) — главы, метаданные и клипы недоступны" role="img" aria-label="ИИ выключен (Ollama не найдена)">⚠</span>
+      </nav>
+
+      <section id="panel-cuts" class="tabPanel" role="tabpanel" aria-labelledby="tab-cuts" tabindex="0">
+        <div class="tabTools">
+          <button id="btnRedetect" class="btn small"><svg class="ic" aria-hidden="true"><use href="#i-redetect"/></svg>Передетектировать</button>
+          <span class="spacer"></span>
+          <div class="legend">
+            <span title="Длинная тишина между словами (по таймингам слов)"><i class="dot pause"></i>пауза</span>
+            <span title="Слова-паразиты: «ну», «как бы», «вот»…"><i class="dot filler"></i>паразит</span>
+            <span title="Мат — цензурируется в звуке"><i class="dot profanity"></i>мат</span>
+            <span title="Неудачный дубль / оборванная фраза (ИИ)"><i class="dot bad_take"></i>дубль</span>
+            <span title="Акустический сбой речи: затянутые «э-э», бормотание, микро-провалы, которых нет в тексте"><i class="dot hesitation"></i>заминка</span>
+            <span title="Ваш ручной вырез"><i class="dot manual"></i>ручной</span>
+          </div>
+          <span id="cpuBadge" class="llmBadge cpuBadge hidden" title="Транскрипция шла на CPU — CUDA недоступна (медленнее в разы). Проверьте драйвер NVIDIA.">CPU</span>
         </div>
-      </div>
-      <div id="cutlist" class="cutlist">
-        <div class="empty placeholder"><svg class="ic ic-empty" aria-hidden="true"><use href="#i-scissors"/></svg><div>Вырезов пока нет — выдели текст или нажми «Передетектировать»</div></div>
-      </div>
-      <div id="chaptersPanel" class="chaptersPanel collapsible collapsed">
-        <div class="chaptersHead accHead" role="button" tabindex="0" aria-expanded="false"
-             aria-controls="chaptersList" title="Развернуть/свернуть">
-          <svg class="ic chev" aria-hidden="true"><use href="#i-chevron-down"/></svg>
-          <span class="paneTitle">Главы</span>
-          <button id="btnChaptersToggle" class="btn small" title="Сгенерировать главы по финальному таймлайну">Предпросмотр глав</button>
+        <div id="cutlist" class="cutlist">
+          <div class="empty placeholder"><svg class="ic ic-empty" aria-hidden="true"><use href="#i-scissors"/></svg><div>Вырезов пока нет — выдели текст или нажми «Передетектировать»</div></div>
+        </div>
+      </section>
+
+      <section id="panel-chapters" class="tabPanel" role="tabpanel" aria-labelledby="tab-chapters" tabindex="0" hidden>
+        <div class="tabTools">
+          <button id="btnChaptersToggle" class="btn small" title="Сгенерировать главы по финальному таймлайну">Сгенерировать главы</button>
         </div>
         <div id="chaptersList" class="chaptersList">
-          <div class="empty placeholder"><svg class="ic ic-empty" aria-hidden="true"><use href="#i-clock"/></svg><div>Глав пока нет — нажми «Предпросмотр глав»</div></div>
+          <div class="empty placeholder"><svg class="ic ic-empty" aria-hidden="true"><use href="#i-clock"/></svg><div>Глав пока нет — нажми «Сгенерировать главы»</div></div>
         </div>
-      </div>
-      <div id="metadataPanel" class="metadataPanel collapsible collapsed">
-        <div class="metadataHead accHead" role="button" tabindex="0" aria-expanded="false"
-             aria-controls="metadataBody" title="Развернуть/свернуть">
-          <svg class="ic chev" aria-hidden="true"><use href="#i-chevron-down"/></svg>
-          <span class="paneTitle">Метаданные YouTube</span>
+      </section>
+
+      <section id="panel-meta" class="tabPanel" role="tabpanel" aria-labelledby="tab-meta" tabindex="0" hidden>
+        <div class="tabTools">
           <button id="btnMetaGenerate" class="btn small" title="Сгенерировать заголовок, описание и теги по финальному таймлайну">Сгенерировать</button>
+          <span class="spacer"></span>
+          <button id="btnMetaCopyAll" class="btn small"><svg class="ic" aria-hidden="true"><use href="#i-copy"/></svg>Копировать всё</button>
         </div>
         <div id="metadataBody" class="metadataBody">
-          <div class="metaField">
-            <div class="metaLabel">Заголовок <span id="metaTitleLen" class="muted"></span>
-              <button class="btn small metaCopyBtn" data-field="title"><svg class="ic" aria-hidden="true"><use href="#i-copy"/></svg>Копировать</button></div>
-            <div id="metaTitle" class="metaText" contenteditable="true" spellcheck="false" data-placeholder="—" role="textbox" aria-label="Заголовок"></div>
-          </div>
-          <div class="metaField">
-            <div class="metaLabel">Описание
-              <button class="btn small metaCopyBtn" data-field="desc"><svg class="ic" aria-hidden="true"><use href="#i-copy"/></svg>Копировать</button></div>
-            <div id="metaDesc" class="metaText metaTextArea" contenteditable="true" spellcheck="false" data-placeholder="—" role="textbox" aria-label="Описание" aria-multiline="true"></div>
-          </div>
-          <div class="metaField">
-            <div class="metaLabel">Теги
-              <button class="btn small metaCopyBtn" data-field="tags"><svg class="ic" aria-hidden="true"><use href="#i-copy"/></svg>Копировать</button></div>
-            <div id="metaTags" class="metaText" contenteditable="true" spellcheck="false" data-placeholder="—" role="textbox" aria-label="Теги"></div>
-          </div>
-          <div class="metaField metaHookField">
-            <div class="metaLabel">Хук
-              <button class="btn small metaCopyBtn" data-field="hook"><svg class="ic" aria-hidden="true"><use href="#i-copy"/></svg>Копировать</button></div>
-            <div id="metaHook" class="metaText" contenteditable="true" spellcheck="false" data-placeholder="—" role="textbox" aria-label="Хук"></div>
-          </div>
-          <div class="metaActions">
-            <button id="btnMetaCopyAll" class="btn small"><svg class="ic" aria-hidden="true"><use href="#i-copy"/></svg>Копировать всё</button>
+          <div id="metaEmpty" class="empty placeholder"><svg class="ic ic-empty" aria-hidden="true"><use href="#i-edit"/></svg><div>Заголовок, описание и теги появятся здесь — нажми «Сгенерировать»</div></div>
+          <div id="metaFields" class="metaFields hidden">
+            <div class="metaField">
+              <div class="metaLabel">Заголовок <span id="metaTitleLen" class="muted"></span>
+                <button class="btn small metaCopyBtn" data-field="title"><svg class="ic" aria-hidden="true"><use href="#i-copy"/></svg>Копировать</button></div>
+              <div id="metaTitle" class="metaText" contenteditable="true" spellcheck="false" data-placeholder="—" role="textbox" aria-label="Заголовок"></div>
+            </div>
+            <div class="metaField">
+              <div class="metaLabel">Описание
+                <button class="btn small metaCopyBtn" data-field="desc"><svg class="ic" aria-hidden="true"><use href="#i-copy"/></svg>Копировать</button></div>
+              <div id="metaDesc" class="metaText metaTextArea" contenteditable="true" spellcheck="false" data-placeholder="—" role="textbox" aria-label="Описание" aria-multiline="true"></div>
+            </div>
+            <div class="metaField">
+              <div class="metaLabel">Теги
+                <button class="btn small metaCopyBtn" data-field="tags"><svg class="ic" aria-hidden="true"><use href="#i-copy"/></svg>Копировать</button></div>
+              <div id="metaTags" class="metaText" contenteditable="true" spellcheck="false" data-placeholder="—" role="textbox" aria-label="Теги"></div>
+            </div>
+            <div class="metaField metaHookField">
+              <div class="metaLabel">Хук
+                <button class="btn small metaCopyBtn" data-field="hook"><svg class="ic" aria-hidden="true"><use href="#i-copy"/></svg>Копировать</button></div>
+              <div id="metaHook" class="metaText" contenteditable="true" spellcheck="false" data-placeholder="—" role="textbox" aria-label="Хук"></div>
+            </div>
           </div>
         </div>
-      </div>
-      <!-- F4 — Clip Maker: панель кандидатов Shorts (план §4.1) -->
-      <div id="clipsPanel" class="clipsPanel collapsible collapsed">
-        <div class="clipsHead accHead" role="button" tabindex="0" aria-expanded="false"
-             aria-controls="clipsList" title="Развернуть/свернуть">
-          <svg class="ic chev" aria-hidden="true"><use href="#i-chevron-down"/></svg>
-          <span class="paneTitle">Клипы (Shorts)</span>
-          <div class="clipsHeadBtns">
-            <button id="btnClipsSettings" class="btn small" title="Настройки рендера клипов" aria-label="Настройки рендера клипов" aria-haspopup="dialog"><svg class="ic" aria-hidden="true"><use href="#i-sliders"/></svg></button>
-            <button id="btnClipsSuggest" class="btn small" title="Локальная LLM предложит фрагменты под Shorts (20–60 с)">Предложить клипы</button>
-          </div>
+      </section>
+
+      <!-- F4 — Clip Maker: вкладка кандидатов Shorts (план §4.1) -->
+      <section id="panel-clips" class="tabPanel" role="tabpanel" aria-labelledby="tab-clips" tabindex="0" hidden>
+        <div class="tabTools">
+          <button id="btnClipsSettings" class="btn small" title="Настройки рендера клипов" aria-label="Настройки рендера клипов" aria-haspopup="dialog"><svg class="ic" aria-hidden="true"><use href="#i-sliders"/></svg></button>
+          <button id="btnClipsSuggest" class="btn small" title="Локальная LLM предложит фрагменты под Shorts (20–60 с)">Предложить клипы</button>
         </div>
         <div id="clipsList" class="clipsList">
           <div class="empty placeholder"><svg class="ic ic-empty" aria-hidden="true"><use href="#i-film"/></svg><div>Нажмите «Предложить клипы» — локальная LLM найдёт кандидатов под Shorts</div></div>
@@ -283,7 +313,7 @@
         <div id="clipsFoot" class="clipsFoot hidden">
           <button id="btnClipsRender" class="btn btn-primary"><svg class="ic" aria-hidden="true"><use href="#i-render"/></svg>Рендерить выбранные (<span id="clipsSelCount">0</span>)</button>
         </div>
-      </div>
+      </section>
     </section>
   </main>
 
@@ -356,6 +386,7 @@
         <tr><td><kbd>A</kbd></td><td>переключить «До / После» (финальный таймлайн)</td></tr>
         <tr><td><kbd>+</kbd> <kbd>−</kbd></td><td>зум таймлайна</td></tr>
         <tr><td><kbd>;</kbd> <kbd>'</kbd></td><td>сдвиг подсветки (синхрон) ∓50 мс</td></tr>
+        <tr><td><kbd>1</kbd>–<kbd>4</kbd></td><td>вкладки справа: Вырезы / Главы / Мета / Клипы</td></tr>
         <tr><td><kbd>S</kbd> / <kbd>R</kbd></td><td>сохранить / рендер (настройки)</td></tr>
         <tr><td><kbd>Esc</kbd></td><td>снять выделение / закрыть</td></tr>
       </table>

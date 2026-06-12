@@ -66,6 +66,19 @@ const regionById = new Map()
 const CLIP_HL_COLOR = 'rgba(245,158,11,0.20)'
 let clipHlRegion = null
 const clipEls = new Map()
+// Таб-бар правой колонки: декларации живут ДО вызова init() (:122) — bindTabs
+// зовётся из init синхронно, const/let ниже по файлу были бы в TDZ.
+const TABS = [
+  { id: 'cuts', tab: 'tab-cuts', panel: 'panel-cuts' },
+  { id: 'chapters', tab: 'tab-chapters', panel: 'panel-chapters' },
+  { id: 'meta', tab: 'tab-meta', panel: 'panel-meta' },
+  { id: 'clips', tab: 'tab-clips', panel: 'panel-clips' },
+]
+const TAB_KEY = 'fve_tab'
+// Вкладка-адресат фоновой задачи (busy-спиннер вместо бейджа, точка при ошибке).
+const TASK_TAB = { transcribe: 'cuts', detect: 'cuts', preview_chapters: 'chapters', preview_metadata: 'meta', preview_clips: 'clips', render_clips: 'clips' }
+let activeTab = 'cuts'
+const tabDescr = (id) => TABS.find((t) => t.id === id)
 let saveTimer = null, es = null, raf = 0
 let phMetrics = { total: 0, client: 0 }   // cached scroll/client widths for playhead
 let phScrollRaf = 0
@@ -126,6 +139,7 @@ async function init() {
   bindQueue()
   bindPrivacy()
   bindModels()
+  bindTabs()      // ДО ранних return'ов: таб-бар жив и кликабелен в пустой сессии
   checkHealth()   // A7: карточка «ffmpeg не найден» (не блокирует загрузку — fire-and-forget)
   const s = await (await fetch('/api/state')).json()
   if (s.network) renderNetBadge(s.network)   // P2-#4: zero-upload badge from bootstrap
@@ -620,57 +634,134 @@ async function loadChapters() {
   // Задача запущена — следим по SSE (renderChapters вызовется в followTask).
   followTask('preview_chapters')
 }
-// ---- Аккордеон вторичных панелей (Главы/Метаданные/Клипы) -------------------
-// Свёрнутая панель = одна 40px-шапка; данные приехали → панель раскрывается
-// сама (setPanelExpanded из render*-функций). Состояние — в localStorage.
-const ACC_PANELS = ['chaptersPanel', 'metadataPanel', 'clipsPanel']
-
-function setPanelExpanded(panelId, expanded) {
-  const p = document.getElementById(panelId); if (!p) return
-  p.classList.toggle('collapsed', !expanded)
-  const head = p.querySelector('.accHead')
-  if (head) head.setAttribute('aria-expanded', String(!!expanded))
-  try { localStorage.setItem('fve_acc_' + panelId, expanded ? '1' : '0') } catch {}
-  // Режим «один открыт»: вторичных панелей три, а вертикаль одна — раскрытие
-  // одной сворачивает остальные, и место всегда сходится на любом экране.
-  if (expanded) {
-    for (const other of ACC_PANELS) if (other !== panelId) {
-      const o = document.getElementById(other)
-      if (o && !o.classList.contains('collapsed')) setPanelExpanded(other, false)
+// ---- Таб-бар правой колонки (Вырезы/Главы/Мета/Клипы) -----------------------
+// Панели смонтированы ВСЕГДА (contenteditable-правки меты и clipEls живут в
+// DOM); переключение — только атрибут hidden. Приход данных НИКОГДА не
+// переключает вкладку — только бейдж + конечный пульс + точка «непрочитано».
+function setActiveTab(id) {
+  const target = tabDescr(id) || TABS[0]
+  // Фокус внутри скрываемой панели не должен «умереть» в display:none —
+  // переносим на активный таб (единственное исключение из «хоткей не трогает фокус»).
+  const focusLost = TABS.some((t) => {
+    if (t.id === target.id) return false
+    const p = document.getElementById(t.panel)
+    return p && !p.hidden && p.contains(document.activeElement)
+  })
+  for (const t of TABS) {
+    const btn = document.getElementById(t.tab)
+    const panel = document.getElementById(t.panel)
+    const active = t.id === target.id
+    if (panel) panel.hidden = !active
+    if (!btn) continue
+    btn.setAttribute('aria-selected', String(active))
+    btn.tabIndex = active ? 0 : -1
+    if (active) {
+      // Первая активация гасит точку «непрочитано» и останавливает пульс.
+      const dot = btn.querySelector('.tDot'); if (dot) dot.classList.add('hidden')
+      for (const el of btn.querySelectorAll('.fresh')) el.classList.remove('fresh')
     }
+  }
+  activeTab = target.id
+  if (focusLost) { const tb = document.getElementById(target.tab); if (tb) tb.focus() }
+  try { localStorage.setItem(TAB_KEY, target.id) } catch {}
+}
+
+// Бейдж вкладки: chapters/clips — счётчик (пуст при 0 → скрыт через :empty),
+// meta — точка наличия. Бейдж «Вырезов» (#cutCount) пишет renderCutlist.
+function updateTabBadge(id, n) {
+  const d = tabDescr(id); if (!d) return
+  const btn = document.getElementById(d.tab); if (!btn) return
+  if (id === 'meta') {
+    const dot = btn.querySelector('.tHas'); if (dot) dot.classList.toggle('hidden', !n)
+    return
+  }
+  const c = btn.querySelector('.tCount'); if (c) c.textContent = n ? String(n) : ''
+}
+
+// Данные приехали в НЕактивную вкладку → точка «непрочитано» + конечный пульс
+// (1.3s × 2, рестарт через reflow). Активной вкладке сигнал не нужен.
+function notifyTab(id) {
+  if (id === activeTab) return
+  const d = tabDescr(id); if (!d) return
+  const btn = document.getElementById(d.tab); if (!btn) return
+  const dot = btn.querySelector('.tDot'); if (dot) dot.classList.remove('hidden')
+  for (const el of btn.querySelectorAll('.tCount, .tHas, .tDot')) {
+    el.classList.remove('fresh'); void el.offsetWidth; el.classList.add('fresh')
   }
 }
 
-function bindAccordion() {
-  for (const id of ACC_PANELS) {
-    const p = document.getElementById(id); if (!p) continue
-    const head = p.querySelector('.accHead'); if (!head) continue
-    // Восстановить сохранённое состояние (дефолт — свёрнуто, как в разметке).
-    let saved = null
-    try { saved = localStorage.getItem('fve_acc_' + id) } catch {}
-    if (saved === '1') setPanelExpanded(id, true)
-    const toggle = (e) => {
-      // Кнопки в шапке («Предпросмотр глав», «Сгенерировать», ⚙…) — действия,
-      // а не сворачивание: их клики аккордеон не трогает.
-      if (e.target.closest('button')) return
-      setPanelExpanded(id, p.classList.contains('collapsed'))
-    }
-    head.onclick = toggle
-    head.onkeydown = (e) => {
-      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(e) }
-    }
+// Busy-спиннер на вкладке-адресате текущей задачи (вызов из setRunning).
+function setTabBusy(name) {
+  const busyTab = name ? TASK_TAB[name] : null
+  for (const t of TABS) {
+    const btn = document.getElementById(t.tab)
+    if (btn) btn.classList.toggle('busy', t.id === busyTab)
   }
+}
+
+// Вызывается из init() ДО ранних return'ов: таб-бар жив и в пустой сессии.
+function bindTabs() {
+  // Восстановление fve_tab; однократная миграция со старых ключей аккордеона:
+  // развёрнутая панель ('1') становится вкладкой (порядок ACC_PANELS — последняя
+  // выигрывает), затем все fve_acc_* удаляются (и '0'-значения тоже).
+  let initial = null
+  try {
+    const valid = new Set(TABS.map((t) => t.id))
+    const saved = localStorage.getItem(TAB_KEY)
+    if (saved && valid.has(saved)) initial = saved
+    else {
+      const old = { chaptersPanel: 'chapters', metadataPanel: 'meta', clipsPanel: 'clips' }
+      for (const [panel, tab] of Object.entries(old)) {
+        if (localStorage.getItem('fve_acc_' + panel) === '1') initial = tab
+      }
+      for (const panel of Object.keys(old)) localStorage.removeItem('fve_acc_' + panel)
+    }
+  } catch {}
+  setActiveTab(initial || 'cuts')
+  updateMetaEmpty()
+
+  for (const t of TABS) {
+    const btn = document.getElementById(t.tab)
+    if (btn) btn.addEventListener('click', () => setActiveTab(t.id))
+  }
+  const list = document.querySelector('.paneTabs')
+  if (!list) return
+  // WAI-ARIA Tabs: roving tabindex; ←/→ — automatic activation (данные уже в
+  // st.*, переключение дёшево); Home/End — крайние; 1–4 — прямой переход.
+  // stopPropagation обязателен: глобальный keydown иначе словит seek ±5с / play.
+  const TAB_HOTKEYS = { 1: 'cuts', 2: 'chapters', 3: 'meta', 4: 'clips' }
+  list.addEventListener('keydown', (e) => {
+    const k = e.key
+    let next = null
+    const idx = TABS.findIndex((t) => t.id === activeTab)
+    if (k === 'ArrowLeft') next = TABS[(idx + TABS.length - 1) % TABS.length].id
+    else if (k === 'ArrowRight') next = TABS[(idx + 1) % TABS.length].id
+    else if (k === 'Home') next = TABS[0].id
+    else if (k === 'End') next = TABS[TABS.length - 1].id
+    else if (TAB_HOTKEYS[k]) next = TAB_HOTKEYS[k]
+    else if (k === ' ' || k === 'Enter') {
+      // Активировать фокусный таб; глушим, чтобы Space не дошёл до play/pause.
+      e.preventDefault(); e.stopPropagation()
+      const t = TABS.find((x) => x.tab === (document.activeElement && document.activeElement.id))
+      if (t) setActiveTab(t.id)
+      return
+    } else return
+    e.preventDefault(); e.stopPropagation()
+    setActiveTab(next)
+    const b = document.getElementById(tabDescr(next).tab); if (b) b.focus()
+  })
 }
 
 // Главы приходят в КООРДИНАТАХ ФИНАЛА; клик → seek(finalToOrig(time)).
 function renderChapters(chapters) {
   st.chaptersData = chapters || []
-  if (st.chaptersData.length) setPanelExpanded('chaptersPanel', true)
+  updateTabBadge('chapters', st.chaptersData.length)
+  notifyTab('chapters')   // вкладку НЕ переключаем — пульс + точка, если неактивна
   const box = $('#chaptersList'); if (!box) return
   box.replaceChildren()
   if (!st.chaptersData.length) {
     const ph = document.createElement('div'); ph.className = 'empty placeholder'
-    ph.innerHTML = icon('clock') + '<div>Глав пока нет — нажми «Предпросмотр глав»</div>'
+    ph.innerHTML = icon('clock') + '<div>Глав пока нет — нажми «Сгенерировать главы»</div>'
     box.appendChild(ph); return
   }
   for (const ch of st.chaptersData) {
@@ -711,12 +802,23 @@ function renderMetadata(meta) {
   set('#metaHook', hook)
   const len = $('#metaTitleLen')
   if (len) len.textContent = title ? `(${title.length}/100)` : ''
-  if (title || desc || tags || hook) setPanelExpanded('metadataPanel', true)
+  updateTabBadge('meta', !!(title || desc || tags || hook))
+  notifyTab('meta')   // вкладку НЕ переключаем — пульс + точка, если неактивна
+  updateMetaEmpty()
 }
 // Текущее содержимое поля берём из DOM (пользователь мог отредактировать вручную).
 function metaFieldText(field) {
   const map = { title: '#metaTitle', desc: '#metaDesc', tags: '#metaTags', hook: '#metaHook' }
   const el = $(map[field]); return el ? (el.textContent || '').trim() : ''
+}
+// Пустое состояние «Меты»: placeholder, пока генерации не было И поля пусты.
+function updateMetaEmpty() {
+  const ph = $('#metaEmpty'), fields = $('#metaFields')
+  if (!ph || !fields) return
+  const empty = st.metadataData == null &&
+    !metaFieldText('title') && !metaFieldText('desc') && !metaFieldText('tags') && !metaFieldText('hook')
+  ph.classList.toggle('hidden', !empty)
+  fields.classList.toggle('hidden', empty)
 }
 async function copyToClipboard(text) {
   if (!text) { toast('Пусто — нечего копировать', 'info'); return false }
@@ -829,14 +931,16 @@ async function loadClips() {
 async function loadClipsFromCache() {
   let j
   try { const r = await fetch('/api/clips'); if (!r.ok) return; j = await r.json() } catch { return }
-  if (j && Array.isArray(j.clips) && j.clips.length && !j.stale) renderClips(j.clips)
+  // silent: кэш — не новость; тело + тихий счётчик, БЕЗ пульса/точки/переключения.
+  if (j && Array.isArray(j.clips) && j.clips.length && !j.stale) renderClips(j.clips, { silent: true })
 }
 
-function renderClips(clips) {
+function renderClips(clips, opts = {}) {
   st.clipsData = (Array.isArray(clips) ? clips.slice() : [])
     .filter((c) => c && typeof c === 'object')
     .sort((a, b) => (b.score || 0) - (a.score || 0))
-  if (st.clipsData.length) setPanelExpanded('clipsPanel', true)
+  updateTabBadge('clips', st.clipsData.length)
+  if (!opts.silent) notifyTab('clips')   // вкладку НЕ переключаем
   // Выбор/подсветка/результаты переживают пере-рендер, но не смену набора.
   const ids = new Set(st.clipsData.map((c) => String(c.id)))
   st.clipsSel = new Set([...st.clipsSel].filter((id) => ids.has(id)))
@@ -1037,7 +1141,14 @@ function updateKept() {
 function renderCutlist() {
   const box = $('#cutlist')
   const segs = [...st.segs].sort((a, b) => a.start - b.start)
-  $('#cutCount').textContent = `(${segs.filter((s) => s.enabled).length}/${segs.length})`
+  // Бейдж в табе «Вырезы»: «N/M» (+ data-short для узкой колонки, см. CSS).
+  const en = segs.filter((s) => s.enabled).length
+  const cc = $('#cutCount')
+  cc.textContent = `${en}/${segs.length}`
+  cc.dataset.short = String(en)
+  cc.title = `включено ${en} из ${segs.length}`
+  const tabBtn = document.getElementById('tab-cuts')
+  if (tabBtn) tabBtn.setAttribute('aria-label', `Вырезы — включено ${en} из ${segs.length}`)
   box.replaceChildren()
   if (!segs.length) {
     const ph = document.createElement('div'); ph.className = 'empty placeholder'
@@ -1364,6 +1475,7 @@ function setRunning(name) {
   st.task = name || null
   const busy = !!name
   for (const id of ['#btnTranscribe', '#btnRedetect', '#btnRender', '#btnChaptersToggle', '#btnMetaGenerate', '#btnClipsSuggest', '#btnClipsRender']) { const b = $(id); if (b) b.disabled = busy }
+  setTabBusy(st.task)   // busy-спиннер на табе-адресате (вкладки НЕ дизейблим)
   const cancel = $('#btnCancelTask'); if (cancel) cancel.classList.toggle('hidden', !busy)
 }
 async function cancelTask() {
@@ -1407,12 +1519,14 @@ function followTask(name) {
         // F4: отменённый render_clips сохраняет частичные результаты — показать
         // готовые клипы/ошибки на карточках (план §2.4: «остальные не теряются»).
         if (t.name === 'render_clips' && t.results && t.results.clips) applyClipRenderResults(t.results.clips)
+        // Ошибка = существующий тост + точка на вкладке-адресате задачи.
+        const errTab = TASK_TAB[t.name]; if (errTab) notifyTab(errTab)
         if (t.cancelled || t.error === 'cancelled') toast('Задача отменена', 'info')
         else toast('Ошибка задачи: ' + t.error, 'error')
         return
       }
-      if (t.name === 'transcribe') { $('#btnTranscribe').classList.add('hidden'); toast('Транскрипция готова', 'success'); loadData() }
-      if (t.name === 'detect') { reloadCutlist() }
+      if (t.name === 'transcribe') { $('#btnTranscribe').classList.add('hidden'); toast('Транскрипция готова', 'success'); loadData(); notifyTab('cuts') }
+      if (t.name === 'detect') { reloadCutlist(); notifyTab('cuts') }
       if (t.name === 'render' && t.results) { toast('Рендер завершён', 'success'); showResults(t.results) }
       if (t.name === 'preview_chapters' && t.results) { renderChapters(t.results.chapters || []); toast('Главы готовы', 'success') }
       if (t.name === 'preview_metadata' && t.results && t.results.metadata) { renderMetadata(t.results.metadata); toast('Метаданные готовы', 'success') }
@@ -1456,6 +1570,9 @@ async function transcribe() {
       }
     }
   } catch {}
+  // Старт действия — единственный разрешённый auto-switch (§3.3): прогресс и
+  // адрес результата видны сразу.
+  setActiveTab('cuts')
   let res
   try { res = await fetch('/api/transcribe', { method: 'POST' }) }
   catch (e) { toast('Сеть: не удалось запустить транскрипцию (' + e.message + ')', 'error'); return }
@@ -1466,6 +1583,7 @@ async function transcribe() {
 async function redetect() {
   if (st.task) return
   if (!confirm('Перестроить вырезы из транскрипта? Ручные вырезы сохранятся, остальные правки сбросятся.')) return
+  setActiveTab('cuts')   // старт действия — единственный разрешённый auto-switch (§3.3)
   // Flush pending edits first: the server rebuilds from its OWN cutlist and
   // re-appends manual cuts from it, so an unsaved manual cut (added within the
   // 700ms autosave window) would otherwise be lost. Mirrors startRender().
@@ -1774,12 +1892,11 @@ function bindUI() {
   $('#skipCuts').onchange = (e) => { if (st.afterMode) { e.target.checked = true; return } st.preview = e.target.checked }
   $('#btnAfterToggle').onclick = () => setAfterMode(!st.afterMode)
   $('#btnSubsToggle').onclick = () => setSubsMode(!st.subsMode)
-  // Кнопка-действие в шапке раскрывает свою панель: результат/прогресс видно сразу.
-  $('#btnChaptersToggle').onclick = () => { setPanelExpanded('chaptersPanel', true); loadChapters() }
-  $('#btnMetaGenerate').onclick = () => { setPanelExpanded('metadataPanel', true); loadMetadata() }
-  bindAccordion()
-  // F4 — Clip Maker: панель + модалка пресета рендера клипов
-  $('#btnClipsSuggest').onclick = () => { setPanelExpanded('clipsPanel', true); loadClips() }
+  // Кнопки генерации живут внутри своих вкладок — раскрывать нечего.
+  $('#btnChaptersToggle').onclick = loadChapters
+  $('#btnMetaGenerate').onclick = loadMetadata
+  // F4 — Clip Maker: вкладка + модалка пресета рендера клипов
+  $('#btnClipsSuggest').onclick = loadClips
   $('#btnClipsRender').onclick = clipsRender
   $('#btnClipsSettings').onclick = openClipsModal
   $('#btnCloseClips').onclick = () => closeOverlay('#clipsModal')
@@ -1869,6 +1986,11 @@ function bindKeys() {
       if (k === 'Enter' && e.target.id === 'search') doSearch(e.target.value)
       return
     }
+    // Фокус в таб-баре: стрелки/Space/1–4 обрабатывает сам tablist (bindTabs),
+    // глобальные seek ±5с / play-pause не должны конкурировать (зеркально
+    // inField-гарду). Escape пропускаем — он безопасен и работает отовсюду.
+    const ae = document.activeElement
+    if (k !== 'Escape' && ae && ae.closest && ae.closest('[role="tablist"]')) return
     if (e.ctrlKey || e.metaKey || e.altKey) return  // leave OS/browser combos alone
 
     const fps = (st.media && st.media.fps) ? st.media.fps : 25
@@ -1899,6 +2021,12 @@ function bindKeys() {
     else if (k === 'r' || k === 'к') openRenderModal()
     else if (k === ';' || k === 'ж') { st.syncOffset = Math.round((st.syncOffset - 0.05) * 100) / 100; saveSync() }
     else if (k === "'" || k === 'э') { st.syncOffset = Math.round((st.syncOffset + 0.05) * 100) / 100; saveSync() }
+    // Вкладки правой колонки: 1–4 без модификаторов (раскладко-независимы RU/EN).
+    // Фокус не трогаем (исключение внутри setActiveTab — фокус из скрытой панели).
+    else if (k === '1') setActiveTab('cuts')
+    else if (k === '2') setActiveTab('chapters')
+    else if (k === '3') setActiveTab('meta')
+    else if (k === '4') setActiveTab('clips')
     else if (k === '?' || k === 'h') openOverlay('#help')
     else if (k === 'Escape') { window.getSelection().removeAllRanges(); $('#cutFloat').classList.add('hidden'); st.selected = null; clipsSetActive(null); renderCutlist() }
   })
