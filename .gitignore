@@ -32,7 +32,9 @@ Thumbs.db
 /REMAINING.md
 /claude_code_video_pipeline_prompt.md
 
-# User's own media / session screenshots (never publish)
+# User's own media / private session screenshots in the repo ROOT (never publish).
+# Public README screenshots live in docs/ — the rule below is anchored to the
+# root ("/"), so docs/*.png stays tracked.
 /*.mp4
 /*.png
 

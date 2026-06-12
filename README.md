@@ -1,16 +1,48 @@
 # FastVideoEdit
 
-A **local** talking-head video pipeline for YouTube, with a premium web editor
+![License: MIT](https://img.shields.io/badge/license-MIT-green)
+![Python 3.11–3.12](https://img.shields.io/badge/python-3.11–3.12-blue)
+![Platform: Windows 11](https://img.shields.io/badge/platform-Windows%2011-0078D4)
+
+A **local** talking-head video pipeline for YouTube, with a visual web editor
 (UI in Russian). Transcription runs on your GPU, the "smart" steps run on a local
 LLM, and the final render uses NVENC. Built and tested on Windows 11 + RTX 3080
 (8 GB) + 64 GB RAM.
 
+**Why this instead of Gling / CapCut?** The same auto-cut workflow — but
+**free and unlimited**: $0, MIT, no subscription, no upload quotas, no
+watermarks. Tuned for **Russian speech** (filler/profanity dictionaries, RU
+subtitle reading-speed rules), and your footage never leaves your machine.
+Benchmark: **0 % clipped words** across 129 auto-cuts
+([§7](#7-cut-quality-benchmark)).
+
+*Коротко: как Gling, только бесплатно ($0, MIT), без подписки и безлимитно,
+локально и под русскую речь.*
+
 > **Приватность.** Вся обработка локальна: распознавание речи (Whisper на вашем
 > GPU), ИИ-подсказки (Ollama на localhost), монтаж (ffmpeg) — на вашей машине;
 > ваше видео и транскрипт не загружаются на сторонние серверы. Первый запуск
-> однократно скачивает модель Whisper (~1.5 ГБ) с Hugging Face — после этого можно
+> однократно скачивает модель Whisper (~3 ГБ для large-v3) с Hugging Face — после этого можно
 > работать полностью офлайн (оффлайн-режим, флаг `--offline`, блокирует исходящие
 > сетевые соединения процесса; работает с локальным Ollama на localhost).
+
+![Главный экран веб-редактора FastVideoEdit: видеоплеер, кликабельный транскрипт, список вырезов и волна с цветными регионами вырезов](docs/editor-main.png)
+
+*Веб-редактор: транскрипт, плеер, список вырезов и волна с цветными регионами — всё локально.*
+
+![Демо: выбрать ролик → вырезы уже найдены → превью-монтаж → рендер → готово](docs/demo.gif)
+
+*Полный цикл за полминуты: открыли клип — вырезы уже найдены, превью без рендера, рендер с прогрессом, на выходе −15 % длительности + субтитры, главы и метаданные.*
+
+<details>
+<summary><strong>Ещё скриншоты</strong></summary>
+
+| | |
+|---|---|
+| ![Диалог настроек рендера: кодек NVENC/x264, качество, разрешение и fps, вшитые субтитры, 9:16 для Shorts, шумоподавление, громкость −14 LUFS, экспорт в монтажку](docs/render-dialog.png) | ![Редактор: транскрипт слева, сгенерированные YouTube-метаданные и панель клипов для Shorts справа](docs/editor-metadata.png) |
+| *Диалог рендера: кодек, вшитые сабы, 9:16 Shorts, шумодав, −14 LUFS, NLE-экспорт* | *Транскрипт + YouTube-метаданные + клипы для Shorts* |
+
+</details>
 
 It takes a raw talking-head `.mp4` and produces:
 
@@ -49,7 +81,43 @@ edit it, *then* it renders.
 
 ---
 
+## Quick start (Windows)
+
+```powershell
+winget install Gyan.FFmpeg    # one-time; open a NEW terminal afterwards
+.\run.bat                     # creates .venv + installs deps, then opens the editor
+```
+
+Браузер откроется на `http://127.0.0.1:8000`: выберите клип в панели «Файлы»,
+просмотрите предложенные вырезы (паузы/филлеры уже найдены) и нажмите
+**«Рендер»**. Ничего руками править не нужно — всё дальше делается мышкой.
+ИИ-подсказки (неудачные дубли, главы, метаданные) опциональны — для них
+поставьте Ollama ([§1](#1-install-windows)).
+
+---
+
 ## 1. Install (Windows)
+
+### Platform support
+
+- **Windows 11** — the primary and only fully tested platform. Everything in this
+  README (launcher `run.bat` / `run.ps1`, NVENC render, CUDA transcription) is
+  verified here.
+- **Linux** — the core pipeline and the unit tests are cross-platform (pure
+  Python + ffmpeg; `pytest` needs no GPU), but the **end-to-end flow has not been
+  tested on Linux**. There is no launcher: create a venv, `pip install -r
+  requirements.txt`, then run `python serve.py` from the venv. Install ffmpeg
+  from your package manager (`apt install ffmpeg` etc.).
+- **macOS** — not tested. NVENC is unavailable there; the x264 fallback works
+  (pick `x264` in the render settings or `config.yaml`).
+- **GPU is optional** — without CUDA, transcription automatically falls back to
+  CPU (much slower, but functional). Rendering falls back to x264 likewise.
+- **Python 3.11 / 3.12** (developed and tested on 3.12).
+
+> A pinned snapshot of the author's known-good environment lives in
+> [`requirements.lock`](requirements.lock) — use it only if the regular
+> `requirements.txt` install misbehaves and you want to reproduce the exact
+> tested versions.
 
 ### Prerequisites (system, one-time)
 
@@ -110,60 +178,7 @@ even-split for chapters.
 
 ---
 
-## 2. Run
-
-### Step 1 — detect and review (stops for you)
-
-```powershell
-python pipeline.py input.mp4 --out ./out
-```
-
-This probes, transcribes (cached), detects cut candidates, writes the cut list,
-and **stops**:
-
-- `out/input.cutlist.json` — the editable cut list,
-- `out/input.cutlist.txt` — a readable summary (timecodes + reasons).
-
-### Step 2 — edit the cut list
-
-Open `out/input.cutlist.json` and adjust each segment:
-
-- `"enabled": true/false` — apply this cut or keep that part,
-- `"action": "remove" | "censor"` — delete it, or (for profanity) censor audio.
-
-Bad-take suggestions start with `"enabled": false` — flip the ones you agree with.
-
-### Step 3 — render
-
-```powershell
-python pipeline.py input.mp4 --out ./out --apply
-```
-
-Produces `out/input.mp4`, `out/input.srt` (+ `.vtt`), `out/transcript.txt`,
-`out/chapters.txt`, and prints a summary (before/after duration, cuts by type,
-words censored, time saved).
-
-> Tip: `--apply` with **no** existing cut list runs detection then renders in one
-> shot (handy for testing). Re-runs are idempotent; originals are never touched.
-
-### Useful flags
-
-```
---config FILE          use a different config (default: config.yaml)
---apply                render using the (edited) cut list
---redetect             rebuild the cut list from the transcript (overwrites it)
---no-llm               skip the LLM (bad-takes off, chapters use fallback)
---censor-method M      partial | pitch | lowpass | reverse  (override config)
---device cuda|cpu      override transcription device
---model NAME           override the whisper model (e.g. large-v3-turbo, medium)
-```
-
-> A plain re-run (no `--apply`) never overwrites your hand-edited cut list — use
-> `--redetect` if you actually want to rebuild it.
-
----
-
-## 2b. Web editor (recommended)
+## 2. Web editor (recommended)
 
 A local visual editor (like Gling) for reviewing and trimming before render:
 
@@ -221,6 +236,65 @@ nudge · `S` save · `R` render settings · `?` help.
 
 ---
 
+## 2b. CLI pipeline (no browser)
+
+Prefer the terminal? The same engine runs headless. Activate the venv first
+(`.\.venv\Scripts\Activate.ps1`), or call its interpreter explicitly —
+`.\.venv\Scripts\python.exe pipeline.py …` — system Python lacks the deps.
+
+### Step 1 — detect and review (stops for you)
+
+```powershell
+python pipeline.py input.mp4 --out ./out
+```
+
+This probes, transcribes (cached), detects cut candidates, writes the cut list,
+and **stops**:
+
+- `out/input.cutlist.json` — the editable cut list,
+- `out/input.cutlist.txt` — a readable summary (timecodes + reasons).
+
+### Step 2 — edit the cut list
+
+Open `out/input.cutlist.json` and adjust each segment (or open the clip in the
+web editor — [§2](#2-web-editor-recommended) — and do the same with the mouse:
+both edit the same file):
+
+- `"enabled": true/false` — apply this cut or keep that part,
+- `"action": "remove" | "censor"` — delete it, or (for profanity) censor audio.
+
+Bad-take suggestions start with `"enabled": false` — flip the ones you agree with.
+
+### Step 3 — render
+
+```powershell
+python pipeline.py input.mp4 --out ./out --apply
+```
+
+Produces `out/input.mp4`, `out/input.srt` (+ `.vtt`), `out/transcript.txt`,
+`out/chapters.txt`, and prints a summary (before/after duration, cuts by type,
+words censored, time saved).
+
+> Tip: `--apply` with **no** existing cut list runs detection then renders in one
+> shot (handy for testing). Re-runs are idempotent; originals are never touched.
+
+### Useful flags
+
+```
+--config FILE          use a different config (default: config.yaml)
+--apply                render using the (edited) cut list
+--redetect             rebuild the cut list from the transcript (overwrites it)
+--no-llm               skip the LLM (bad-takes off, chapters use fallback)
+--censor-method M      partial | pitch | lowpass | reverse  (override config)
+--device cuda|cpu      override transcription device
+--model NAME           override the whisper model (e.g. large-v3-turbo, medium)
+```
+
+> A plain re-run (no `--apply`) never overwrites your hand-edited cut list — use
+> `--redetect` if you actually want to rebuild it.
+
+---
+
 ## 3. Configuration
 
 - **`config.yaml`** — every threshold and option (pause length & padding, whisper
@@ -255,7 +329,9 @@ Masking of profanity **in the subtitle text** (e.g. `б***ь`) is set under
 3. **Detect** — pauses (word-gap silence), fillers (regex), profanity (roots),
    bad takes (LLM) → one editable cut list.
 4. **Censor** — audio-only filtergraph; video kept bit-exact.
-5. **Review** — stop and let you edit (CLI now; web UI next).
+5. **Review** — stop and let you edit the cut list: visually in the web editor
+   ([§2](#2-web-editor-recommended)) or as JSON in the CLI flow
+   ([§2b](#2b-cli-pipeline-no-browser)).
 6. **Render** — two stages: lossless censored audio, then a **single** frame-accurate
    cut + NVENC encode (`-rc constqp -qp 19 -preset p7`), AAC 320k, `+faststart`.
 7. **Subtitles** — word timestamps remapped onto the cut timeline; `.srt`/`.vtt`
@@ -286,7 +362,23 @@ web/vendor/        wavesurfer.js v7 vendored locally (no CDN — fully offline)
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-## 7. Roadmap
+## 7. Cut quality (benchmark)
+
+Качество авто-монтажа измеряется скриптом [`scripts/benchmark_cuts.py`](scripts/benchmark_cuts.py)
+по кэшированным транскриптам (GPU не нужен). Срез от 2026-06-10, 4 клипа (~30 мин речи):
+
+| Авто-вырезов | Слов задето (клиппинг >12 мс) | Нарушений |
+|---:|---:|---:|
+| 129 | 0 | 0.0 % |
+
+Методика, полные таблицы и честные оговорки (метрики чистоты — прокси) — в
+[docs/BENCHMARK.md](docs/BENCHMARK.md). Воспроизвести на своих клипах:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\benchmark_cuts.py мой_клип.mp4
+```
+
+## 8. Roadmap
 
 - [x] Core CLI pipeline (stages 1–9)
 - [x] Web editor (FastAPI + wavesurfer.js v7): waveform with colored regions,
@@ -310,7 +402,7 @@ web/vendor/        wavesurfer.js v7 vendored locally (no CDN — fully offline)
       (хук-фраза, 20–60 с, без пересечений); рендер выбранных — 9:16 с
       face-crop по диапазону, караоке-сабами и внутренними вырезами.
 
-## 8. Troubleshooting
+## 9. Troubleshooting
 
 - **Транскрипция падает с ошибкой про прокси** (`Unknown scheme for proxy URL
   'socks4://…'`): системный прокси Windows (VPN/прокси-клиент) несовместим с
@@ -327,6 +419,9 @@ web/vendor/        wavesurfer.js v7 vendored locally (no CDN — fully offline)
 ## Лицензия
 
 FastVideoEdit распространяется под лицензией **MIT** — см. [`LICENSE`](LICENSE).
+
+История изменений — в [CHANGELOG.md](CHANGELOG.md). Хотите помочь проекту —
+загляните в [CONTRIBUTING.md](CONTRIBUTING.md) (dev-окружение, тесты, стиль).
 
 ## Сторонние компоненты / Third-party
 
