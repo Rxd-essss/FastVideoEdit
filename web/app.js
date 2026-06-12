@@ -51,6 +51,9 @@ const st = {
   _clipsRenderIds: null,  // порядок id в последнем POST /api/clips/render (мапа результатов)
   _clipPreviewEnd: null,  // ▶-предпросмотр: авто-пауза на этом orig-времени (null = выключен)
   _clipPrevPreview: false,// каким был «пропускать вырезы» до ▶ (восстановить после авто-паузы)
+  // F7 — правка границ кандидата: {id, start, end} активной правки (null = нет).
+  // start/end живут тут (а не в st.clipsData) до «Сохранить границы».
+  clipEdit: null,
   // save serialization
   dirty: false, saving: false, savingPromise: null, saveError: false, _navigating: false,
   // A6 — онбординг: тост о тихом CPU-фоллбэке показываем ОДИН раз на файл
@@ -70,6 +73,13 @@ const regionById = new Map()
 const CLIP_HL_COLOR = 'rgba(245,158,11,0.20)'
 let clipHlRegion = null
 const clipEls = new Map()
+// F7 — правка границ кандидата: ВРЕМЕННЫЙ драг-регион на волне (индиго — отличен
+// и от типов вырезов, и от янтарной подсветки clip-hl) + ссылки на DOM панели.
+const CLIP_EDIT_COLOR = 'rgba(99,102,241,0.28)'
+const CLIP_MIN_S = 5, CLIP_MAX_S = 90, CLIP_WARN_S = 60   // сек; >60 — мягкое предупреждение (лимит Shorts)
+let clipEditRegion = null
+let clipEditEls = null      // {box, time, msg, save} панели правки активной карточки
+let clipDragTimer = 0       // settle-таймер драга clip-edit региона (паттерн dragTimer)
 // Таб-бар правой колонки: декларации живут ДО вызова init() (:122) — bindTabs
 // зовётся из init синхронно, const/let ниже по файлу были бы в TDZ.
 const TABS = [
@@ -258,6 +268,9 @@ function snapTo(t, key, tol = 0.18) {
 let dragTimer = 0, dragUndoTaken = false, dragRegionId = null, dragAlt = false
 function onRegionDragging(r) {
   if (st.addingRegion) return
+  // F7: временный регион правки границ клипа — отдельный путь (без undo-стека
+  // вырезов: правка живёт в st.clipEdit до «Сохранить границы»).
+  if (r.id === 'clip-edit') { onClipEditDragging(r); return }
   const s = segOf(r.id); if (!s) return
   // Take a single undo snapshot at the start of a drag gesture.
   if (!dragUndoTaken || dragRegionId !== r.id) { pushUndo(); dragUndoTaken = true; dragRegionId = r.id }
@@ -303,6 +316,9 @@ function renderRegions() {
   const ac = (st.clipsData || []).find((c) => String(c.id) === st.clipsActive)
   if (ac) clipHlRegion = regions.addRegion({ id: 'clip-hl', start: ac.start, end: ac.end, color: CLIP_HL_COLOR, drag: false, resize: false })
   st.addingRegion = false
+  // F7: и временный регион правки границ — тоже (он живёт поверх вырезов).
+  clipEditRegion = null
+  if (st.clipEdit) clipEditAddRegion()
 }
 const refreshRegionColor = (id) => { const r = regionById.get(id), s = segOf(id); if (r && s) r.setOptions({ color: colorOf(s) }) }
 
@@ -314,14 +330,22 @@ async function loadData() {
   updateCpuBadge(tr.device_used, tr.device_configured)
   st.words = []; st.paras = []; let gi = 0
   tr.segments.forEach((seg, si) => {
-    const para = { words: [] }
+    // start — глобальный индекс первого слова абзаца; el/spans/h — виртуализация
+    // транскрипта (см. renderTranscript): живой <p>, материализованные спаны,
+    // последняя замеренная высота для плейсхолдера.
+    const para = { words: [], start: gi, el: null, spans: null, h: 0 }
     ;(seg.words || []).forEach((w, wi) => {
       // si/wi — адрес слова для PUT /api/transcript/word; edited — флаг «изменено»
       // (хранится в st.words, чтобы пережить пере-рендер renderTranscript).
-      const o = { i: gi++, word: w.w, start: w.s, end: w.e, si, wi, edited: false }
+      // pi — индекс абзаца (доступ к спану через st.paras при виртуализации).
+      const o = { i: gi++, word: w.w, start: w.s, end: w.e, si, wi, edited: false, pi: 0 }
       st.words.push(o); para.words.push(o)
     })
-    if (para.words.length) st.paras.push(para)
+    if (para.words.length) {
+      const pi = st.paras.length
+      for (const o of para.words) o.pi = pi
+      st.paras.push(para)
+    }
   })
   let cl; try { const r = await fetch('/api/cutlist'); cl = r.ok ? await r.json() : { segments: [] } } catch { cl = { segments: [] } }
   st.segs = cl.segments || []; st.manualN = st.segs.filter((s) => s.type === 'manual').length
@@ -329,25 +353,131 @@ async function loadData() {
   flash('Готово к монтажу')
 }
 
+/* ---------- B4: оконная виртуализация транскрипта (по абзацам) ----------
+   На длинных роликах (10–20 тыс. слов) полный DOM из спанов .w делает каждый
+   refreshCuts/доступ тяжёлым. При words > VIRT_MIN_WORDS рендерим только абзацы
+   в видимом окне ±буфер (IntersectionObserver на самих <p>), остальные — пустые
+   плейсхолдеры с сохранённой/оценочной высотой. Короткие ролики — как раньше. */
+const VIRT_MIN_WORDS = 1500
+const VIRT_MARGIN = '1000px'      // буфер материализации над/под окном
+let virtOn = false
+let virtIO = null
+let virtMatches = null            // Set глобальных индексов слов-совпадений поиска (virt-режим)
+
+// Спан слова по глобальному индексу (null, если абзац не материализован).
+function getSpan(i) {
+  if (i == null || i < 0) return null
+  if (!virtOn) {
+    const spans = st.spans || (st.spans = $('#transcript').querySelectorAll('.w'))
+    return spans[i] || null
+  }
+  const w = st.words[i]; if (!w) return null
+  const para = st.paras[w.pi]
+  if (!para || !para.spans) return null
+  return para.spans[i - para.start] || null
+}
+// Обход всех СУЩЕСТВУЮЩИХ в DOM спанов (в virt-режиме — только материализованных).
+function forEachShownSpan(fn) {
+  if (!virtOn) {
+    const spans = st.spans || (st.spans = $('#transcript').querySelectorAll('.w'))
+    for (const sp of spans) fn(sp)
+    return
+  }
+  for (const para of st.paras) if (para.spans) for (const sp of para.spans) fn(sp)
+}
+
+// Оценка высоты плейсхолдера: ширина текста / ширина колонки → строки × line-height.
+// Неточность безопасна — после первой материализации высота замеряется (para.h).
+function estimateParaH(para) {
+  let chars = 0
+  for (const w of para.words) chars += w.word.trim().length + 1
+  const box = $('#transcript')
+  // .transcript: padding 22/30, max-width 820; .para: padding-left 28
+  const usable = Math.max(160, Math.min(820, box.clientWidth || 820) - 60 - 28)
+  const lines = Math.max(1, Math.ceil(chars * 9.5 / usable))
+  return lines * 36   // .para: font-size 18 × line-height 2.0
+}
+
+// Наполнить <p> абзаца гуттером и спанами слов. Возвращает массив спанов.
+function buildParaContent(para, p, el) {
+  el.replaceChildren()
+  const g = document.createElement('span'); g.className = 'gutter'; g.innerHTML = icon('scissors'); g.title = 'Вырезать абзац'; g.dataset.p = p
+  el.appendChild(g)
+  const spans = []
+  for (const w of para.words) {
+    const sp = document.createElement('span'); sp.className = 'w'; sp.dataset.i = w.i
+    if (w.edited) { sp.classList.add('edited'); sp.title = 'изменено' }   // восстановить пометку после пере-рендера
+    sp.textContent = w.word.trim() + ' '; spans.push(sp); el.appendChild(sp)
+  }
+  return spans
+}
+
+// Материализация абзаца: контент + состояние, которое полному рендеру дали бы
+// refreshCuts (strikethrough), doSearch (match) и highlight (active).
+function materializePara(p) {
+  const para = st.paras[p]; if (!para || !para.el || para.spans) return
+  const spans = buildParaContent(para, p, para.el)
+  para.spans = spans
+  for (let k = 0; k < spans.length; k++) {
+    const w = para.words[k], sp = spans[k]
+    if (st.showCuts && insideRemoved((w.start + w.end) / 2)) sp.classList.add('cut')
+    if (virtMatches && virtMatches.has(w.i)) sp.classList.add('match')
+    if (w.i === st.activeWord) sp.classList.add('active')
+  }
+  para.el.classList.remove('vph')
+  para.el.style.minHeight = ''
+}
+function dematerializePara(p) {
+  const para = st.paras[p]; if (!para || !para.el || !para.spans) return
+  // Идёт инлайн-правка слова в этом абзаце — не выгружаем (contenteditable/blur).
+  if (editingSpan && para.el.contains(editingSpan)) return
+  para.h = para.el.offsetHeight || para.h
+  para.spans = null
+  para.el.replaceChildren()
+  para.el.classList.add('vph')
+  para.el.style.minHeight = (para.h || estimateParaH(para)) + 'px'
+}
+function onParaIO(entries) {
+  for (const en of entries) {
+    const p = +en.target.dataset.vp
+    if (en.isIntersecting) materializePara(p)
+    else dematerializePara(p)
+  }
+}
+
 function renderTranscript() {
   const box = $('#transcript'); box.replaceChildren()
+  if (virtIO) { virtIO.disconnect(); virtIO = null }
+  st.spans = null; virtMatches = null
   if (!st.paras.length) {
     const ph = document.createElement('div'); ph.className = 'empty placeholder'
     ph.innerHTML = icon('edit') + '<div>Транскрипт появится здесь — нажми «Транскрибировать»</div>'
-    box.appendChild(ph); st.spans = null; return
+    box.appendChild(ph); return
   }
+  virtOn = st.words.length > VIRT_MIN_WORDS
+  if (!virtOn) {
+    // Короткий ролик — полный рендер, как раньше (без риска для мелких сессий).
+    st.paras.forEach((para, p) => {
+      const el = document.createElement('p'); el.className = 'para'
+      para.el = el; para.spans = buildParaContent(para, p, el)
+      box.appendChild(el)
+    })
+    st.spans = box.querySelectorAll('.w')   // cache for highlight/refreshCuts/doSearch
+    return
+  }
+  // Виртуальный путь: каждый абзац — <p>-плейсхолдер с оценочной высотой;
+  // IntersectionObserver (root = сам скролл-контейнер #transcript) материализует
+  // абзацы в окне ±VIRT_MARGIN и выгружает ушедшие за буфер.
+  virtIO = new IntersectionObserver(onParaIO, { root: box, rootMargin: VIRT_MARGIN + ' 0px' })
   st.paras.forEach((para, p) => {
-    const el = document.createElement('p'); el.className = 'para'
-    const g = document.createElement('span'); g.className = 'gutter'; g.innerHTML = icon('scissors'); g.title = 'Вырезать абзац'; g.dataset.p = p
-    el.appendChild(g)
-    for (const w of para.words) {
-      const sp = document.createElement('span'); sp.className = 'w'; sp.dataset.i = w.i
-      if (w.edited) { sp.classList.add('edited'); sp.title = 'изменено' }   // восстановить пометку после пере-рендера
-      sp.textContent = w.word.trim() + ' '; el.appendChild(sp)
-    }
+    const el = document.createElement('p')
+    el.className = 'para vph'
+    el.dataset.vp = p
+    el.style.minHeight = (para.h || estimateParaH(para)) + 'px'
+    para.el = el; para.spans = null
     box.appendChild(el)
+    virtIO.observe(el)
   })
-  st.spans = box.querySelectorAll('.w')   // cache for highlight/refreshCuts/doSearch
 }
 
 /* ---------- A6/A7 — онбординг: степпер, CPU-фоллбэк, карточка ffmpeg ---------- */
@@ -943,6 +1073,7 @@ async function loadClipsFromCache() {
 }
 
 function renderClips(clips, opts = {}) {
+  if (st.clipEdit) clipEditCancel()   // F7: пере-рендер карточек сносит DOM правки
   st.clipsData = (Array.isArray(clips) ? clips.slice() : [])
     .filter((c) => c && typeof c === 'object')
     .sort((a, b) => (b.score || 0) - (a.score || 0))
@@ -1005,6 +1136,14 @@ function clipCard(c, i) {
     b.textContent = 'коротковат'; b.title = '15–20 секунд — короче целевых 20–40'
     line.appendChild(b)
   }
+  // F7: правленный вручную кандидат — бейдж «изменён» (+ авто-границы в tooltip).
+  if (c.edited) {
+    const b = document.createElement('span'); b.className = 'clipBadge edited'
+    b.textContent = 'изменён'
+    b.title = 'Границы правлены вручную'
+      + (c.auto_start != null ? ` (авто: ${fmt(c.auto_start)}–${fmt(c.auto_end)})` : '')
+    line.appendChild(b)
+  }
   meta.appendChild(hook); meta.appendChild(line)
 
   const acts = document.createElement('div'); acts.className = 'acts'
@@ -1013,6 +1152,12 @@ function clipCard(c, i) {
   play.setAttribute('aria-label', 'Предпросмотр клипа')
   play.onclick = (e) => { e.stopPropagation(); clipsPreview(c, id) }
   acts.appendChild(play)
+  // F7: «Границы» — режим правки start/end (драг-регион на волне + ±сегмент).
+  const bnd = document.createElement('button')
+  bnd.innerHTML = icon('split'); bnd.title = 'Границы — править начало и конец клипа'
+  bnd.setAttribute('aria-label', 'Править границы клипа')
+  bnd.onclick = (e) => { e.stopPropagation(); clipEditStart(id) }
+  acts.appendChild(bnd)
 
   row.appendChild(cb); row.appendChild(rank); row.appendChild(meta); row.appendChild(acts)
   const resBox = document.createElement('div'); resBox.className = 'clipResult hidden'
@@ -1020,7 +1165,9 @@ function clipCard(c, i) {
   clipEls.set(id, { row, eff, res: resBox })
   applyClipResult(id, st.clipsResults.get(id))
 
-  row.onclick = () => clipsSetActive(st.clipsActive === id ? null : id)
+  // F7: клик по карточке в режиме правки ЕЁ границ не должен дёргать
+  // выбор/подсветку (панель правки живёт внутри карточки).
+  row.onclick = () => { if (st.clipEdit && st.clipEdit.id === id) return; clipsSetActive(st.clipsActive === id ? null : id) }
   return row
 }
 
@@ -1046,13 +1193,227 @@ function clipsHighlight(c) {
 // авто-пауза на end (срабатывает в onFrame). Прежний выбор «пропускать вырезы»
 // восстанавливается после авто-паузы.
 function clipsPreview(c, id) {
-  clipsSetActive(id)
+  // F7: в режиме правки границ ЭТОГО клипа ▶ проверяет ЧЕРНОВЫЕ границы
+  // (st.clipEdit.start/end), а НЕ сохранённые c.start/c.end, и не зовёт
+  // clipsSetActive — иначе поверх индиго-региона правки лёг бы янтарный
+  // clip-hl со старыми границами и играл бы несохранённый старый диапазон.
+  const ed = st.clipEdit && st.clipEdit.id === id ? st.clipEdit : null
+  if (!ed) clipsSetActive(id)
   st._clipPrevPreview = st.preview
   st.preview = true
   const skip = $('#skipCuts'); if (skip) skip.checked = true
-  st._clipPreviewEnd = c.end
-  seek(c.start)
+  st._clipPreviewEnd = ed ? ed.end : c.end
+  seek(ed ? ed.start : c.start)
   video.play()
+}
+
+/* ---------- F7: правка границ кандидата (план §5/F7) ----------
+   «Границы» на карточке → временный драг-регион на волне (паттерн ручного
+   выреза: те же wavesurfer Regions, перетаскивание краёв, снэп к границам слов,
+   Alt отключает снэп) + кнопки «±сегмент» (двигают границу на целый
+   whisper-сегмент). Esc/«Отмена» — выход без сохранения, «Сохранить границы» —
+   POST /api/clips/save (atomic-персист в clips.json, пересчёт dur_eff). */
+function clipEditStart(id) {
+  const c = st.clipsData.find((x) => String(x.id) === id); if (!c) return
+  if (st.clipEdit && st.clipEdit.id === id) return       // уже правим эту карточку
+  if (st.clipEdit) clipEditCancel()                      // одна правка за раз
+  clipsSetActive(null)            // янтарную подсветку убрать — её место займёт драг-регион
+  st.clipEdit = { id, start: c.start, end: c.end }
+  const els = clipEls.get(id); if (els) els.row.classList.add('editing')
+  clipEditBuildPanel(c)
+  clipEditAddRegion()
+  seek(c.start)
+  clipEditRefresh()
+}
+
+function clipEditAddRegion() {
+  if (!regions || !st.clipEdit) return
+  st.addingRegion = true
+  if (clipEditRegion) { try { clipEditRegion.remove() } catch {} }
+  clipEditRegion = regions.addRegion({ id: 'clip-edit', start: st.clipEdit.start, end: st.clipEdit.end, color: CLIP_EDIT_COLOR, drag: true, resize: true })
+  st.addingRegion = false
+}
+// Границы изменились кнопками ±сегмент → мгновенно подвинуть регион на волне.
+function clipEditSyncRegion() {
+  if (!clipEditRegion || !st.clipEdit) return
+  st.addingRegion = true
+  clipEditRegion.setOptions({ start: st.clipEdit.start, end: st.clipEdit.end })
+  st.addingRegion = false
+}
+
+// Драг краёв региона: live-цифры в карточке дёшево, снэп к границам слов — по
+// settle-таймеру (паттерн onRegionDragging/finishRegionDrag ручных вырезов).
+function onClipEditDragging(r) {
+  if (!st.clipEdit || clipEditRegion !== r) return
+  st.clipEdit.start = r.start; st.clipEdit.end = r.end
+  clipEditRefresh()
+  clearTimeout(clipDragTimer)
+  clipDragTimer = setTimeout(() => finishClipEditDrag(r), 140)
+}
+function finishClipEditDrag(r) {
+  if (!st.clipEdit || clipEditRegion !== r) return
+  let a = r.start, b = r.end
+  if (!altDown) {                                        // Alt = без снэпа (как у вырезов)
+    const sa = snapTo(a, 'start'), sb = snapTo(b, 'end')
+    if (sb - sa >= 0.5) { a = sa; b = sb }
+  }
+  a = Math.max(0, a); b = Math.min(st.duration, b)
+  if (a !== r.start || b !== r.end) { st.addingRegion = true; r.setOptions({ start: a, end: b }); st.addingRegion = false }
+  st.clipEdit.start = round(a); st.clipEdit.end = round(b)
+  clipEditRefresh()
+}
+
+// «±сегмент»: сдвиг границы на целый whisper-сегмент (st.paras построены по
+// сегментам транскрипта). dir=+1 — расширить (сегмент наружу), dir=−1 — сузить.
+// Полу-сегментный старт «дотягивается» до своей границы первым нажатием «+».
+function clipSegShift(edge, dir) {
+  const ed = st.clipEdit; if (!ed || !st.paras.length) return
+  const EPS = 0.05
+  if (edge === 'start') {
+    const starts = st.paras.map((p) => p.words[0].start)
+    let k = 0; while (k + 1 < starts.length && starts[k + 1] <= ed.start + EPS) k++
+    let t
+    if (dir < 0) t = (k + 1 < starts.length) ? starts[k + 1] : null
+    else t = (ed.start > starts[k] + EPS) ? starts[k] : (k > 0 ? starts[k - 1] : null)
+    if (t == null) { flash('Дальше некуда'); return }
+    if (ed.end - t < 1) { flash('Клип схлопнется — сначала подвинь конец'); return }
+    ed.start = round(Math.max(0, t))
+  } else {
+    const ends = st.paras.map((p) => p.words[p.words.length - 1].end)
+    let m = ends.length - 1; while (m - 1 >= 0 && ends[m - 1] >= ed.end - EPS) m--
+    let t
+    if (dir < 0) t = (m - 1 >= 0) ? ends[m - 1] : null
+    else t = (ed.end < ends[m] - EPS) ? ends[m] : (m + 1 < ends.length ? ends[m + 1] : null)
+    if (t == null) { flash('Дальше некуда'); return }
+    if (t - ed.start < 1) { flash('Клип схлопнется — сначала подвинь начало'); return }
+    ed.end = round(Math.min(st.duration, t))
+  }
+  clipEditSyncRegion(); clipEditRefresh()
+}
+
+// Валидация (план F7): 5с ≤ длительность ≤ 90с (>60с — мягкое предупреждение,
+// лимит Shorts), границы в пределах ролика, не пересекать соседние ВЫБРАННЫЕ
+// клипы (невыбранных кандидатов можно касаться — юзер сам решает, что рендерить).
+function clipEditProblems() {
+  const ed = st.clipEdit; if (!ed) return { errors: [], warns: [] }
+  const errors = [], warns = []
+  const dur = ed.end - ed.start
+  if (dur < CLIP_MIN_S) errors.push(`Короче ${CLIP_MIN_S}с`)
+  if (dur > CLIP_MAX_S) errors.push(`Длиннее ${CLIP_MAX_S}с`)
+  else if (dur > CLIP_WARN_S) warns.push(`Длиннее ${CLIP_WARN_S}с — лимит Shorts, может уйти в обычные видео`)
+  if (ed.start < 0 || ed.end > st.duration + 0.001) errors.push('Границы вне ролика')
+  for (const o of st.clipsData) {
+    const oid = String(o.id)
+    if (oid === ed.id || !st.clipsSel.has(oid)) continue
+    if (ed.start < o.end && o.start < ed.end) {
+      errors.push(`Пересекает выбранный клип ${fmt(o.start)}–${fmt(o.end)}`); break
+    }
+  }
+  return { errors, warns }
+}
+
+function clipEditRefresh() {
+  const ed = st.clipEdit; if (!ed || !clipEditEls) return
+  const dur = ed.end - ed.start
+  clipEditEls.time.textContent =
+    `${fmtcs(ed.start)}–${fmtcs(ed.end)} · ${dur.toFixed(1)}с (~${Math.round(clipEffDur(ed))}с эфф.)`
+  const { errors, warns } = clipEditProblems()
+  clipEditEls.msg.textContent = errors[0] || warns[0] || ''
+  clipEditEls.msg.classList.toggle('err', !!errors.length)
+  clipEditEls.msg.classList.toggle('warn', !errors.length && !!warns.length)
+  clipEditEls.save.disabled = !!errors.length
+}
+
+function clipEditBuildPanel(c) {
+  const els = clipEls.get(String(c.id)); if (!els) return
+  const box = document.createElement('div'); box.className = 'clipEditBox'
+  box.onclick = (e) => e.stopPropagation()
+
+  const segs = document.createElement('div'); segs.className = 'clipEditSegs'
+  const mkb = (ic, title, edge, dir) => {
+    const b = document.createElement('button'); b.className = 'btn small'
+    b.innerHTML = icon(ic); b.title = title; b.setAttribute('aria-label', title)
+    b.onclick = (e) => { e.stopPropagation(); clipSegShift(edge, dir) }
+    return b
+  }
+  const lab = (t) => { const s = document.createElement('span'); s.textContent = t; return s }
+  segs.append(
+    lab('Начало:'),
+    mkb('plus', 'Сегмент в начало (раньше)', 'start', +1),
+    mkb('minus', 'Убрать сегмент из начала', 'start', -1),
+    lab('Конец:'),
+    mkb('plus', 'Сегмент в конец (позже)', 'end', +1),
+    mkb('minus', 'Убрать сегмент из конца', 'end', -1))
+
+  const time = document.createElement('div'); time.className = 'clipEditTime'
+  const msg = document.createElement('div'); msg.className = 'clipEditMsg'
+
+  const btns = document.createElement('div'); btns.className = 'clipEditBtns'
+  const save = document.createElement('button'); save.className = 'btn small btn-primary'
+  save.textContent = 'Сохранить границы'
+  save.onclick = (e) => { e.stopPropagation(); clipEditSave() }
+  btns.appendChild(save)
+  if (c.edited) {
+    const reset = document.createElement('button'); reset.className = 'btn small'
+    reset.textContent = 'Сбросить к авто'
+    reset.title = c.auto_start != null ? `Вернуть авто-границы ${fmt(c.auto_start)}–${fmt(c.auto_end)}` : 'Вернуть авто-границы'
+    reset.onclick = (e) => { e.stopPropagation(); clipEditReset() }
+    btns.appendChild(reset)
+  }
+  const cancel = document.createElement('button'); cancel.className = 'btn small'
+  cancel.textContent = 'Отмена'; cancel.title = 'Выйти без сохранения (Esc)'
+  cancel.onclick = (e) => { e.stopPropagation(); clipEditCancel() }
+  btns.appendChild(cancel)
+
+  box.append(segs, time, msg, btns)
+  els.row.appendChild(box)
+  clipEditEls = { box, time, msg, save }
+}
+
+// Выход из режима правки БЕЗ сохранения (Esc/«Отмена»/пере-рендер карточек).
+function clipEditCancel() {
+  if (!st.clipEdit) return
+  const id = st.clipEdit.id
+  st.clipEdit = null
+  clearTimeout(clipDragTimer)
+  if (clipEditRegion) { st.addingRegion = true; try { clipEditRegion.remove() } catch {} st.addingRegion = false; clipEditRegion = null }
+  if (clipEditEls) { clipEditEls.box.remove(); clipEditEls = null }
+  const els = clipEls.get(id); if (els) els.row.classList.remove('editing')
+}
+
+async function clipEditSave() {
+  const ed = st.clipEdit; if (!ed) return
+  const { errors } = clipEditProblems()
+  if (errors.length) { toast(errors[0], 'error'); return }
+  let res
+  try {
+    res = await fetch('/api/clips/save', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: ed.id, start: ed.start, end: ed.end }) })
+  } catch (e) { toast('Сеть: не удалось сохранить границы (' + e.message + ')', 'error'); return }
+  if (!res.ok) { await failToast(res, 'Не удалось сохранить границы'); return }
+  let j; try { j = await res.json() } catch { j = null }
+  clipEditApply(j && j.clip)
+  toast('Границы сохранены', 'success')
+}
+async function clipEditReset() {
+  const ed = st.clipEdit; if (!ed) return
+  let res
+  try {
+    res = await fetch('/api/clips/save', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: ed.id, reset: true }) })
+  } catch (e) { toast('Сеть: не удалось сбросить границы (' + e.message + ')', 'error'); return }
+  if (!res.ok) { await failToast(res, 'Не удалось сбросить границы'); return }
+  let j; try { j = await res.json() } catch { j = null }
+  clipEditApply(j && j.clip)
+  toast('Границы возвращены к авто', 'success')
+}
+// Ответ сервера (clip с пересчитанным dur_eff) → st.clipsData → пере-рендер
+// карточек: новые таймкоды, бейдж «изменён», eff-цифра. Рендер выбранных
+// клипов берёт start/end из st.clipsData (clipsRender) — то есть уже новые.
+function clipEditApply(clip) {
+  clipEditCancel()
+  if (!clip) return
+  const i = st.clipsData.findIndex((c) => String(c.id) === String(clip.id))
+  if (i >= 0) st.clipsData[i] = { ...st.clipsData[i], ...clip }
+  renderClips(st.clipsData, { silent: true })
 }
 
 function updateClipsFoot() {
@@ -1127,13 +1488,14 @@ function refreshCuts() {
   // is never called per playback frame (preview uses insideRemoved directly),
   // so clearing here costs nothing and keeps the memo correct.
   st._merged = null; st._kept = null   // финальная карта зависит от вырезов — тоже сбрасываем
-  const rem = mergedRemoves()
-  const spans = st.spans || (st.spans = $('#transcript').querySelectorAll('.w'))
-  for (const sp of spans) {
+  mergedRemoves()
+  // virt-режим: только материализованные спаны (абзацы вне окна получат класс
+  // .cut при материализации — см. materializePara).
+  forEachShownSpan((sp) => {
     const w = st.words[+sp.dataset.i]; const mid = (w.start + w.end) / 2
     // intervals sorted -> linear ok, but reuse binary insideRemoved for the midpoint
     sp.classList.toggle('cut', st.showCuts && insideRemoved(mid) != null)
-  }
+  })
   updateKept()
   updateClipsEff()        // F4: eff-длительность карточек клипов зависит от вырезов
   scheduleAfterRedraw()   // вырезы изменились → перерисовать «После»-полосу (debounced)
@@ -1145,49 +1507,80 @@ function updateKept() {
 }
 
 /* ---------- cut list (AI suggestions) ---------- */
+// B4: живые строки списка по id — точечные обновления (toggle/чекбокс/смена
+// action/выбор) не ребилдят все 300+ строк. Полный renderCutlist — только при
+// структурных изменениях: детект, undo-снапшот, добавление/удаление, drag
+// (может сменить порядок сортировки), смена файла.
+const cutRowEls = new Map()
+
+// Бейдж в табе «Вырезы»: «N/M» (+ data-short для узкой колонки, см. CSS).
+function updateCutCounters() {
+  const total = st.segs.length
+  const en = st.segs.reduce((a, s) => a + (s.enabled ? 1 : 0), 0)
+  const cc = $('#cutCount')
+  cc.textContent = `${en}/${total}`
+  cc.dataset.short = String(en)
+  cc.title = `включено ${en} из ${total}`
+  const tabBtn = document.getElementById('tab-cuts')
+  if (tabBtn) tabBtn.setAttribute('aria-label', `Вырезы — включено ${en} из ${total}`)
+}
+
+function cutRowEl(seg) {
+  const rgb = COLORS[seg.type] || '120,120,120'
+  const row = document.createElement('div')
+  row.className = 'cut-row' + (seg.enabled ? '' : ' off') + (seg.id === st.selected ? ' sel' : '')
+  row.style.borderLeftColor = `rgb(${rgb})`
+  row.innerHTML = `
+    <input type="checkbox" class="en" ${seg.enabled ? 'checked' : ''}>
+    <div class="meta">
+      <div class="tline"><span class="badge" style="background:rgba(${rgb},.15);color:rgb(${rgb})">${TYPE_RU[seg.type] || seg.type}/${seg.action === 'censor' ? 'цензура' : 'вырезать'}</span>
+        <span class="muted">${fmt(seg.start)}–${fmt(seg.end)} (${(seg.end - seg.start).toFixed(2)}s)</span></div>
+      <div class="ttext">${(seg.reason || seg.text || '').replace(/</g, '&lt;')}</div>
+    </div>
+    <div class="acts">
+      <button class="jump" title="перейти" aria-label="Перейти к вырезу">${icon('arrow-right')}</button>
+      <button class="act" title="вырезать/цензура" aria-label="Вкл/выкл вырез">${icon('swap')}</button>
+      <button class="del" title="удалить" aria-label="Удалить вырез">${icon('backspace')}</button>
+    </div>`
+  const cb = row.querySelector('.en')
+  cb.onclick = (e) => e.stopPropagation()   // don't let the click bubble to row (would re-render before 'change')
+  cb.onchange = () => toggleEnabled(seg.id)
+  row.querySelector('.jump').onclick = (e) => { e.stopPropagation(); select(seg.id); seek(seg.start) }
+  row.querySelector('.act').onclick = (e) => { e.stopPropagation(); cycleAction(seg.id) }
+  row.querySelector('.del').onclick = (e) => { e.stopPropagation(); deleteSeg(seg.id) }
+  row.onclick = () => { select(seg.id); seek(seg.start) }
+  return row
+}
+
 function renderCutlist() {
   const box = $('#cutlist')
   const segs = [...st.segs].sort((a, b) => a.start - b.start)
-  // Бейдж в табе «Вырезы»: «N/M» (+ data-short для узкой колонки, см. CSS).
-  const en = segs.filter((s) => s.enabled).length
-  const cc = $('#cutCount')
-  cc.textContent = `${en}/${segs.length}`
-  cc.dataset.short = String(en)
-  cc.title = `включено ${en} из ${segs.length}`
-  const tabBtn = document.getElementById('tab-cuts')
-  if (tabBtn) tabBtn.setAttribute('aria-label', `Вырезы — включено ${en} из ${segs.length}`)
-  box.replaceChildren()
+  updateCutCounters()
+  box.replaceChildren(); cutRowEls.clear()
   if (!segs.length) {
     const ph = document.createElement('div'); ph.className = 'empty placeholder'
     ph.innerHTML = icon('scissors') + '<div>Вырезов пока нет — выдели текст или нажми «Передетектировать»</div>'
     box.appendChild(ph); return
   }
   for (const seg of segs) {
-    const rgb = COLORS[seg.type] || '120,120,120'
-    const row = document.createElement('div')
-    row.className = 'cut-row' + (seg.enabled ? '' : ' off') + (seg.id === st.selected ? ' sel' : '')
-    row.style.borderLeftColor = `rgb(${rgb})`
-    row.innerHTML = `
-      <input type="checkbox" class="en" ${seg.enabled ? 'checked' : ''}>
-      <div class="meta">
-        <div class="tline"><span class="badge" style="background:rgba(${rgb},.15);color:rgb(${rgb})">${TYPE_RU[seg.type] || seg.type}/${seg.action === 'censor' ? 'цензура' : 'вырезать'}</span>
-          <span class="muted">${fmt(seg.start)}–${fmt(seg.end)} (${(seg.end - seg.start).toFixed(2)}s)</span></div>
-        <div class="ttext">${(seg.reason || seg.text || '').replace(/</g, '&lt;')}</div>
-      </div>
-      <div class="acts">
-        <button class="jump" title="перейти" aria-label="Перейти к вырезу">${icon('arrow-right')}</button>
-        <button class="act" title="вырезать/цензура" aria-label="Вкл/выкл вырез">${icon('swap')}</button>
-        <button class="del" title="удалить" aria-label="Удалить вырез">${icon('backspace')}</button>
-      </div>`
-    const cb = row.querySelector('.en')
-    cb.onclick = (e) => e.stopPropagation()   // don't let the click bubble to row (would re-render before 'change')
-    cb.onchange = () => toggleEnabled(seg.id)
-    row.querySelector('.jump').onclick = (e) => { e.stopPropagation(); select(seg.id); seek(seg.start) }
-    row.querySelector('.act').onclick = (e) => { e.stopPropagation(); cycleAction(seg.id) }
-    row.querySelector('.del').onclick = (e) => { e.stopPropagation(); deleteSeg(seg.id) }
-    row.onclick = () => { select(seg.id); seek(seg.start) }
+    const row = cutRowEl(seg)
+    cutRowEls.set(seg.id, row)
     box.appendChild(row)
   }
+}
+
+// Точечное обновление одной строки после мутации её сега (enabled/action/границы).
+// Нет строки (плейсхолдер/новый сег) — честный полный ребилд.
+function updateCutRow(id) {
+  const row = cutRowEls.get(id), seg = segOf(id)
+  if (!row || !seg) { renderCutlist(); return }
+  row.classList.toggle('off', !seg.enabled)
+  row.classList.toggle('sel', seg.id === st.selected)
+  const cb = row.querySelector('.en'); if (cb) cb.checked = !!seg.enabled
+  const b = row.querySelector('.badge')
+  if (b) b.textContent = `${TYPE_RU[seg.type] || seg.type}/${seg.action === 'censor' ? 'цензура' : 'вырезать'}`
+  const t = row.querySelector('.tline .muted')
+  if (t) t.textContent = `${fmt(seg.start)}–${fmt(seg.end)} (${(seg.end - seg.start).toFixed(2)}s)`
 }
 
 /* ---------- undo / redo ---------- */
@@ -1196,7 +1589,11 @@ function renderCutlist() {
 //   { type: 'word', i, si, wi, old, new, prevEdited } — правка слова (dblclick):
 //     old/new — отображаемый текст БЕЗ ведущего пробела (конвенцию Whisper
 //     сервер восстанавливает сам), откат/повтор = обратный PUT.
-function snapshot() { return JSON.parse(JSON.stringify(st.segs)) }
+// B4: structuredClone заметно дешевле JSON-round-trip на 300+ сегах; word-правки
+// в снапшоты не попадают вовсе — у них типизированные записи (pushWordUndo).
+function snapshot() {
+  return (typeof structuredClone === 'function') ? structuredClone(st.segs) : JSON.parse(JSON.stringify(st.segs))
+}
 function pushUndo() {
   undoStack.push({ type: 'cuts', segs: snapshot() })
   if (undoStack.length > UNDO_CAP) undoStack.shift()
@@ -1208,9 +1605,36 @@ function pushWordUndo(rec) {
   redoStack.length = 0
 }
 function restoreSegs(segs) {
+  // B4: undo/redo чаще всего откатывает ОДНУ точечную мутацию (toggle, action,
+  // границы). Тот же состав и порядок сегов + ровно одно отличие → обновляем
+  // одну строку и один регион вместо полного ребилда регионов и списка.
+  const prev = st.segs
+  let diff = -1, structural = prev.length !== segs.length
+  if (!structural) {
+    for (let i = 0; i < segs.length; i++) {
+      const a = prev[i], b = segs[i]
+      if (a.id !== b.id) { structural = true; break }
+      if (a.start !== b.start) { structural = true; break }   // start меняет порядок сортировки списка
+      if (a.end !== b.end || a.enabled !== b.enabled || a.action !== b.action ||
+          a.type !== b.type || a.text !== b.text || a.reason !== b.reason || a.word !== b.word) {
+        if (diff !== -1) { structural = true; break }   // изменён не один сег — полный путь
+        diff = i
+      }
+    }
+  }
   st.segs = segs
   st.manualN = st.segs.filter((s) => s.type === 'manual').length
   if (st.selected && !segOf(st.selected)) st.selected = null
+  if (!structural) {
+    if (diff !== -1) {
+      const s = segs[diff]
+      const r = regionById.get(s.id)
+      if (r) { st.addingRegion = true; r.setOptions({ start: s.start, end: s.end, color: colorOf(s) }); st.addingRegion = false }
+      updateCutRow(s.id); updateCutCounters()
+    }
+    refreshCuts(); markDirty()
+    return
+  }
   renderRegions(); renderCutlist(); refreshCuts(); markDirty()
 }
 // Обратный (toOld=true) / повторный PUT правки слова + синхронизация st.words
@@ -1238,8 +1662,7 @@ async function applyWordRecord(rec, toOld) {
   if (w) {
     w.word = (j && typeof j.text === 'string') ? j.text : (' ' + text)
     w.edited = toOld ? !!rec.prevEdited : true
-    const spans = st.spans || (st.spans = $('#transcript').querySelectorAll('.w'))
-    const sp = spans[rec.i]
+    const sp = getSpan(rec.i)   // virt: спан может быть не материализован — состояние в st.words достаточно
     if (sp && +sp.dataset.i === rec.i) {
       sp.textContent = text + ' '
       sp.classList.toggle('edited', w.edited)
@@ -1286,8 +1709,10 @@ async function redo() {
 }
 
 /* ---------- mutations ---------- */
-function toggleEnabled(id) { const s = segOf(id); if (!s) return; pushUndo(); s.enabled = !s.enabled; refreshRegionColor(id); renderCutlist(); refreshCuts(); markDirty() }
-function cycleAction(id) { const s = segOf(id); if (!s) return; pushUndo(); s.action = s.action === 'remove' ? 'censor' : 'remove'; renderCutlist(); refreshCuts(); markDirty() }
+// B4: toggle/смена action — точечное обновление строки + счётчиков (полный
+// ребилд списка на каждый клик был главным тормозом при 300+ вырезах).
+function toggleEnabled(id) { const s = segOf(id); if (!s) return; pushUndo(); s.enabled = !s.enabled; refreshRegionColor(id); updateCutRow(id); updateCutCounters(); refreshCuts(); markDirty() }
+function cycleAction(id) { const s = segOf(id); if (!s) return; pushUndo(); s.action = s.action === 'remove' ? 'censor' : 'remove'; updateCutRow(id); refreshCuts(); markDirty() }
 function deleteSeg(id) {
   if (!segOf(id)) return
   pushUndo()
@@ -1296,7 +1721,16 @@ function deleteSeg(id) {
   if (st.selected === id) st.selected = null
   renderCutlist(); refreshCuts(); markDirty()
 }
-function select(id) { st.selected = id; renderCutlist() }
+// B4: выбор строки — точечно (раньше каждый клик по вырезу ребилдил весь список).
+function select(id) {
+  const prev = st.selected
+  st.selected = id || null
+  if (prev && prev !== st.selected) { const r = cutRowEls.get(prev); if (r) r.classList.remove('sel') }
+  if (!st.selected) return
+  const row = cutRowEls.get(st.selected)
+  if (row) row.classList.add('sel')
+  else renderCutlist()   // строки ещё нет (необычный порядок вызовов) — полный путь
+}
 function seek(t) { video.currentTime = Math.max(0, Math.min(t, st.duration - 0.04)); onFrame() }
 
 function addManual(start, end) {
@@ -1319,8 +1753,9 @@ function onSelectionChange() {
   const range = sel.getRangeAt(0)
   if (!$('#transcript').contains(range.commonAncestorContainer)) { float.classList.add('hidden'); st.selRange = null; return }
   let lo = Infinity, hi = -1
-  const spans = st.spans || (st.spans = $('#transcript').querySelectorAll('.w'))
-  for (const sp of spans) if (range.intersectsNode(sp)) { const i = +sp.dataset.i; if (i < lo) lo = i; if (i > hi) hi = i }
+  // virt-режим: выделить можно только видимое = материализованное; индексы слов
+  // глобальные и непрерывные, так что [lo..hi] остаётся корректным диапазоном.
+  forEachShownSpan((sp) => { if (range.intersectsNode(sp)) { const i = +sp.dataset.i; if (i < lo) lo = i; if (i > hi) hi = i } })
   if (hi < 0) { float.classList.add('hidden'); st.selRange = null; return }
   st.selRange = [lo, hi]
   const r = range.getBoundingClientRect()
@@ -1470,10 +1905,16 @@ function highlight(t) {
   let lo = 0, hi = st.words.length - 1, idx = -1
   while (lo <= hi) { const m = (lo + hi) >> 1, w = st.words[m]; if (t < w.start) hi = m - 1; else if (t >= w.end) lo = m + 1; else { idx = m; break } }
   if (idx === st.activeWord) return
-  const spans = st.spans || (st.spans = $('#transcript').querySelectorAll('.w'))
-  if (st.activeWord >= 0 && spans[st.activeWord]) spans[st.activeWord].classList.remove('active')
+  const prev = getSpan(st.activeWord)
+  if (prev) prev.classList.remove('active')
   st.activeWord = idx
-  if (idx >= 0 && spans[idx]) { spans[idx].classList.add('active'); spans[idx].scrollIntoView({ block: 'nearest' }) }
+  // virt-режим: после дальнего seek (клик по волне, «перейти» к вырезу, глава)
+  // абзац активного слова может быть не материализован — материализуем его явно,
+  // чтобы подсветка и автоследование вели себя 1:1 со старым полным рендером.
+  // IO после скролла сам догрузит соседей и выгрузит ушедшие абзацы.
+  let sp = getSpan(idx)
+  if (!sp && virtOn && idx >= 0) { materializePara(st.words[idx].pi); sp = getSpan(idx) }
+  if (sp) { sp.classList.add('active'); sp.scrollIntoView({ block: 'nearest' }) }
 }
 
 /* ---------- nav between cuts ---------- */
@@ -2106,13 +2547,28 @@ function trapTab(e, ov) {
 /* ---------- search ---------- */
 function doSearch(q) {
   q = q.trim().toLowerCase()
-  let first = null
-  const spans = st.spans || (st.spans = $('#transcript').querySelectorAll('.w'))
-  for (const sp of spans) {
-    const hit = q && sp.textContent.toLowerCase().includes(q)
-    sp.classList.toggle('match', hit); if (hit && !first) first = sp
+  if (!virtOn) {
+    let first = null
+    const spans = st.spans || (st.spans = $('#transcript').querySelectorAll('.w'))
+    for (const sp of spans) {
+      const hit = q && sp.textContent.toLowerCase().includes(q)
+      sp.classList.toggle('match', hit); if (hit && !first) first = sp
+    }
+    if (first) first.scrollIntoView({ block: 'center' })
+    return
   }
-  if (first) first.scrollIntoView({ block: 'center' })
+  // virt-режим: совпадения считаем по ДАННЫМ (st.words), а не по DOM; классы —
+  // на материализованных спанах сейчас, на остальных — при материализации.
+  virtMatches = q ? new Set() : null
+  let firstIdx = -1
+  if (q) for (const w of st.words) {
+    if (w.word.toLowerCase().includes(q)) { virtMatches.add(w.i); if (firstIdx < 0) firstIdx = w.i }
+  }
+  forEachShownSpan((sp) => { sp.classList.toggle('match', !!(virtMatches && virtMatches.has(+sp.dataset.i))) })
+  if (firstIdx >= 0) {
+    materializePara(st.words[firstIdx].pi)   // найденное слово → абзац материализуется
+    const sp = getSpan(firstIdx); if (sp) sp.scrollIntoView({ block: 'center' })
+  }
 }
 
 /* ---------- UI ---------- */
@@ -2302,7 +2758,12 @@ function bindKeys() {
     else if (k === '3') setActiveTab('meta')
     else if (k === '4') setActiveTab('clips')
     else if (k === '?' || k === 'h') openOverlay('#help')
-    else if (k === 'Escape') { window.getSelection().removeAllRanges(); $('#cutFloat').classList.add('hidden'); st.selected = null; clipsSetActive(null); renderCutlist() }
+    else if (k === 'Escape') {
+      // F7: активная правка границ клипа — Esc сначала выходит из неё (без
+      // сохранения), не сбрасывая выбор выреза/карточки.
+      if (st.clipEdit) { clipEditCancel(); return }
+      window.getSelection().removeAllRanges(); $('#cutFloat').classList.add('hidden'); select(null); clipsSetActive(null)
+    }
   })
 }
 

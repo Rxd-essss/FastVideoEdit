@@ -706,6 +706,26 @@ button:focus-visible, .btn:focus-visible { outline: 2px solid var(--accent); out
 .clipsFoot { padding: 8px 12px; border-top: 1px solid var(--line); background: var(--surface); display: flex; flex: none; }
 .clipsFoot .btn { flex: 1; }
 
+/* ---------- F7 — правка границ кандидата ----------
+   Индиго (как временный регион на волне) — отличаем режим правки и от янтарного
+   «выбран» (.sel), и от цветов типов вырезов. */
+.clip-row.editing { border-color: rgb(99,102,241); box-shadow: 0 0 0 1px rgb(99,102,241) inset; cursor: default; }
+.clip-row.editing:hover { transform: none; }
+.clipEditBox { grid-column: 1 / -1; display: flex; flex-direction: column; gap: 6px;
+  padding-top: 8px; margin-top: 2px; border-top: 1px dashed var(--line); cursor: default; }
+.clipEditSegs { display: flex; gap: 4px; align-items: center; flex-wrap: wrap;
+  font-size: 11px; color: var(--muted); }
+.clipEditSegs span { margin-right: 2px; }
+.clipEditSegs span:not(:first-child) { margin-left: 8px; }   /* «Конец:» отступает от кнопок начала */
+.clipEditSegs .btn { padding: 2px 7px; min-width: 0; }
+.clipEditSegs .btn .ic { width: 12px; height: 12px; }
+.clipEditTime { font-size: 12px; font-variant-numeric: tabular-nums; }
+.clipEditMsg { font-size: 11px; min-height: 14px; }
+.clipEditMsg.warn { color: var(--filler); }
+.clipEditMsg.err { color: #ff8d8d; }
+.clipEditBtns { display: flex; gap: 6px; flex-wrap: wrap; }
+.clipBadge.edited { color: rgb(129,140,248); background: rgba(99,102,241,.12); border-color: rgba(99,102,241,.35); }
+
 /* Модалка пресета рендера клипов */
 .clipsCard { width: 560px; max-width: 95vw; }
 .clipsCard .chk { margin: 12px 0 4px; }

@@ -1380,16 +1380,30 @@ def video():
 
 @app.get("/api/peaks")
 def peaks():
+    # B4 (длинные ролики): прежний потолок 24 000 бакетов «размазывал» волну на
+    # роликах > 40 мин (10 бакетов/с упирались в cap). Для длинных роликов
+    # поднимаем потолок так, чтобы 10 бакетов/с сохранялись до ~100 мин — этого
+    # хватает на весь диапазон зума редактора (макс. зум = 6× fit ≈ 9 000 px).
+    # TODO(B4): честный дозапрос окна при зуме — query-параметры start/end/px у
+    # /api/peaks (ffmpeg -ss/-t) и подмена данных wavesurfer на лету; сейчас не
+    # нужно, т.к. стартовое разрешение покрывает доступный зум с запасом.
     s = S()
+    dur = s.media.duration or 0
+    max_buckets = 24000 if dur <= 2400 else 60000
+    expected = max(1, min(max_buckets, int(round(dur * 10))))
     cache_file = s.cache_dir / f"{s.audio_hash}.peaks.json"
     if s.peaks is None and cache_file.exists():
         try:
             data = json.loads(cache_file.read_text(encoding="utf-8"))
             s.peaks = data.get("peaks") or []
+            # Кэш старого (более низкого) разрешения — пересчитать; пустые peaks
+            # (ролик без аудио) валидны при любом разрешении.
+            if s.peaks and len(s.peaks) != expected:
+                s.peaks = None
         except Exception:  # noqa: BLE001 — corrupt cache: recompute below
             s.peaks = None
     if s.peaks is None:
-        s.peaks = compute_peaks(s.ff.ffmpeg, s.inp, s.media.duration)
+        s.peaks = compute_peaks(s.ff.ffmpeg, s.inp, dur, max_buckets=max_buckets)
         try:
             cache_file.write_text(
                 json.dumps({"duration": s.media.duration, "peaks": s.peaks}),
@@ -2332,6 +2346,93 @@ def get_clips():
             # файлы до F6 писались без rank_source — тогда порядок и был
             # round-robin (MVP-сортировка)
             "rank_source": data.get("rank_source", "round_robin")}
+
+
+# F7: жёсткие пределы длительности клипа при правке границ из UI (сек).
+# Мягкое предупреждение «>60с — лимит Shorts» живёт на фронте; сервер
+# отсекает только бессмысленное (<5с) и заведомо не-Shorts (>90с).
+CLIP_SAVE_MIN = 5.0
+CLIP_SAVE_MAX = 90.0
+
+
+@app.post("/api/clips/save")
+def clips_save(body: dict = Body(default={})):
+    """F7 — правка границ кандидата из UI: обновить запись в out/<stem>.clips.json.
+
+    ``{id, start, end}``  — новые границы (5–90 с, в пределах ролика);
+    ``{id, reset: true}`` — вернуть авто-границы (запомнены при первой правке).
+
+    dur_raw/dur_eff пересчитываются по ТЕКУЩЕМУ катлисту сессии и возвращаются
+    в ответе (``{ok, clip}``) — карточка обновляет цифру без перезапроса.
+    Кандидат помечается ``edited:true``; исходные границы сохраняются один раз
+    в ``auto_start/auto_end`` (повторная правка их не перетирает). Топ-уровень
+    файла (version/hash/generated_at/model/rank_source) не трогаем — файл
+    остаётся валидным для GET /api/clips (hash-проверка) и рендера. Запись
+    атомарная (.tmp -> os.replace), но в отличие от best-effort
+    _save_clips_json неудача честно отдаёт 500: юзер ждёт подтверждение.
+    """
+    s = S()
+    _guard_no_task()
+    cid = body.get("id")
+    if not isinstance(cid, str) or not cid:
+        raise HTTPException(400, "id кандидата обязателен (строка)")
+    data = _load_clips_json(s)
+    if data is None:
+        raise HTTPException(404, "Кандидаты не найдены — сначала «Предложить клипы»")
+    if data.get("hash") != s.audio_hash:
+        raise HTTPException(409, "clips.json от другого видео — правка отклонена")
+    clip = next((c for c in data["clips"]
+                 if isinstance(c, dict) and c.get("id") == cid), None)
+    if clip is None:
+        raise HTTPException(404, f"Кандидат {cid} не найден")
+
+    duration = float(s.media.duration)
+    if body.get("reset"):
+        # Сброс к авто-границам; кандидат без правок — идемпотентный no-op
+        # (фронт кнопку и не показывает, но пусть будет безопасно).
+        start = float(clip.get("auto_start", clip["start"]))
+        end = float(clip.get("auto_end", clip["end"]))
+        clip["edited"] = False
+    else:
+        try:
+            start, end = float(body.get("start")), float(body.get("end"))
+        except (TypeError, ValueError):
+            raise HTTPException(400, "start/end должны быть числами (секунды)")
+        # NaN/Infinity валидны для json.loads — отсекаем ДО сравнений (паттерн
+        # /api/clips/render: max/min с NaN тихо отдают не то).
+        if not (math.isfinite(start) and math.isfinite(end)):
+            raise HTTPException(400, "start/end должны быть конечными числами")
+        if start < -0.001 or end > duration + 0.001:
+            raise HTTPException(400, "Границы клипа вне ролика")
+        start = max(0.0, start)
+        end = min(duration, end)
+        if not (CLIP_SAVE_MIN <= end - start <= CLIP_SAVE_MAX):
+            raise HTTPException(
+                400, f"Длительность клипа должна быть "
+                     f"{CLIP_SAVE_MIN:.0f}–{CLIP_SAVE_MAX:.0f} секунд")
+        if not clip.get("edited"):
+            # Первая правка: запомнить авто-границы для «сбросить к авто».
+            clip["auto_start"], clip["auto_end"] = clip["start"], clip["end"]
+        clip["edited"] = True
+
+    # dur_raw/dur_eff — по текущему live-катлисту (eff = raw − enabled-вырезы
+    # внутри диапазона); катлиста ещё нет (свежеоткрытый файл) → eff == raw.
+    removed = resolve(s.cutlist)[0] if s.cutlist is not None else []
+    tl = Timeline(removed, duration)
+    dur_raw = end - start
+    clip["start"], clip["end"] = round(start, 3), round(end, 3)
+    clip["dur_raw"] = round(dur_raw, 3)
+    clip["dur_eff"] = round(max(0.0, dur_raw - tl.removed_overlap(start, end)), 3)
+
+    p = _clips_json_path(s)
+    try:
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                       encoding="utf-8")
+        os.replace(tmp, p)
+    except OSError as e:
+        raise HTTPException(500, f"Не удалось сохранить clips.json: {e}")
+    return {"ok": True, "clip": clip}
 
 
 @app.post("/api/clips/render")

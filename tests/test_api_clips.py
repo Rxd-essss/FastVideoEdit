@@ -539,3 +539,224 @@ def test_clips_endpoints_csrf_guarded(client, monkeypatch, tmp_path):
                     json={"clips": [{"start": 1.0, "end": 20.0}]})
     assert r.status_code == 403
     assert sess.task["name"] is None
+
+
+# === F7: POST /api/clips/save — правка границ кандидата из UI ====================
+def _saved_file(sess) -> dict:
+    return json.loads((sess.out_dir / "fake.clips.json")
+                      .read_text(encoding="utf-8"))
+
+
+def test_save_happy_path_recomputes_and_marks_edited(client, monkeypatch,
+                                                     tmp_path):
+    # enabled-вырез [10,12] внутри нового диапазона → dur_eff = raw − 2;
+    # disabled-вырез [20,25] НЕ считается.
+    cuts = [CutSegment(id="p1", start=10.0, end=12.0, type=TYPE_PAUSE,
+                       action=ACTION_REMOVE, enabled=True),
+            CutSegment(id="p2", start=20.0, end=25.0, type=TYPE_PAUSE,
+                       action=ACTION_REMOVE, enabled=False)]
+    sess = FakeSession(tmp_path, cuts=cuts)
+    _install(monkeypatch, sess)
+    serve._save_clips_json(sess, [_cand("c01", 5.0, 35.0),
+                                  _cand("c02", 36.0, 39.0)])
+
+    r = client.post("/api/clips/save",
+                    json={"id": "c01", "start": 6.0, "end": 36.0})
+    assert r.status_code == 200
+    j = r.json()
+    assert j["ok"] is True
+    c = j["clip"]
+    # пересчитанный dur_eff возвращается в ответе (карточка обновляет цифру)
+    assert (c["start"], c["end"]) == (6.0, 36.0)
+    assert c["dur_raw"] == pytest.approx(30.0)
+    assert c["dur_eff"] == pytest.approx(28.0)
+    assert c["edited"] is True
+    # авто-границы запомнены при первой правке (для «сбросить к авто»)
+    assert (c["auto_start"], c["auto_end"]) == (5.0, 35.0)
+
+    # файл обновлён атомарно, .tmp не остался
+    data = _saved_file(sess)
+    assert not (sess.out_dir / "fake.clips.json.tmp").exists()
+    by_id = {x["id"]: x for x in data["clips"]}
+    assert by_id["c01"] == c
+    # сосед не тронут
+    assert (by_id["c02"]["start"], by_id["c02"]["end"]) == (36.0, 39.0)
+    assert "edited" not in by_id["c02"]
+
+
+def test_save_keeps_top_level_and_stays_valid_for_get(client, monkeypatch,
+                                                      tmp_path):
+    sess = FakeSession(tmp_path)
+    _install(monkeypatch, sess)
+    serve._save_clips_json(sess, [_cand()])
+    before = _saved_file(sess)
+    assert client.post("/api/clips/save", json={
+        "id": "c01", "start": 7.0, "end": 30.0}).status_code == 200
+    data = _saved_file(sess)
+    # hash-валидация кэша НЕ сломана: топ-уровень файла бит-в-бит прежний
+    for key in ("version", "hash", "generated_at", "model", "rank_source"):
+        assert data[key] == before[key]
+    # GET /api/clips видит правленный файл как свежий (не stale) с новыми границами
+    j = client.get("/api/clips").json()
+    assert j["stale"] is False
+    assert j["clips"][0]["start"] == 7.0 and j["clips"][0]["end"] == 30.0
+    assert j["clips"][0]["edited"] is True
+
+
+def test_save_second_edit_keeps_original_auto_bounds(client, monkeypatch,
+                                                     tmp_path):
+    sess = FakeSession(tmp_path)
+    _install(monkeypatch, sess)
+    serve._save_clips_json(sess, [_cand("c01", 5.0, 35.0)])
+    client.post("/api/clips/save", json={"id": "c01", "start": 6.0, "end": 36.0})
+    r = client.post("/api/clips/save", json={"id": "c01", "start": 8.0, "end": 30.0})
+    c = r.json()["clip"]
+    assert (c["start"], c["end"]) == (8.0, 30.0)
+    assert (c["auto_start"], c["auto_end"]) == (5.0, 35.0)   # не перетёрты
+
+
+def test_save_reset_restores_auto_bounds(client, monkeypatch, tmp_path):
+    cuts = [CutSegment(id="p1", start=10.0, end=12.0, type=TYPE_PAUSE,
+                       action=ACTION_REMOVE, enabled=True)]
+    sess = FakeSession(tmp_path, cuts=cuts)
+    _install(monkeypatch, sess)
+    serve._save_clips_json(sess, [_cand("c01", 5.0, 35.0)])
+    client.post("/api/clips/save", json={"id": "c01", "start": 6.0, "end": 36.0})
+    r = client.post("/api/clips/save", json={"id": "c01", "reset": True})
+    assert r.status_code == 200
+    c = r.json()["clip"]
+    assert (c["start"], c["end"]) == (5.0, 35.0)
+    assert c["edited"] is False
+    assert c["dur_raw"] == pytest.approx(30.0)
+    assert c["dur_eff"] == pytest.approx(28.0)   # пересчитан по текущему катлисту
+    assert _saved_file(sess)["clips"][0]["edited"] is False
+
+
+def test_save_reset_unedited_is_idempotent_noop(client, monkeypatch, tmp_path):
+    sess = FakeSession(tmp_path)
+    _install(monkeypatch, sess)
+    serve._save_clips_json(sess, [_cand("c01", 5.0, 35.0)])
+    r = client.post("/api/clips/save", json={"id": "c01", "reset": True})
+    assert r.status_code == 200
+    c = r.json()["clip"]
+    assert (c["start"], c["end"]) == (5.0, 35.0)
+    assert c["edited"] is False
+
+
+@pytest.mark.parametrize("body", [
+    {},                                               # нет id
+    {"id": 42, "start": 5.0, "end": 15.0},            # id не строка
+    {"id": "c01"},                                    # нет start/end
+    {"id": "c01", "start": "пять", "end": 15.0},
+    {"id": "c01", "start": None, "end": 15.0},
+    {"id": "c01", "start": 5.0, "end": 9.9},          # короче 5с
+    {"id": "c01", "start": 15.0, "end": 5.0},         # перевёрнутый диапазон
+    {"id": "c01", "start": -1.0, "end": 15.0},        # за левую границу
+    {"id": "c01", "start": 5.0, "end": 41.0},         # за конец ролика (40с)
+    '{"id": "c01", "start": NaN, "end": 15.0}',       # NaN сквозь json.loads
+    '{"id": "c01", "start": 5.0, "end": Infinity}',
+])
+def test_save_validation_400(client, monkeypatch, tmp_path, body):
+    sess = FakeSession(tmp_path)
+    _install(monkeypatch, sess)
+    serve._save_clips_json(sess, [_cand("c01", 5.0, 35.0)])
+    if isinstance(body, str):
+        r = client.post("/api/clips/save", content=body,
+                        headers={"Content-Type": "application/json"})
+    else:
+        r = client.post("/api/clips/save", json=body)
+    assert r.status_code == 400
+    # файл не изменён
+    c = _saved_file(sess)["clips"][0]
+    assert (c["start"], c["end"]) == (5.0, 35.0)
+    assert "edited" not in c
+
+
+def test_save_longer_than_90s_rejected(client, monkeypatch, tmp_path):
+    sess = FakeSession(tmp_path, duration=200.0)
+    _install(monkeypatch, sess)
+    serve._save_clips_json(sess, [_cand("c01", 5.0, 35.0)])
+    r = client.post("/api/clips/save",
+                    json={"id": "c01", "start": 5.0, "end": 96.0})
+    assert r.status_code == 400
+    # ровно 90с — можно (мягкий предел 60с — забота фронта)
+    r = client.post("/api/clips/save",
+                    json={"id": "c01", "start": 5.0, "end": 95.0})
+    assert r.status_code == 200
+    assert r.json()["clip"]["dur_raw"] == pytest.approx(90.0)
+
+
+def test_save_unknown_id_404(client, monkeypatch, tmp_path):
+    sess = FakeSession(tmp_path)
+    _install(monkeypatch, sess)
+    serve._save_clips_json(sess, [_cand("c01")])
+    r = client.post("/api/clips/save",
+                    json={"id": "чужой", "start": 5.0, "end": 15.0})
+    assert r.status_code == 404
+
+
+def test_save_no_clips_file_404(client, monkeypatch, tmp_path):
+    sess = FakeSession(tmp_path)
+    _install(monkeypatch, sess)
+    r = client.post("/api/clips/save",
+                    json={"id": "c01", "start": 5.0, "end": 15.0})
+    assert r.status_code == 404
+
+
+def test_save_stale_hash_409(client, monkeypatch, tmp_path):
+    sess = FakeSession(tmp_path)
+    _install(monkeypatch, sess)
+    serve._save_clips_json(sess, [_cand()])
+    sess.audio_hash = "ff" * 20            # «другое» видео с тем же именем
+    r = client.post("/api/clips/save",
+                    json={"id": "c01", "start": 5.0, "end": 15.0})
+    assert r.status_code == 409
+
+
+def test_save_busy_task_409(client, monkeypatch, tmp_path):
+    sess = FakeSession(tmp_path)
+    sess.task["running"] = True
+    _install(monkeypatch, sess)
+    serve._save_clips_json(sess, [_cand()])
+    r = client.post("/api/clips/save",
+                    json={"id": "c01", "start": 5.0, "end": 15.0})
+    assert r.status_code == 409
+
+
+def test_save_no_session_409(client):
+    r = client.post("/api/clips/save",
+                    json={"id": "c01", "start": 5.0, "end": 15.0})
+    assert r.status_code == 409
+
+
+def test_save_write_failure_500_keeps_original_file(client, monkeypatch,
+                                                    tmp_path):
+    sess = FakeSession(tmp_path)
+    _install(monkeypatch, sess)
+    serve._save_clips_json(sess, [_cand("c01", 5.0, 35.0)])
+
+    real_replace = serve.os.replace
+
+    def boom(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(serve.os, "replace", boom)
+    r = client.post("/api/clips/save",
+                    json={"id": "c01", "start": 6.0, "end": 36.0})
+    assert r.status_code == 500
+    monkeypatch.setattr(serve.os, "replace", real_replace)
+    # atomic: оригинальный файл цел и валиден
+    c = _saved_file(sess)["clips"][0]
+    assert (c["start"], c["end"]) == (5.0, 35.0)
+    assert client.get("/api/clips").json()["stale"] is False
+
+
+def test_save_csrf_guarded(client, monkeypatch, tmp_path):
+    sess = FakeSession(tmp_path)
+    _install(monkeypatch, sess)
+    serve._save_clips_json(sess, [_cand()])
+    r = client.post("/api/clips/save", headers={"Origin": "http://evil.example"},
+                    json={"id": "c01", "start": 6.0, "end": 36.0})
+    assert r.status_code == 403
+    c = _saved_file(sess)["clips"][0]
+    assert (c["start"], c["end"]) == (5.0, 35.0)   # файл не тронут
