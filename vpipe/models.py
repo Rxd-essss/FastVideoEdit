@@ -65,6 +65,10 @@ class Transcript:
     # fallback (requested large-v3, got medium → keep it, don't re-OOM next run)
     # apart from a deliberate model switch (requested changed → re-transcribe).
     requested_model: str = ""
+    # A6: the device that ACTUALLY ran the transcription ("cuda" | "cpu") so the
+    # UI can warn about a silent CPU fallback. None on caches written before
+    # this field existed (old json has no key → from_dict yields None).
+    device_used: Optional[str] = None
 
     def all_words(self) -> list[Word]:
         out: list[Word] = []
@@ -77,6 +81,7 @@ class Transcript:
         return {"version": self.version, "language": self.language,
                 "duration": self.duration, "model": self.model,
                 "requested_model": self.requested_model,
+                "device_used": self.device_used,
                 "audio_hash": self.audio_hash,
                 "segments": [s.to_dict() for s in self.segments]}
 
@@ -85,6 +90,7 @@ class Transcript:
         return Transcript(
             language=d.get("language", "ru"), duration=float(d.get("duration", 0.0)),
             model=d.get("model", ""), requested_model=d.get("requested_model", ""),
+            device_used=d.get("device_used"),   # старые кэши без поля → None
             audio_hash=d.get("audio_hash", ""),
             segments=[Segment.from_dict(s) for s in d.get("segments", [])],
             version=int(d.get("version", 1)))

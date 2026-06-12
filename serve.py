@@ -1065,6 +1065,12 @@ def state():
         # transcribed) — the UI flags when a new Whisper choice applies next run.
         "transcript_model": (getattr(s.transcript, "model", None) or None)
                             if s.transcript is not None else None,
+        # A6: фактический девайс последней транскрипции ("cuda"|"cpu") — UI
+        # предупреждает о тихом CPU-фоллбэке. null: нет транскрипта или старый
+        # кэш без поля. Рядом — настроенный девайс для сравнения.
+        "device_used": (getattr(s.transcript, "device_used", None) or None)
+                       if s.transcript is not None else None,
+        "device_configured": s.cfg.transcribe.device,
         "defaults": {
             "encoder": s.cfg.render.encoder,
             "quality": s.cfg.render.nvenc.qp if s.cfg.render.encoder == "nvenc" else s.cfg.render.x264.crf,
@@ -1217,7 +1223,11 @@ def transcript():
     s = S()
     if s.transcript is None:
         raise HTTPException(404, "Not transcribed yet")
-    return s.transcript.to_dict()
+    # A6: "device_used" уже в to_dict() (null у старых кэшей без поля);
+    # сюда добавляем только настроенный девайс — для CPU-предупреждения в UI.
+    out = s.transcript.to_dict()
+    out["device_configured"] = s.cfg.transcribe.device
+    return out
 
 
 def _join_words(words) -> str:
@@ -1595,10 +1605,18 @@ def get_models():
     transcript_model = None
     if SESSION is not None and SESSION.transcript is not None:
         transcript_model = getattr(SESSION.transcript, "model", None) or None
+    # A6 (онбординг): каждому пресету — лежит ли его модель уже в локальном
+    # HF-кэше (чисто фс-проверка, БЕЗ сети) и примерный объём разовой загрузки.
+    # Копии словарей: WHISPER_PRESETS не мутируем.
+    dl_gb = transcribe_mod._MODEL_DOWNLOAD_GB
+    presets = [{**p,
+                "cached": _whisper_model_cached(p["model"]),
+                "download_gb": dl_gb.get(p["model"])}
+               for p in WHISPER_PRESETS]
     return {
         "whisper": {
             "current": cfg.transcribe.model,
-            "presets": WHISPER_PRESETS,
+            "presets": presets,
             "allowed": sorted(WHISPER_ALLOWED),
             "transcript": transcript_model,
         },

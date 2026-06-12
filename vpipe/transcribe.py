@@ -287,6 +287,9 @@ def _run_once(audio_path: str, size: str, device: str, ctype: str,
         return Transcript(language=info.language or cfg.language,
                           duration=duration, model=size,
                           requested_model=cfg.model,
+                          # A6: фактический девайс этой попытки (cuda|cpu) —
+                          # кэшируется и доезжает до UI (CPU-предупреждение).
+                          device_used=device,
                           audio_hash=audio_hash, segments=segments)
     finally:
         del model

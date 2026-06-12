@@ -53,6 +53,9 @@ const st = {
   _clipPrevPreview: false,// каким был «пропускать вырезы» до ▶ (восстановить после авто-паузы)
   // save serialization
   dirty: false, saving: false, savingPromise: null, saveError: false, _navigating: false,
+  // A6 — онбординг: тост о тихом CPU-фоллбэке показываем ОДИН раз на файл
+  // (смена файла = location.reload() → st пересоздаётся, флаг сбрасывается сам)
+  cpuWarned: false,
 }
 const UNDO_CAP = 50
 const undoStack = [], redoStack = []
@@ -123,11 +126,13 @@ async function init() {
   bindQueue()
   bindPrivacy()
   bindModels()
+  checkHealth()   // A7: карточка «ffmpeg не найден» (не блокирует загрузку — fire-and-forget)
   const s = await (await fetch('/api/state')).json()
   if (s.network) renderNetBadge(s.network)   // P2-#4: zero-upload badge from bootstrap
   if (s.no_session) {
     st.hasSession = false; st.curDir = s.start_dir
     $('#filename').textContent = 'Ролик не выбран'
+    renderEmptyStepper()   // A6: степпер «с чего начать» вместо плейсхолдера транскрипта
     if (s.queue_running) startQueuePoll()   // очередь может крутиться без активного клипа
     else if (s.queue_pending > 0) loadQueueList()   // P2-#6: засветить бейдж восстановленной очереди (воркер стоит)
     openFiles(false)
@@ -283,6 +288,9 @@ const refreshRegionColor = (id) => { const r = regionById.get(id), s = segOf(id)
 /* ---------- data ---------- */
 async function loadData() {
   const tr = await (await fetch('/api/transcript')).json()
+  // A6: тихий CPU-фоллбэк — бейдж «CPU» + один тост (device_used пишется в кэш
+  // транскрипта; null у старых кэшей или до A6-бэкенда → ничего не показываем).
+  updateCpuBadge(tr.device_used, tr.device_configured)
   st.words = []; st.paras = []; let gi = 0
   tr.segments.forEach((seg, si) => {
     const para = { words: [] }
@@ -319,6 +327,86 @@ function renderTranscript() {
     box.appendChild(el)
   })
   st.spans = box.querySelectorAll('.w')   // cache for highlight/refreshCuts/doSearch
+}
+
+/* ---------- A6/A7 — онбординг: степпер, CPU-фоллбэк, карточка ffmpeg ---------- */
+// A6: 3 шага «с чего начать». inFiles=true — вариант ВНУТРИ пикера файлов:
+// при пустой сессии пикер открыт модально поверх всего и не закрывается,
+// так что подсказки первого запуска обязаны жить в нём, а не под скримом.
+function stepperHTML(inFiles) {
+  const step1 = inFiles
+    ? 'Выберите ролик ниже или перетащите файл'
+    : 'Выберите ролик — <a href="#" id="stepperFiles">Файлы</a>'
+  return '<div class="stepperTitle">С чего начать</div>' +
+    '<ol class="steps">' +
+      `<li><span class="stepNum">1</span><span>${step1}</span></li>` +
+      '<li><span class="stepNum">2</span><span>Нажмите «Транскрибировать» — речь превратится в текст (в первый раз скачается модель распознавания)</span></li>' +
+      '<li><span class="stepNum">3</span><span>Проверьте вырезы и нажмите «Рендер»</span></li>' +
+    '</ol>'
+}
+
+// A6: когда сессии нет — вместо плейсхолдера транскрипта компактный степпер
+// из 3 шагов (ссылка «Файлы» открывает тот же пикер, что и кнопка в хедере).
+function renderEmptyStepper() {
+  const box = $('#transcript'); if (!box) return
+  const el = document.createElement('div')
+  el.className = 'stepper'
+  el.innerHTML = stepperHTML(false)
+  box.replaceChildren(el)
+  el.querySelector('#stepperFiles').onclick = (e) => { e.preventDefault(); openFiles(false) }
+}
+
+// A6: транскрипция просилась на CUDA, но реально шла на CPU (нет драйвера/cuDNN).
+// Бейдж «CPU» висит, пока открыт этот транскрипт; тост — один раз (st.cpuWarned).
+const CPU_FALLBACK_MSG = 'Транскрипция шла на CPU — CUDA недоступна (медленнее в разы). Проверьте драйвер NVIDIA.'
+function updateCpuBadge(used, configured) {
+  const fellBack = used === 'cpu' && configured === 'cuda'
+  const b = $('#cpuBadge'); if (b) b.classList.toggle('hidden', !fellBack)
+  if (fellBack && !st.cpuWarned) { st.cpuWarned = true; toast(CPU_FALLBACK_MSG, 'warn', { ttl: 8000 }) }
+}
+
+// A7: /api/health при старте — нет ffmpeg → несдвигаемая карточка-предупреждение.
+// Обычно живёт поверх левой панели (НЕ оверлей: остальной UI кликабелен), но при
+// пустой сессии — ВНУТРИ открытого пикера файлов: тот модален и неотключаем
+// (скрим z-50 выше карточки), и без переноса юзер первого запуска без ffmpeg
+// застрял бы в пикере, так и не увидев команду установки. Старый сервер без
+// /api/health или сетевая ошибка → молча пропускаем.
+async function checkHealth() {
+  let h
+  try { const r = await fetch('/api/health'); if (!r.ok) return; h = await r.json() }
+  catch { return }
+  if (h && h.ffmpeg && h.ffmpeg.found === false) showFfmpegCard()
+}
+
+function showFfmpegCard() {
+  if ($('#ffmpegCard')) return
+  const el = document.createElement('div')
+  el.id = 'ffmpegCard'; el.className = 'ffmpegCard'
+  el.innerHTML =
+    `<div class="ffTitle">${icon('info')}ffmpeg не найден</div>` +
+    '<div class="ffText">Открытие видео и рендер не работают. Установите: <code>winget install Gyan.FFmpeg</code> — затем откройте новый терминал и перезапустите редактор.</div>' +
+    '<div class="ffActs"><button id="btnFfRecheck" class="btn small">Проверить снова</button></div>'
+  const head = $('#files .filesHead')
+  if (!st.hasSession && head && !$('#files').classList.contains('hidden')) {
+    el.classList.add('inFiles'); head.after(el)   // онбординг: пикер уже открыт поверх всего
+  } else {
+    const pane = $('#scriptPane'); if (!pane) return
+    pane.appendChild(el)
+  }
+  el.querySelector('#btnFfRecheck').onclick = recheckFfmpeg
+}
+
+async function recheckFfmpeg() {
+  const btn = $('#btnFfRecheck'); if (btn) btn.disabled = true
+  let h = null
+  try { const r = await fetch('/api/health'); if (r.ok) h = await r.json() } catch {}
+  if (btn) btn.disabled = false
+  if (h && h.ffmpeg && h.ffmpeg.found) {
+    const card = $('#ffmpegCard'); if (card) card.remove()
+    toast('ffmpeg найден', 'success')
+  } else {
+    toast(h ? 'ffmpeg всё ещё не найден — откройте новый терминал и перезапустите редактор' : 'Не удалось проверить — сервер недоступен', 'warn')
+  }
 }
 
 /* ---------- cut math ---------- */
@@ -1353,6 +1441,21 @@ async function failToast(res, prefix) {
 
 async function transcribe() {
   if (st.task) return
+  // A6: первая транскрипция тянет модель Whisper из сети (до ~3 ГБ) — честно
+  // предупредить ДО старта. Ошибка/недоступность /api/models НЕ блокирует:
+  // ведём себя как раньше (модель докачается молча в ходе задачи).
+  try {
+    const r = await fetch('/api/models')
+    if (r.ok) {
+      const j = await r.json()
+      const w = (j && j.whisper) || {}
+      const p = (w.presets || []).find((x) => x.model === w.current)
+      if (p && !p.cached) {
+        const size = (p.download_gb != null) ? ` (~${String(p.download_gb).replace('.', ',')} ГБ)` : ''
+        if (!confirm(`Модель Whisper «${p.label || p.model}» ещё не скачана${size}. Скачать сейчас? Это однократно — дальше работает офлайн.`)) return
+      }
+    }
+  } catch {}
   let res
   try { res = await fetch('/api/transcribe', { method: 'POST' }) }
   catch (e) { toast('Сеть: не удалось запустить транскрипцию (' + e.message + ')', 'error'); return }
@@ -1812,6 +1915,21 @@ function openFiles(closable, pickCb) {
   $('#btnCloseFiles').style.display = (closable || pickCb) ? '' : 'none'
   lastFocus = document.activeElement
   $('#files').classList.remove('hidden')
+  // A6/A7 — онбординг первого запуска: no-session пикер модален и неотключаем,
+  // его скрим (z-50) накрывает степпер в #transcript и карточку ffmpeg (z-35).
+  // Поэтому шаги «С чего начать» дублируем ВНУТРЬ модалки, а уже показанную
+  // карточку «ffmpeg не найден» переносим сюда же (health мог ответить раньше).
+  if (!st.hasSession && !pickCb) {
+    const head = $('#files .filesHead')
+    if (head && !$('#filesStepper')) {
+      const stp = document.createElement('div')
+      stp.id = 'filesStepper'; stp.className = 'stepper inFiles'
+      stp.innerHTML = stepperHTML(true)
+      head.after(stp)
+    }
+    const card = $('#ffmpegCard')
+    if (head && card && !card.closest('#files')) { card.classList.add('inFiles'); head.after(card) }
+  }
   const fi = $('#pathInput'); if (fi) fi.focus()
   browseDir(st.curDir)
 }

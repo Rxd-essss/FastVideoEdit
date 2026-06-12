@@ -26,8 +26,10 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import serve                                       # noqa: E402
-from vpipe.config import LlmCfg, load_config       # noqa: E402
+import vpipe.transcribe as T                       # noqa: E402
+from vpipe.config import LlmCfg, TranscribeCfg, load_config   # noqa: E402
 from vpipe.llm import OllamaClient                 # noqa: E402
+from vpipe.models import Transcript                # noqa: E402
 
 
 # --- OllamaClient.list_models -----------------------------------------------
@@ -159,6 +161,152 @@ def test_get_models_transcript_model_from_session(client, monkeypatch):
     monkeypatch.setattr(serve, "SESSION", sess)
     j = client.get("/api/models").json()
     assert j["whisper"]["transcript"] == "small"
+
+
+# --- A6: GET /api/models — cached / download_gb per preset -------------------
+def test_get_models_presets_cached_true(client, monkeypatch):
+    # The onboarding modal flags presets whose model is already in the HF cache.
+    # The check is per-PRESET model (not the configured one) and purely local.
+    asked: list[str] = []
+
+    def fake_cached(model):
+        asked.append(model)
+        return True
+
+    monkeypatch.setattr(serve, "_whisper_model_cached", fake_cached)
+    j = client.get("/api/models").json()
+    presets = j["whisper"]["presets"]
+    assert presets
+    for p in presets:
+        # old shape intact + the two new fields
+        assert {"key", "label", "model", "hint", "cached", "download_gb"} <= set(p)
+        assert p["cached"] is True
+        assert isinstance(p["download_gb"], float)
+        assert p["download_gb"] == T._MODEL_DOWNLOAD_GB[p["model"]]
+    # every preset model was individually checked against the cache
+    assert set(asked) == {p["model"] for p in presets}
+
+
+def test_get_models_presets_cached_false_and_unknown_size(client, monkeypatch):
+    monkeypatch.setattr(serve, "_whisper_model_cached", lambda model: False)
+    # 'small' missing from the size table -> download_gb must be null, not a crash
+    sizes = {k: v for k, v in T._MODEL_DOWNLOAD_GB.items() if k != "small"}
+    monkeypatch.setattr(T, "_MODEL_DOWNLOAD_GB", sizes)
+    j = client.get("/api/models").json()
+    by_model = {p["model"]: p for p in j["whisper"]["presets"]}
+    assert all(p["cached"] is False for p in by_model.values())
+    assert by_model["small"]["download_gb"] is None
+    assert by_model["large-v3"]["download_gb"] == sizes["large-v3"]
+
+
+def test_get_models_does_not_mutate_presets(client, monkeypatch):
+    # The endpoint must enrich COPIES — the module-level whitelist stays clean.
+    monkeypatch.setattr(serve, "_whisper_model_cached", lambda model: True)
+    client.get("/api/models")
+    for p in serve.WHISPER_PRESETS:
+        assert "cached" not in p and "download_gb" not in p
+
+
+# --- A6: device_used — фактический девайс транскрипции -----------------------
+def test_run_once_sets_device_used(monkeypatch):
+    # _run_once stamps the device that ACTUALLY ran (CPU fallback passes "cpu").
+    import faster_whisper
+
+    class FakeModel:
+        def __init__(self, *a, **k):
+            pass
+
+        def transcribe(self, *a, **k):
+            return iter(()), SimpleNamespace(language="ru")
+
+    monkeypatch.setattr(faster_whisper, "WhisperModel", FakeModel)
+    monkeypatch.setattr(T, "_start_download_watch", lambda *a, **k: None)
+    tr = T._run_once("x.wav", "small", "cpu", "int8",
+                     TranscribeCfg(), 1.0, "h", lambda *a, **k: None)
+    assert tr.device_used == "cpu"
+
+
+def test_transcript_cache_roundtrip_device_used(tmp_path):
+    p = tmp_path / "t.transcript.json"
+    Transcript(language="ru", duration=1.0, model="small", audio_hash="h",
+               device_used="cuda").save(p)
+    loaded = Transcript.load(p)
+    assert loaded.device_used == "cuda"
+    assert json.loads(p.read_text(encoding="utf-8"))["device_used"] == "cuda"
+
+
+def test_old_cache_without_device_used_reads_null(tmp_path):
+    # A pre-A6 cache json has no "device_used" key at all — must load fine.
+    old = {"version": 1, "language": "ru", "duration": 1.0, "model": "small",
+           "requested_model": "small", "audio_hash": "h", "segments": []}
+    p = tmp_path / "t.transcript.json"
+    p.write_text(json.dumps(old), encoding="utf-8")
+    tr = Transcript.load(p)
+    assert tr.device_used is None
+    assert tr.to_dict()["device_used"] is None   # API serialization -> null
+
+
+def test_transcript_endpoint_carries_device_fields(client, monkeypatch):
+    cfg = serve.APP["cfg"]
+    tr = Transcript(language="ru", duration=1.0, model="small", audio_hash="h",
+                    device_used="cpu")
+    sess = SimpleNamespace(transcript=tr, cfg=cfg)
+    monkeypatch.setattr(serve, "SESSION", sess)
+    j = client.get("/api/transcript").json()
+    assert j["device_used"] == "cpu"
+    assert j["device_configured"] == cfg.transcribe.device
+
+
+def test_transcript_endpoint_old_cache_device_null(client, monkeypatch):
+    # An old cached transcript (no device_used) -> null in the API, no 500.
+    cfg = serve.APP["cfg"]
+    tr = Transcript.from_dict({"language": "ru", "duration": 1.0,
+                               "model": "small", "audio_hash": "h",
+                               "segments": []})
+    sess = SimpleNamespace(transcript=tr, cfg=cfg)
+    monkeypatch.setattr(serve, "SESSION", sess)
+    j = client.get("/api/transcript").json()
+    assert j["device_used"] is None
+    assert j["device_configured"] == cfg.transcribe.device
+
+
+def _state_session(cfg, transcript):
+    media = SimpleNamespace(duration=10.0, fps=25.0, width=1920, height=1080)
+    Path(cfg.paths.out_dir).mkdir(parents=True, exist_ok=True)
+    return SimpleNamespace(
+        inp=Path("clip.mp4"), media=media, audio_hash="a" * 12,
+        transcript=transcript, cutlist=None, llm=None, cfg=cfg,
+        out_dir=Path(cfg.paths.out_dir),
+        task={"name": None, "running": False},
+    )
+
+
+def test_state_exposes_device_fields(client, monkeypatch):
+    cfg = serve.APP["cfg"]
+    tr = Transcript(language="ru", duration=10.0, model="small", audio_hash="h",
+                    device_used="cpu")
+    monkeypatch.setattr(serve, "SESSION", _state_session(cfg, tr))
+    j = client.get("/api/state").json()
+    assert j["device_used"] == "cpu"
+    assert j["device_configured"] == cfg.transcribe.device
+
+
+def test_state_device_used_null_without_transcript(client, monkeypatch):
+    cfg = serve.APP["cfg"]
+    monkeypatch.setattr(serve, "SESSION", _state_session(cfg, None))
+    j = client.get("/api/state").json()
+    assert j["device_used"] is None
+    assert j["device_configured"] == cfg.transcribe.device
+
+
+def test_state_device_used_null_legacy_transcript(client, monkeypatch):
+    # In-memory transcript object without the attribute (legacy) -> null, no 500.
+    cfg = serve.APP["cfg"]
+    legacy = SimpleNamespace(model="small")          # no device_used attr at all
+    monkeypatch.setattr(serve, "SESSION", _state_session(cfg, legacy))
+    j = client.get("/api/state").json()
+    assert j["device_used"] is None
+    assert j["transcript_model"] == "small"
 
 
 # --- POST /api/models : whisper ---------------------------------------------

@@ -47,8 +47,11 @@ def sess(tmp_path):
     cache.mkdir()
     tr = make_transcript()
     tr.save(cache / f"{HASH}.transcript.json")   # стартовый кэш — как после транскрипции
+    # A6: GET /api/transcript теперь отдаёт device_configured из s.cfg — у
+    # реальной Session cfg есть всегда, повторяем это в фейке.
+    cfg = SimpleNamespace(transcribe=SimpleNamespace(device="cuda"))
     return SimpleNamespace(transcript=tr, cache_dir=cache, audio_hash=HASH,
-                           task={"running": False})
+                           cfg=cfg, task={"running": False})
 
 
 @pytest.fixture()
