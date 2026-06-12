@@ -49,5 +49,7 @@ if (-not $ff) {
     }
 }
 
-Write-Host 'Starting editor -> http://127.0.0.1:8000' -ForegroundColor Green
+$port = '8000'
+for ($i = 0; $i -lt $args.Count - 1; $i++) { if ($args[$i] -eq '--port') { $port = $args[$i + 1] } }
+Write-Host "Starting editor -> http://127.0.0.1:$port" -ForegroundColor Green
 & $py (Join-Path $root 'serve.py') @args

@@ -89,6 +89,13 @@ winget install Gyan.FFmpeg    # one-time; open a NEW terminal afterwards
 .\run.bat                     # creates .venv + installs deps, then opens the editor
 ```
 
+Или вообще одной командой — скачает репозиторий в `.\FastVideoEdit` и запустит
+редактор:
+
+```powershell
+irm https://raw.githubusercontent.com/Rxd-essss/FastVideoEdit/main/scripts/install.ps1 | iex
+```
+
 Браузер откроется на `http://127.0.0.1:8000`: выберите клип в панели «Файлы»,
 просмотрите предложенные вырезы (паузы/филлеры уже найдены) и нажмите
 **«Рендер»**. Ничего руками править не нужно — всё дальше делается мышкой.
