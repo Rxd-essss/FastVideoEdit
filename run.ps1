@@ -19,7 +19,10 @@ if (-not (Test-Path $py)) {
     }
     if (-not $base) { Write-Error 'Python not found. Install Python 3.12 from https://python.org'; exit 1 }
     $parts = $base.Split(' '); $exe = $parts[0]
-    $pre = if ($parts.Count -gt 1) { $parts[1..($parts.Count - 1)] } else { @() }
+    # @() is load-bearing: assigning from a bare `if` unwraps a 1-element array
+    # to a string, and splatting a string explodes it into per-CHARACTER args
+    # ("py - 3 . 1 2") - python then reads "-" as stdin and hangs forever.
+    $pre = @(if ($parts.Count -gt 1) { $parts[1..($parts.Count - 1)] } else { @() })
     Write-Host "  using: $base"
     & $exe @pre -m venv $venv
 }
