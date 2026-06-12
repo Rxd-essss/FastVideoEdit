@@ -9,6 +9,10 @@ Covers the plan's F1 expectations 1-7 + founder decision №5:
  5. made-up hook_phrase demotes the candidate to the tail;
  6. a failed window is skipped, others survive; on_stage/on_progress per window;
  7. bool/str/negative/out-of-range indices from the mock are quietly dropped.
+Plus F6 (one-call re-rank, §3.5): the ranking order is applied, prompt ids are
+STRICTLY 1-based, broken replies (garbage / unknown ids / duplicates / gaps /
+empty / LLM down) repair or fall back to round-robin, cfg.rerank=False skips
+the call, rank_source is marked on every candidate.
 No real LLM, no Ollama: the mock is a plain object with chat_json().
 """
 from __future__ import annotations
@@ -497,3 +501,206 @@ def test_tiny_boundary_kiss_survives_overlap_pass():
              hook_phrase="y", reason="", source_window=0)  # 2s/32s = 6% < 20%
     kept = _drop_residual_overlaps([a, b])
     assert len(kept) == 2
+
+
+# === F6: one-call re-rank (§3.5) ===================================================
+# Setup: 2 windows ([0:10] и [8:16] при max_segments_per_call=10, overlap=2),
+# 4 непересекающихся кандидата. Round-robin base order (исходный порядок для
+# ремонта ответа): seg_start [0, 8, 4, 12] → re-rank id 1→0, 2→8, 3→4, 4→12.
+def _rerank_setup():
+    segs = _mk_segs(_T[:16])
+    tr = _tr(segs)
+    win_responses = [
+        {"clips": [
+            {"start_index": 0, "end_index": 3, "score": 90,
+             "hook_phrase": _hook(_T[0]), "reason": "r"},
+            {"start_index": 4, "end_index": 7, "score": 85,
+             "hook_phrase": _hook(_T[4]), "reason": "r"},
+        ]},
+        {"clips": [                          # окно 2: segments[8:16]
+            {"start_index": 0, "end_index": 3, "score": 88,
+             "hook_phrase": _hook(_T[8]), "reason": "r"},
+            {"start_index": 4, "end_index": 7, "score": 70,
+             "hook_phrase": _hook(_T[12]), "reason": "r"},
+        ]},
+    ]
+    return tr, win_responses
+
+
+def _suggest2(tr, llm, **cfg_kw):
+    return suggest(tr, _cl(tr.duration), ClipsCfg(window_overlap=2, **cfg_kw),
+                   LlmCfg(max_segments_per_call=10), llm, log=_SILENT)
+
+
+def test_rerank_order_applied_scores_replaced():
+    tr, win = _rerank_setup()
+    llm = MockLLM(win + [{"ranking": [
+        {"id": 4, "score": 97}, {"id": 2, "score": 80},
+        {"id": 1, "score": 64}, {"id": 3, "score": 41}]}])
+    out = _suggest2(tr, llm)
+    assert len(llm.calls) == 3                       # 2 окна + 1 re-rank
+    # порядок задаёт re-rank, НЕ окно-скоры и НЕ round-robin
+    assert [c.seg_start for c in out] == [12, 8, 0, 4]
+    # re-rank-скоры замещают окно-скоры; окно-скор сохранён отдельно
+    assert [c.score for c in out] == [97, 80, 64, 41]
+    assert [c.score_window for c in out] == [70, 88, 90, 85]
+    assert all(c.rank_source == "llm" for c in out)
+    assert [c.id for c in out] == ["c01", "c02", "c03", "c04"]
+
+
+def test_rerank_prompt_ids_are_one_based_with_hook_dur_text():
+    from vpipe import clips as clips_mod
+    tr, win = _rerank_setup()
+    llm = MockLLM(win + [{"ranking": [{"id": 1, "score": 90}]}])
+    _suggest2(tr, llm)
+    rcall = llm.calls[2]
+    # system/схема — §3.5, как в остальных вызовах clips.py; keep_alive=0
+    assert rcall["system"] == clips_mod._RERANK_SYSTEM
+    assert rcall["schema"] is clips_mod._RERANK_SCHEMA
+    assert rcall["keep_alive"] == 0
+    body = [ln for ln in rcall["user"].split("\n") if " | " in ln and "хук:" in ln]
+    # id СТРОГО с 1 (0-based теряет нулевой элемент — доказанный баг LLM)
+    assert [ln.split(" | ")[0] for ln in body] == ["1", "2", "3", "4"]
+    assert not any(ln.startswith("0 |") for ln in rcall["user"].split("\n"))
+    # id=1 — лучший по round-robin (окно-скор 90, сегмент 0): хук + текст + 20с
+    assert _hook(_T[0]) in body[0] and _T[1] in body[0] and "| 20с |" in body[0]
+    assert _hook(_T[8]) in body[1]                  # id=2 — сегмент 8 (окно 2)
+    assert "\"ranking\"" in rcall["user"]
+
+
+def test_rerank_unknown_ids_ignored_missing_appended_in_base_order():
+    tr, win = _rerank_setup()
+    llm = MockLLM(win + [{"ranking": [
+        {"id": 99, "score": 99}, {"id": 0, "score": 88},   # неизвестные (0 — не наш!)
+        {"id": 3, "score": 77}]}])
+    out = _suggest2(tr, llm)
+    # валидный id=3 (сегмент 4) — первым; пропущенные 1,2,4 — хвост в исходном
+    # round-robin порядке [0, 8, 12]
+    assert [c.seg_start for c in out] == [4, 0, 8, 12]
+    # хвост без re-rank-скора сохраняет окно-скор
+    assert [c.score for c in out] == [77, 90, 88, 70]
+    assert all(c.rank_source == "llm" for c in out)
+
+
+def test_rerank_duplicate_ids_first_occurrence_wins():
+    tr, win = _rerank_setup()
+    llm = MockLLM(win + [{"ranking": [
+        {"id": 2, "score": 91}, {"id": 2, "score": 15},    # дубль схлопнут
+        {"id": 1, "score": 50}]}])
+    out = _suggest2(tr, llm)
+    assert [c.seg_start for c in out] == [8, 0, 4, 12]
+    assert out[0].score == 91                              # скор первого вхождения
+    assert [c.score for c in out] == [91, 50, 85, 70]
+
+
+@pytest.mark.parametrize("bad", [
+    {"ranking": "мусор"},                                  # не список
+    {"foo": 1},                                            # нет ranking
+    {"ranking": []},                                       # пустой
+    {"ranking": ["x", 5, {"score": 9}, {"id": True, "score": 9},
+                 {"id": "1", "score": 9}]},                # ни одного валидного id
+])
+def test_rerank_garbage_reply_falls_back_to_round_robin(bad):
+    tr, win = _rerank_setup()
+    out = _suggest2(tr, MockLLM(win + [bad]))
+    assert [c.seg_start for c in out] == [0, 8, 4, 12]     # round-robin
+    assert [c.score for c in out] == [90, 88, 85, 70]      # окно-скоры
+    assert all(c.rank_source == "round_robin" for c in out)
+
+
+def test_rerank_llm_exception_falls_back_with_log():
+    tr, win = _rerank_setup()
+    logs: list[str] = []
+    llm = MockLLM(win + [RuntimeError("rerank boom")])
+    out = suggest(tr, _cl(tr.duration), ClipsCfg(window_overlap=2),
+                  LlmCfg(max_segments_per_call=10), llm, log=logs.append)
+    assert [c.seg_start for c in out] == [0, 8, 4, 12]
+    assert all(c.rank_source == "round_robin" for c in out)
+    assert any("re-rank" in m and "rerank boom" in m for m in logs)
+
+
+def test_rerank_disabled_no_extra_call_round_robin():
+    tr, win = _rerank_setup()
+    llm = MockLLM(list(win))
+    out = _suggest2(tr, llm, rerank=False)
+    assert len(llm.calls) == 2                             # только окна
+    assert [c.seg_start for c in out] == [0, 8, 4, 12]
+    assert [c.score for c in out] == [90, 88, 85, 70]
+    assert all(c.rank_source == "round_robin" for c in out)
+
+
+def test_rerank_skipped_for_single_candidate():
+    segs = _mk_segs(_T[:10])
+    tr = _tr(segs)
+    llm = MockLLM([{"clips": [{"start_index": 1, "end_index": 5, "score": 85,
+                               "hook_phrase": _hook(_T[1]), "reason": "r"}]}])
+    out = suggest(tr, _cl(tr.duration), ClipsCfg(), LlmCfg(), llm, log=_SILENT)
+    assert len(llm.calls) == 1                             # сравнивать нечего
+    assert len(out) == 1 and out[0].rank_source == "round_robin"
+
+
+def test_rerank_pool_capped_tail_keeps_order(monkeypatch):
+    from vpipe import clips as clips_mod
+    monkeypatch.setattr(clips_mod, "_RERANK_MAX", 2)
+    segs = _mk_segs(_T[:12])
+    tr = _tr(segs)
+    llm = MockLLM([
+        {"clips": [
+            {"start_index": 0, "end_index": 3, "score": 90,
+             "hook_phrase": _hook(_T[0]), "reason": "r"},
+            {"start_index": 4, "end_index": 7, "score": 85,
+             "hook_phrase": _hook(_T[4]), "reason": "r"},
+            {"start_index": 8, "end_index": 11, "score": 80,
+             "hook_phrase": _hook(_T[8]), "reason": "r"},
+        ]},
+        {"ranking": [{"id": 2, "score": 99}, {"id": 1, "score": 55}]},
+    ])
+    out = suggest(tr, _cl(tr.duration), ClipsCfg(), LlmCfg(), llm, log=_SILENT)
+    # в промпт ушли только топ-2 (бюджет токенов §3.5)
+    body = [ln for ln in llm.calls[1]["user"].split("\n") if "хук:" in ln]
+    assert len(body) == 2
+    # третий кандидат — за пулом, идёт хвостом в прежнем порядке
+    assert [c.seg_start for c in out] == [4, 0, 8]
+    assert [c.score for c in out] == [99, 55, 80]
+
+
+def test_rerank_long_text_clipped_head_and_tail():
+    from vpipe import clips as clips_mod
+    roots = ["абрикос", "берёза", "вулкан", "гитара",
+             "дельфин", "ландыш", "жираф", "закат"]
+    texts = [f"Сегмент {i} " + " ".join(f"{roots[i]}{j}" for j in range(24)) + "."
+             for i in range(8)]
+    segs = _mk_segs(texts)
+    tr = _tr(segs)
+    llm = MockLLM([{"clips": [
+        {"start_index": 0, "end_index": 3, "score": 90,
+         "hook_phrase": _hook(texts[0]), "reason": "r"},
+        {"start_index": 4, "end_index": 7, "score": 80,
+         "hook_phrase": _hook(texts[4]), "reason": "r"},
+    ]}])
+    suggest(tr, _cl(tr.duration), ClipsCfg(), LlmCfg(), llm, log=_SILENT)
+    line = next(ln for ln in llm.calls[1]["user"].split("\n")
+                if ln.startswith("1 |"))
+    full = " ".join(texts[0:4])
+    assert len(full) > clips_mod._RERANK_TEXT_MAX       # есть что резать
+    assert full not in line                             # текст усечён…
+    assert " … " in line                                # …голова + … + хвост
+    assert "Сегмент 0" in line                          # голова на месте
+    assert f"{roots[3]}23." in line                     # хвост (конец мысли) на месте
+
+
+# --- round-robin сам по себе: 3 окна, чистый юнит на _sort_mvp ---------------------
+def test_round_robin_three_windows_unit():
+    from vpipe.clips import _Raw, _sort_mvp
+
+    def r(w, score, t0):
+        return _Raw(seg_start=0, seg_end=0, t0=t0, t1=t0 + 30.0,
+                    score_window=score, hook_phrase="h", reason="",
+                    source_window=w)
+
+    cands = [r(0, 90, 0), r(0, 70, 100), r(1, 95, 200), r(1, 60, 300),
+             r(2, 80, 400)]
+    out = _sort_mvp(cands)
+    # по одному лучшему из каждого окна по кругу: ряд 1 [95, 90, 80], ряд 2 [70, 60]
+    assert [(c.source_window, c.score_window) for c in out] == [
+        (1, 95), (0, 90), (2, 80), (0, 70), (1, 60)]

@@ -326,7 +326,13 @@ class ClipsCfg(_Base):
     window_overlap: int = 12       # сегментов (≈60с при медиане ~5с/сегмент)
     keep_alive_between: int = 300  # сек, между окнами; 0 на последнем
     max_candidates: int = 15
-    rerank: bool = True            # v1.1; в MVP игнорируется
+    rerank: bool = True            # одновызовный финальный re-rank (F6/§3.5);
+                                   # False → round-robin по окнам
+    # F8: де-клик afade-in/out на ИСТИННЫХ краях клипа (его начале и конце),
+    # сек на каждый край. Только для рендера клипов (/api/clips/render) —
+    # обычный рендер полного ролика фейдов краёв не получает. 0 = выкл;
+    # клампится к 0–0.2 в render().
+    edge_fade: float = 0.025
 
 
 class Config(_Base):

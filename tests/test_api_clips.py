@@ -155,10 +155,10 @@ def _patch_pipeline(monkeypatch, behaviors=None):
     behaviors = list(behaviors or [])
 
     def fake_pipeline(s, cfg, scale_h, fps, out_dir, base, on_progress,
-                      on_stage, cutlist_override=None):
+                      on_stage, cutlist_override=None, edge_fade=0.0):
         idx = len(calls)
         calls.append({"cfg": cfg, "base": base, "out_dir": out_dir,
-                      "override": cutlist_override,
+                      "override": cutlist_override, "edge_fade": edge_fade,
                       "stage_at_entry": s.task["stage"]})
         b = behaviors[idx] if idx < len(behaviors) else None
         if isinstance(b, Exception):
@@ -224,6 +224,47 @@ def test_suggest_happy_path_task_results_and_cache_file(client, monkeypatch,
     assert data["clips"] == res
     # атомарность: .tmp не остаётся
     assert not (sess.out_dir / "fake.clips.json.tmp").exists()
+
+
+# --- F6: rank_source доезжает до results / clips.json / GET ----------------------
+_TWO_CAND_RESPONSE = {"clips": [
+    {"start_index": 0, "end_index": 3, "score": 90,
+     "hook_phrase": " ".join(_T[0].split()[:5]), "reason": "a"},
+    {"start_index": 4, "end_index": 7, "score": 80,
+     "hook_phrase": " ".join(_T[4].split()[:5]), "reason": "b"}]}
+
+
+def test_suggest_rerank_rank_source_llm_everywhere(client, monkeypatch, tmp_path):
+    llm = MockLLM([_TWO_CAND_RESPONSE,
+                   {"ranking": [{"id": 2, "score": 95}, {"id": 1, "score": 60}]}])
+    sess = FakeSession(tmp_path, llm=llm)
+    _install(monkeypatch, sess)
+    assert client.post("/api/clips/suggest").json() == {"ok": True}
+    _wait_done(sess)
+    assert sess.task["error"] is None
+    res = sess.task["results"]
+    assert res["rank_source"] == "llm"
+    assert [c["seg_start"] for c in res["clips"]] == [4, 0]  # порядок от re-rank
+    assert [c["score"] for c in res["clips"]] == [95, 60]    # re-rank-скоры
+    assert [c["score_window"] for c in res["clips"]] == [80, 90]
+    data = json.loads((sess.out_dir / "fake.clips.json")
+                      .read_text(encoding="utf-8"))
+    assert data["rank_source"] == "llm"
+    assert client.get("/api/clips").json()["rank_source"] == "llm"
+
+
+def test_suggest_rerank_failure_marks_round_robin(client, monkeypatch, tmp_path):
+    llm = MockLLM([_TWO_CAND_RESPONSE, RuntimeError("rerank down")])
+    sess = FakeSession(tmp_path, llm=llm)
+    _install(monkeypatch, sess)
+    client.post("/api/clips/suggest")
+    _wait_done(sess)
+    assert sess.task["error"] is None                # фолбэк, не падение задачи
+    res = sess.task["results"]
+    assert res["rank_source"] == "round_robin"
+    assert [c["seg_start"] for c in res["clips"]] == [0, 4]  # окно-скор desc
+    assert [c["score"] for c in res["clips"]] == [90, 80]
+    assert client.get("/api/clips").json()["rank_source"] == "round_robin"
 
 
 # --- 2. занятый слот задач → 409 ------------------------------------------------
@@ -306,6 +347,10 @@ def test_render_two_clips_names_and_forced_flags(client, monkeypatch, tmp_path):
     for c in calls:
         assert c["cfg"].chapters.enabled is False
         assert c["cfg"].metadata.enabled is False
+    # F8: фейды краёв клипа — ЯВНЫЙ параметр из cfg.clips.edge_fade
+    # (дефолт 0.025); обычный рендер таким параметром не пользуется.
+    for c in calls:
+        assert c["edge_fade"] == pytest.approx(0.025)
     # катлист клипа = живые вырезы + 2 граничных REMOVE (§2.4)
     ov = calls[0]["override"]
     by_id = {seg.id: seg for seg in ov.segments}
@@ -332,6 +377,20 @@ def test_render_custom_filename_and_full_range_no_boundary_cuts(
     assert calls[0]["base"].name == "мой_шорт"
     # клип на весь файл — граничные REMOVE не добавляются
     assert [seg.id for seg in calls[0]["override"].segments] == []
+
+
+def test_render_edge_fade_zero_in_config_passes_zero(client, monkeypatch,
+                                                     tmp_path):
+    # F8: cfg.clips.edge_fade=0 → выкл — пайплайн получает 0.0 (нет фильтра).
+    sess = FakeSession(tmp_path)
+    sess.cfg.clips.edge_fade = 0.0
+    _install(monkeypatch, sess)
+    calls = _patch_pipeline(monkeypatch)
+    r = client.post("/api/clips/render", json={
+        "clips": [{"start": 5.0, "end": 15.0}]})
+    assert r.status_code == 200
+    _wait_done(sess)
+    assert calls[0]["edge_fade"] == 0.0
 
 
 # --- 5. упавший клип не валит остальные ------------------------------------------

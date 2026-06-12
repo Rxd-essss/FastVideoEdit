@@ -92,6 +92,43 @@ _SCHEMA = {
     "required": ["clips"],
 }
 
+# --- one-call re-rank (§3.5/F6) ------------------------------------------------
+# Window scores are compressed into 80–95 and NOT comparable across windows, so
+# a raw top-K across windows is effectively random. One final LLM call compares
+# ALL survivors side by side. Ids are STRICTLY 1-based: with 0-based ids the
+# model provably loses element 0 (llm.md). System prompt is the working one
+# from the live run — do not reword.
+_RERANK_SYSTEM = (
+    "Ты — продюсер YouTube Shorts. Тебе дают список кандидатов в короткие "
+    "ролики, вырезанных из одного длинного видео: у каждого номер, "
+    "длительность и текст. Сравни их МЕЖДУ СОБОЙ и оцени каждый по шкале "
+    "0-100: насколько ролик зацепит случайного зрителя в ленте Shorts (хук с "
+    "первой фразы, самодостаточность, польза/эмоция, желание досмотреть). "
+    "Оценки должны различаться — это рейтинг, а не школьные пятёрки. Верни "
+    "строго JSON: каждый номер из списка ровно один раз."
+)
+
+_RERANK_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "ranking": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"id": {"type": "integer"},
+                               "score": {"type": "integer"}},
+                "required": ["id", "score"],
+            },
+        }
+    },
+    "required": ["ranking"],
+}
+
+_RERANK_MAX = 15        # >15 candidates overflow num_ctx 16384 (~4k tokens, §3.5)
+_RERANK_TEXT_MAX = 700  # per-candidate text budget in the re-rank prompt;
+_RERANK_HEAD = 480      # longer texts are clipped to head 480 + " … " +
+_RERANK_TAIL = 180      # tail 180 (§3.5)
+
 # --- calibrated post-processing constants (llm.md §4, plan §3.6) -------------
 _IOU_DUP = 0.5               # time dedup: IoU of [t0,t1] ranges
 _CONTAINMENT_DUP = 0.7       # time dedup: inter / min_len (small clip inside big)
@@ -118,7 +155,8 @@ class ClipCandidate:
     end: float
     dur_raw: float
     dur_eff: float           # raw − Timeline.removed_overlap(start, end)
-    score: int               # final (re-rank in v1.1; MVP = score_window)
+    score: int               # final: re-rank score when rank_source=="llm",
+                             # else the window score
     score_window: int        # raw window score (threshold/tie-break; NOT
                              # comparable across windows)
     hook_phrase: str
@@ -128,6 +166,8 @@ class ClipCandidate:
     source_window: int = 0
     short: bool = False            # dur_eff in [hard_min, min_duration) — the
                                    # «коротковат» mark (plan §3.6.1: 15–20 s)
+    rank_source: str = "round_robin"   # "llm" — порядок задал одновызовный
+                                       # re-rank; "round_robin" — фолбэк (F6)
 
 
 @dataclass
@@ -144,6 +184,7 @@ class _Raw:
     fuzzy_boundary: bool = False
     short: bool = False
     demote: int = 0          # 0 normal | 1 anaphoric opener (soft) | 2 made-up hook
+    score_final: Optional[int] = None  # re-rank score (§3.5); None → window score
 
 
 # --- small helpers ------------------------------------------------------------
@@ -348,10 +389,11 @@ def _drop_residual_overlaps(cands: list[_Raw]) -> list[_Raw]:
 
 
 def _sort_mvp(cands: list[_Raw]) -> list[_Raw]:
-    """MVP sorting — window score desc with round-robin across windows (window
-    scores are NOT comparable across windows, and one «generous» window must
-    not flood the whole top). This is the same proven re-rank fallback; the
-    one-call re-rank itself is v1.1 (cfg.rerank is ignored here). Demoted
+    """Base ordering — window score desc with round-robin across windows
+    (window scores are NOT comparable across windows, and one «generous»
+    window must not flood the whole top). This is both the re-rank FALLBACK
+    (LLM down / garbage reply / cfg.rerank=False) and the «original order» the
+    re-rank repairs lean on (missing ids are appended in this order). Demoted
     candidates go to the tail: soft anaphoric first, made-up hooks last.
     """
     out: list[_Raw] = []
@@ -371,6 +413,86 @@ def _sort_mvp(cands: list[_Raw]) -> list[_Raw]:
             out.extend(row)
             rank += 1
     return out
+
+
+# --- one-call re-rank (§3.5/F6) ---------------------------------------------------
+def _rerank_text(segments: list[Segment], c: _Raw) -> str:
+    """Candidate text for the re-rank prompt: full when <=700 chars, otherwise
+    head 480 + « … » + tail 180 (§3.5 — the tail shows whether the thought
+    completes, which the system prompt scores)."""
+    text = _clip_text(segments, c)
+    if len(text) <= _RERANK_TEXT_MAX:
+        return text
+    return text[:_RERANK_HEAD].rstrip() + " … " + text[-_RERANK_TAIL:].lstrip()
+
+
+def _build_rerank_user(pool: list[_Raw], segments: list[Segment],
+                       tl: Timeline) -> str:
+    """Compact prompt with ALL candidates: id, duration, hook, short text.
+
+    Ids are STRICTLY 1-based — with 0-based ids the model provably drops
+    element 0 (§3.5). The id→candidate mapping stays on our side (pool[id-1]).
+    """
+    lines = []
+    for i, c in enumerate(pool, 1):
+        dur = (c.t1 - c.t0) - tl.removed_overlap(c.t0, c.t1)
+        lines.append(f"{i} | {max(1, round(dur))}с | хук: {c.hook_phrase or '—'} "
+                     f"| {_rerank_text(segments, c)}")
+    return ("Кандидаты (номер | длительность | хук | текст):\n"
+            + "\n".join(lines)
+            + "\n\nУпорядочь от лучшего к худшему (лучшие первыми). Верни "
+              "JSON: {\"ranking\": [{\"id\": N, \"score\": N}]} — каждый номер "
+              "из списка ровно один раз.")
+
+
+def _rerank(ordered: list[_Raw], segments: list[Segment], tl: Timeline,
+            llm: OllamaClient, log) -> Optional[list[_Raw]]:
+    """One final LLM call over all surviving candidates (§3.5/F6).
+
+    Input is the round-robin order; only the first ``_RERANK_MAX`` go into the
+    prompt (token budget §3.5), the rest keep their order at the tail. Returns
+    the new order, or ``None`` — the caller keeps the round-robin order
+    (rank_source="round_robin").
+
+    Response repairs (never a hard failure): unknown ids ignored, duplicate
+    ids collapsed to the first occurrence, missing ids appended at the tail in
+    the original round-robin order. Valid re-rank scores land in
+    ``score_final`` (clamped 0–100) and replace the window score in the
+    output; repaired tail entries keep their window score.
+
+    keep_alive=0 — this is the last LLM call of the pass (frees VRAM).
+    """
+    pool = ordered[:_RERANK_MAX]
+    user = _build_rerank_user(pool, segments, tl)
+    try:
+        data = llm.chat_json(_RERANK_SYSTEM, user, _RERANK_SCHEMA, keep_alive=0)
+    except Exception as e:  # noqa: BLE001 — re-rank must never lose the pass
+        log(f"  clips: re-rank failed ({e}); keeping round-robin order.")
+        return None
+    items = data.get("ranking") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        log("  clips: re-rank returned no usable ranking; keeping round-robin order.")
+        return None
+    seen: set[int] = set()
+    picked: list[_Raw] = []
+    for r in items:
+        if not isinstance(r, dict):
+            continue
+        rid = r.get("id")
+        if not _valid_int(rid) or not (1 <= rid <= len(pool)) or rid in seen:
+            continue                     # unknown/duplicate id — ignore
+        seen.add(rid)
+        c = pool[rid - 1]
+        sc = r.get("score")
+        if _valid_int(sc):
+            c.score_final = max(0, min(100, sc))
+        picked.append(c)
+    if not picked:
+        log("  clips: re-rank returned no usable ranking; keeping round-robin order.")
+        return None
+    picked.extend(c for i, c in enumerate(pool, 1) if i not in seen)
+    picked.extend(ordered[len(pool):])
+    return picked
 
 
 # --- word-snap (§3.6.4) ---------------------------------------------------------
@@ -450,8 +572,9 @@ def _apply_word_bounds(c: _Raw, segments: list[Segment], words, norm_words,
 def suggest(transcript: Transcript, cutlist: CutList, cfg: ClipsCfg,
             llm_cfg: LlmCfg, llm: OllamaClient, *, log=print,
             on_progress=None, on_stage=None) -> list[ClipCandidate]:
-    """Full pass: windows → validation → trim → dedup → (v1.1: re-rank) →
-    word-snap. Candidates come back in ORIGINAL coordinates."""
+    """Full pass: windows → validation → trim → dedup → re-rank (one final
+    LLM call, §3.5/F6; fallback round-robin) → word-snap. Candidates come back
+    in ORIGINAL coordinates; ``rank_source`` says who ordered them."""
     segments = transcript.segments
     if llm is None or not segments:
         return []
@@ -550,8 +673,21 @@ def suggest(transcript: Transcript, cutlist: CutList, cfg: ClipsCfg,
     deduped = _dedup(processed, segments, cutlist)
     deduped = _drop_residual_overlaps(deduped)
 
-    # 8. MVP sort: window score desc + round-robin across windows.
+    # 8. Base order: window score desc + round-robin across windows — the
+    #    honest fallback AND the «original order» for re-rank repairs.
     ordered = _sort_mvp(deduped)
+    # 8b. One-call re-rank (§3.5/F6): window scores are NOT comparable across
+    #     windows, so one final LLM call orders ALL survivors. Any failure
+    #     keeps the round-robin order. Skipped for <2 candidates — nothing to
+    #     compare, no extra LLM call.
+    rank_source = "round_robin"
+    if cfg.rerank and len(ordered) >= 2:
+        if on_stage:
+            on_stage("Клипы… ранжирование")
+        reranked = _rerank(ordered, segments, tl, llm, log)
+        if reranked is not None:
+            ordered = reranked
+            rank_source = "llm"
 
     # 9. Word-snap of the start by hook_phrase + pads + pause-edge snapping.
     words = transcript.all_words()
@@ -569,12 +705,16 @@ def suggest(transcript: Transcript, cutlist: CutList, cfg: ClipsCfg,
             seg_start=c.seg_start, seg_end=c.seg_end,
             start=round(start, 3), end=round(end, 3),
             dur_raw=round(dur_raw, 3), dur_eff=round(dur_eff, 3),
-            score=c.score_window,            # MVP: final score = window score
+            # re-rank score replaces the window score for the UI bar; repaired
+            # tail entries (missing from the LLM reply) keep the window score.
+            score=(c.score_final if c.score_final is not None
+                   else c.score_window),
             score_window=c.score_window,
             hook_phrase=c.hook_phrase, reason=c.reason,
             fuzzy_boundary=c.fuzzy_boundary,
             source_window=c.source_window,
-            short=c.short))
+            short=c.short,
+            rank_source=rank_source))
     if on_progress:
         on_progress(1.0)
     return out

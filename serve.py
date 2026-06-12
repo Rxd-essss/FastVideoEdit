@@ -718,7 +718,8 @@ def _resolve_render_opts(s: Session, opts: dict):
 
 def _run_render_pipeline(s: Session, cfg, scale_h, fps, out_dir: Path,
                          base: Path, on_progress, on_stage,
-                         cutlist_override: Optional[CutList] = None) -> dict:
+                         cutlist_override: Optional[CutList] = None,
+                         edge_fade: float = 0.0) -> dict:
     """Render mp4 + (optional) subtitles + chapters, returning the results dict.
 
     ``on_progress(frac)`` / ``on_stage(msg)`` are callbacks so the same body
@@ -730,7 +731,13 @@ def _run_render_pipeline(s: Session, cfg, scale_h, fps, out_dir: Path,
     instead of the session's (one Shorts clip = the live internal cuts plus
     boundary REMOVEs around [start, end]). Burn-in ASS subs and the Timeline are
     built from the SAME cutlist, and the session is never mutated. ``None``
-    (the default) keeps the legacy single-render behavior bit-for-bit."""
+    (the default) keeps the legacy single-render behavior bit-for-bit.
+
+    ``edge_fade`` (Clip Maker F8): seconds of de-click afade-in/out on the TRUE
+    edges of the clip's final audio. An EXPLICIT parameter (not a heuristic on
+    cutlist_override): only /api/clips/render passes a non-zero value (from
+    cfg.clips.edge_fade); every regular full-video render keeps the default 0.0
+    and gets no edge fades."""
     cl = cutlist_override or s.cutlist
     tr = s.transcript
     removed, _ = resolve(cl)
@@ -814,7 +821,8 @@ def _run_render_pipeline(s: Session, cfg, scale_h, fps, out_dir: Path,
         s.ff, s.media, cl, cfg, base.with_suffix(".mp4"), s.work_dir,
         on_progress=on_progress,
         log=lambda m="": on_stage(str(m).strip() or "Рендер видео…"),
-        scale_h=scale_h, fps=fps, ass_path=ass_path, crop_filter=crop_filter)
+        scale_h=scale_h, fps=fps, ass_path=ass_path, crop_filter=crop_filter,
+        edge_fade=edge_fade)
 
     sr: dict = {}
     subtitles_ok = not cfg.subtitles.enabled
@@ -1897,6 +1905,13 @@ def _clips_json_path(s: Session) -> Path:
     return s.out_dir / f"{s.inp.stem}.clips.json"
 
 
+def _rank_source(cands: list) -> str:
+    """Кто упорядочил кандидатов (F6): suggest() помечает каждого, значение
+    одно на весь прогон — поднимаем его на верхний уровень ответа/файла."""
+    return getattr(cands[0], "rank_source", "round_robin") if cands \
+        else "round_robin"
+
+
 def _save_clips_json(s: Session, cands: list) -> None:
     """Persist clip candidates atomically (.tmp -> os.replace), формат §2.5.
 
@@ -1910,6 +1925,9 @@ def _save_clips_json(s: Session, cands: list) -> None:
         "hash": s.audio_hash,
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "model": s.cfg.llm.model,
+        # F6: кто задал порядок — "llm" (одновызовный re-rank) или
+        # "round_robin" (фолбэк). Фронт может игнорировать.
+        "rank_source": _rank_source(cands),
         "clips": [asdict(c) for c in cands],
     }
     p = _clips_json_path(s)
@@ -1961,7 +1979,8 @@ def clips_suggest():
             log=lambda *_: None,
             on_progress=s.set_progress, on_stage=s.stage)
         _save_clips_json(s, cands)
-        s.task["results"] = {"clips": [asdict(c) for c in cands]}
+        s.task["results"] = {"clips": [asdict(c) for c in cands],
+                             "rank_source": _rank_source(cands)}
 
     s.start_task("preview_clips", run)
     return {"ok": True}
@@ -1980,7 +1999,10 @@ def get_clips():
         return {"clips": [], "stale": True}
     return {"clips": data["clips"], "stale": False,
             "generated_at": data.get("generated_at"),
-            "model": data.get("model")}
+            "model": data.get("model"),
+            # файлы до F6 писались без rank_source — тогда порядок и был
+            # round-robin (MVP-сортировка)
+            "rank_source": data.get("rank_source", "round_robin")}
 
 
 @app.post("/api/clips/render")
@@ -2075,12 +2097,19 @@ def clips_render(body: dict = Body(default={})):
             try:
                 opts_i = {**render_opts, "filename": c["filename"]}
                 cfg, scale_h, fps, out_dir, base = _resolve_render_opts(s, opts_i)
+                # F8: де-клик фейды истинных краёв клипа — ЯВНЫЙ параметр,
+                # только для клипов (обычный рендер живёт с дефолтом 0.0).
+                # Кламп к 0–0.2 — внутри render._edge_fade_filters.
+                try:
+                    ef = float(getattr(cfg.clips, "edge_fade", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    ef = 0.0
                 res = _run_render_pipeline(
                     s, cfg, scale_h, fps, out_dir, base,
                     on_progress=lambda f, i=i: s.set_progress(
                         (i + min(1.0, max(0.0, f))) / n),
                     on_stage=lambda m, i=i: s.stage(f"Клип {i + 1}/{n}: {m}"),
-                    cutlist_override=clip_cl)
+                    cutlist_override=clip_cl, edge_fade=ef)
                 results.append({"ok": True, "filename": c["filename"], **res})
             except Exception as e:  # noqa: BLE001 — упавший клип не валит остальные
                 err = "cancelled" if s.task.get("cancelled") else str(e)

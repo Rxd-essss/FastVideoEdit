@@ -53,6 +53,37 @@ def _audio_seg_filter(asrc: str, a: float, b: float, i: int, n_kept: int,
     return af
 
 
+def _edge_fade_filters(edge_fade: float, out_dur: float) -> list[str]:
+    """De-click fades for the program's TRUE edges (Clip Maker F8).
+
+    A Shorts clip cut from mid-phrase / a noise bed starts and ends with a full-
+    amplitude waveform step — a click. :func:`_audio_seg_filter` deliberately
+    fades only INTERNAL seams, so the clip's own start/end stay hard. This
+    returns an ``afade=in`` at t=0 and an ``afade=out`` ending exactly at
+    ``out_dur`` (the FINAL audio duration, after all cuts), to be appended to
+    the final audio chain. ``edge_fade`` is clamped to a sane 0..0.2 s and to
+    half the output duration (a 30 ms clip must not fade past its middle);
+    <=0 (or an empty program) disables the fades entirely.
+
+    Placement contract (why these run AFTER the whole apost chain, incl.
+    loudnorm): loudnorm is an adaptive gain stage — applied AFTER a fade it
+    would pump the fading edges back up, partially undoing the de-click ramp,
+    whereas afade as the LAST gain stage guarantees the output ramps from/to
+    literal zero. The loudness target is not perturbed: 2×~25 ms of faded edge
+    is far below loudnorm's 400 ms gating blocks and negligible over a 20-60 s
+    integration window. And the 2-pass measurement chain
+    (:func:`build_loudnorm_measure_chain`) intentionally knows nothing about
+    edge fades — with the fade after loudnorm the measured stats still describe
+    exactly the audio that enters loudnorm, bit-for-bit.
+    """
+    edge_fade = min(0.2, max(0.0, float(edge_fade or 0.0)))
+    d = min(edge_fade, out_dur / 2)
+    if d <= 0:
+        return []
+    return [f"afade=t=in:st=0:d={_f(d)}",
+            f"afade=t=out:st={_f(out_dur - d)}:d={_f(d)}"]
+
+
 # Force constant frame rate on every re-encode (cut/rescale) pass. VFR sources
 # (phone/OBS screen recordings) otherwise drift or stutter at concat seams.
 _CFR = ["-fps_mode", "cfr"]
@@ -487,7 +518,8 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
            on_progress=None, log=print,
            scale_h: Optional[int] = None, fps: Optional[float] = None,
            ass_path: Optional[str] = None,
-           crop_filter: Optional[str] = None) -> dict:
+           crop_filter: Optional[str] = None,
+           edge_fade: float = 0.0) -> dict:
     """Run both stages and write the final mp4. Returns a small summary dict.
 
     ``scale_h``/``fps`` override the output resolution height / frame rate; None
@@ -499,6 +531,12 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
     target resize happen before any burn-in. For vertical renders the caller
     passes ``scale_h=None`` because the exact target scale is baked into
     ``crop_filter``.
+
+    ``edge_fade`` (Clip Maker F8): seconds of de-click afade-in/out applied to
+    the TRUE edges of the FINAL audio (after all cuts/censoring/apost — see
+    :func:`_edge_fade_filters` for the loudnorm-ordering rationale). The caller
+    sets it EXPLICITLY and only for Shorts-clip renders; the default 0.0 keeps
+    every regular full-video render byte-for-byte unchanged. Clamped to 0..0.2.
     """
     removed, censors = resolve(cl)
     tl = Timeline(removed, media.duration)
@@ -619,6 +657,14 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
     # byte-for-byte identical to before (copy / passthrough fast-paths preserved).
     apost = build_apost(cfg, loudnorm_measured=measured) if has_audio else []
     apost_s = ",".join(apost)
+    # F8: de-click fades on the clip's TRUE edges, appended AFTER the whole
+    # apost chain (incl. loudnorm — ordering rationale in _edge_fade_filters).
+    # The fade-out anchors to the FINAL audio duration: with cuts that is the
+    # exact concat length (kept already excludes sub-min_segment slivers),
+    # otherwise the full source duration. [] when edge_fade<=0 (every regular
+    # full-video render) -> all fast-paths/graphs stay byte-for-byte identical.
+    out_adur = sum(b - a for a, b in kept)
+    efades = _edge_fade_filters(edge_fade, out_adur) if has_audio else []
 
     if not removed and not vpost:
         # No cuts, no rescale: just mux (video copied — no quality loss). Denoise,
@@ -627,10 +673,11 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
             log("  no cuts — remuxing (video copied).")
             args = ["-i", media.path, "-map", "0:v",
                     "-c:v", "copy", "-an", *_faststart(cfg), out_path]
-        elif apost:
-            log(f"  no cuts — remuxing (video copied); denoise audio ({apost_s}).")
+        elif apost or efades:
+            achain = ",".join(apost + efades)   # == apost_s for regular renders
+            log(f"  no cuts — remuxing (video copied); denoise audio ({achain}).")
             asrc_label = f"[{asrc_idx}:a]"  # DFN wav / FLAC if any, else original
-            graph = f"{asrc_label}{apost_s}[outa]"
+            graph = f"{asrc_label}{achain}[outa]"
             args = [*inputs, "-filter_complex", graph,
                     "-map", "0:v", "-map", "[outa]",
                     "-c:v", "copy", *_audio_args(cfg), *_faststart(cfg), out_path]
@@ -656,10 +703,11 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
 
     if not removed:
         # No cuts but rescale/fps requested -> re-encode video; pass audio through.
-        if has_audio and apost:
-            # Audio must enter the graph to apply the denoise filters.
+        if has_audio and (apost or efades):
+            # Audio must enter the graph to apply the denoise/edge-fade filters.
+            achain = ",".join(apost + efades)
             graph = (f"[0:v]{vpost_s}[outv];"
-                     f"[{asrc_idx}:a]{apost_s}[outa]")
+                     f"[{asrc_idx}:a]{achain}[outa]")
             args = [*inputs, "-filter_complex", graph, "-map", "[outv]",
                     "-map", "[outa]", *venc, *_audio_args(cfg),
                     *_faststart(cfg), out_path]
@@ -694,16 +742,19 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
             aparts.append(_audio_seg_filter(asrc, a, b, i, n_kept, cut_fade) + f"[a{i}]")
             concat.append(f"[v{i}][a{i}]")
         base = ";".join(vparts + aparts) + ";" + "".join(concat)
-        # When denoise is on, the concat's audio leaves as [outa_raw] and the
-        # apost chain produces the final [outa] — so it runs on the FULL retimed
-        # (already-censored) audio, never per-segment.
-        a_lbl = "[outa_raw]" if apost else "[outa]"
+        # When denoise/edge fades are on, the concat's audio leaves as
+        # [outa_raw] and the post chain produces the final [outa] — so it runs
+        # on the FULL retimed (already-censored) audio, never per-segment.
+        # efades come strictly AFTER apost (i.e. after loudnorm) — see
+        # _edge_fade_filters for why that order protects the de-click ramp.
+        afinal = apost + efades
+        a_lbl = "[outa_raw]" if afinal else "[outa]"
         if vpost:
             graph = base + f"concat=n={len(kept)}:v=1:a=1[vc]{a_lbl};[vc]{vpost_s}[outv]"
         else:
             graph = base + f"concat=n={len(kept)}:v=1:a=1[outv]{a_lbl}"
-        if apost:
-            graph += f";[outa_raw]{apost_s}[outa]"
+        if afinal:
+            graph += f";[outa_raw]{','.join(afinal)}[outa]"
         args = [*inputs, "-filter_complex", graph, "-map", "[outv]", "-map", "[outa]",
                 *venc, *_audio_args(cfg), *_faststart(cfg), out_path]
     else:
