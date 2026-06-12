@@ -172,6 +172,10 @@
       <button id="netBadge" class="netBadge net-local" title="Приватность — всё локально" aria-haspopup="dialog"><svg class="ic" aria-hidden="true"><use href="#i-shield"/></svg><span>Локально</span></button>
       <span class="tbSep" aria-hidden="true"></span>
       <button id="btnTranscribe" class="btn btn-ghost">Транскрибировать</button>
+      <!-- C4 — «Авто-пак»: флагман «сырец → ролик + пак Shorts» одной кнопкой.
+           Живёт в топбаре (не в renderModal): фича должна быть видна сразу,
+           без открытия настроек. disabled до выбора ролика (init снимает). -->
+      <button id="btnAutopack" class="btn btn-primary" disabled title="Сначала выберите ролик"><svg class="ic" aria-hidden="true"><use href="#i-bolt"/></svg>Авто-пак</button>
       <button id="btnRender" class="btn btn-primary"><svg class="ic" aria-hidden="true"><use href="#i-render"/></svg>Рендер <kbd>R</kbd></button>
       <button id="btnHelp" class="btn btn-ghost btn-icon" title="Справка (?)" aria-label="Справка"><svg class="ic" aria-hidden="true"><use href="#i-help"/></svg></button>
     </div>
@@ -764,6 +768,42 @@
           <button class="btn" id="btnFillersSave"><svg class="ic" aria-hidden="true"><use href="#i-check"/></svg>Сохранить словарь</button>
         </div>
       </section>
+    </div>
+  </div>
+
+  <!-- C4 — «Авто-пак»: компактная модалка запуска (top_k + форматы основного
+       ролика + тумблер Shorts). Кодек/сабы/шумодав НЕ дублируются — берутся
+       из «Настроек рендера» (collectRenderOpts), о чём честно сказано ниже. -->
+  <div id="autopackModal" class="overlay hidden" role="dialog" aria-modal="true" aria-label="Авто-пак">
+    <div class="card autopackCard">
+      <div class="filesHead">
+        <h2><svg class="ic ic-h2" aria-hidden="true"><use href="#i-bolt"/></svg>Авто-пак</h2>
+        <button class="btn btn-ghost btn-icon" id="btnCloseAutopack" title="Закрыть" aria-label="Закрыть"><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg></button>
+      </div>
+      <p class="apLead hint muted">Всё одной задачей: транскрипция (если её ещё нет), детекция вырезов (если их ещё нет), рендер основного ролика и пак Shorts-клипов. Уже сделанные шаги не повторяются, ваши правки вырезов не трогаются.</p>
+      <label class="apNumLabel" for="apTopK">
+        <input id="apTopK" class="apNum" type="number" min="1" max="10" step="1" value="3" aria-label="Сколько Shorts-клипов рендерить"> Shorts-клипов
+      </label>
+      <div class="rvert">
+        <div class="rfmtTitle">Форматы основного ролика</div>
+        <div class="rfmtRow" role="group" aria-label="Форматы основного ролика">
+          <label class="chk"><input type="checkbox" id="apFmtSource" checked> Исходный</label>
+          <label class="chk"><input type="checkbox" id="apFmt916"> 9:16 (Shorts)</label>
+          <label class="chk"><input type="checkbox" id="apFmt11"> 1:1 (квадрат)</label>
+          <label class="chk"><input type="checkbox" id="apFmt169"> 16:9-кроп</label>
+        </div>
+        <div class="hint muted">Каждый отмеченный формат — отдельный полный рендер (время ×N), имя дополняется суффиксом (_9x16, _1x1, _16x9).</div>
+      </div>
+      <label class="chk apClipsChk"><input type="checkbox" id="apClips" checked> Предложить и отрендерить Shorts</label>
+      <div id="apLlmHint" class="hint muted hidden">ИИ выключен (Ollama не найдена) — новые клипы не предложатся; уже подобранный список клипов (если есть) отрендерится.</div>
+      <div class="apNote hint muted">
+        <span>Настройки кодека, субтитров и шумодава берутся из «Настроек рендера».</span>
+        <button class="btn small" id="btnApOpenRender">Открыть настройки рендера</button>
+      </div>
+      <div class="ractions">
+        <button class="btn" id="btnApCancel">Отмена</button>
+        <button class="btn btn-primary" id="btnApStart"><svg class="ic" aria-hidden="true"><use href="#i-bolt"/></svg>Запустить Авто-пак</button>
+      </div>
     </div>
   </div>
 

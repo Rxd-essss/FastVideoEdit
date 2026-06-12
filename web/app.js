@@ -70,6 +70,10 @@ const st = {
   capPreset: null,
   capBase: null,          // скрытые поля (outline/shadow/margin_v/outline_color)
                           // последнего применённого пресета — «Свой» наследует их
+  // C4 — «Авто-пак»: засеяны ли поля модалки рендера дефолтами в этой сессии
+  // страницы. collectRenderOpts читает их и БЕЗ открытия модалки — без посева
+  // ушли бы «сырые» HTML-значения (range=22, пустые out_dir/filename).
+  _rSeeded: false,
 }
 const UNDO_CAP = 50
 const undoStack = [], redoStack = []
@@ -98,6 +102,8 @@ const TABS = [
 const TAB_KEY = 'fve_tab'
 // Вкладка-адресат фоновой задачи (busy-спиннер вместо бейджа, точка при ошибке).
 const TASK_TAB = { transcribe: 'cuts', detect: 'cuts', preview_chapters: 'chapters', preview_metadata: 'meta', preview_clips: 'clips', render_clips: 'clips' }
+// C4 — title кнопки «Авто-пак» в доступном состоянии (см. setRunning).
+const AUTOPACK_TITLE = 'Сырец → готовый ролик + пак Shorts одной кнопкой'
 let activeTab = 'cuts'
 const tabDescr = (id) => TABS.find((t) => t.id === id)
 let saveTimer = null, es = null, raf = 0
@@ -199,6 +205,8 @@ async function init() {
   $('#tcTot').textContent = fmt(st.duration)
   $('#btnTranscribe').classList.toggle('hidden', s.has_transcript)
   if (!s.has_transcript) { $('#btnTranscribe').classList.add('pulse'); flash('Не транскрибировано — нажми «Транскрибировать»') }
+  // C4: «Авто-пак» доступен, как только выбран ролик — остальное он сделает сам.
+  const apBtn = $('#btnAutopack'); if (apBtn) { apBtn.disabled = false; apBtn.title = AUTOPACK_TITLE }
 
   $('#progress').classList.remove('hidden'); $('#progress').classList.add('indeterminate')
   setProgress(35, 'Готовлю аудиоволну…')
@@ -502,7 +510,7 @@ function stepperHTML(inFiles) {
     '<ol class="steps">' +
       `<li><span class="stepNum">1</span><span>${step1}</span></li>` +
       '<li><span class="stepNum">2</span><span>Нажмите «Транскрибировать» — речь превратится в текст (в первый раз скачается модель распознавания)</span></li>' +
-      '<li><span class="stepNum">3</span><span>Проверьте вырезы и нажмите «Рендер»</span></li>' +
+      '<li><span class="stepNum">3</span><span>Проверьте вырезы и нажмите «Рендер» — или нажмите «Авто-пак»: всё сделается само (вырезы, ролик и пак Shorts)</span></li>' +
     '</ol>'
 }
 
@@ -2020,6 +2028,15 @@ function setRunning(name) {
   st.task = name || null
   const busy = !!name
   for (const id of ['#btnTranscribe', '#btnRedetect', '#btnRender', '#btnChaptersToggle', '#btnMetaGenerate', '#btnClipsSuggest', '#btnClipsRender', '#btnDetectApply', '#btnFillersSave']) { const b = $(id); if (b) b.disabled = busy }
+  // C4: «Авто-пак» — отдельно от общего цикла: он дизейблится И занятой
+  // задачей, И пустой сессией, а title всегда объясняет почему.
+  const ap = $('#btnAutopack')
+  if (ap) {
+    ap.disabled = busy || !st.hasSession
+    ap.title = !st.hasSession ? 'Сначала выберите ролик'
+      : busy ? 'Идёт другая задача — дождитесь завершения или отмените её'
+        : AUTOPACK_TITLE
+  }
   setTabBusy(st.task)   // busy-спиннер на табе-адресате (вкладки НЕ дизейблим)
   const cancel = $('#btnCancelTask'); if (cancel) cancel.classList.toggle('hidden', !busy)
 }
@@ -2064,6 +2081,18 @@ function followTask(name) {
         // F4: отменённый render_clips сохраняет частичные результаты — показать
         // готовые клипы/ошибки на карточках (план §2.4: «остальные не теряются»).
         if (t.name === 'render_clips' && t.results && t.results.clips) applyClipRenderResults(t.results.clips)
+        // C4: отменённый/упавший Авто-пак сохраняет уже сделанное — честная
+        // сводка частичных результатов (основной ролик/клипы не теряются).
+        // autopackRefresh — БЕЗУСЛОВНО: транскрипт/вырезы могли появиться до
+        // упавшей стадии (например, отмена в ходе рендера основного ролика,
+        // когда results.main ещё пуст) — иначе кнопка «Транскрибировать»
+        // продолжает пульсировать, хотя транскрипт уже на сервере.
+        if (t.name === 'autopack') {
+          autopackRefresh()
+          if (t.results && (t.results.main || (Array.isArray(t.results.clips) && t.results.clips.length))) {
+            showAutopackResults(t.results, true)
+          }
+        }
         // Ошибка = существующий тост + точка на вкладке-адресате задачи.
         const errTab = TASK_TAB[t.name]; if (errTab) notifyTab(errTab)
         if (t.cancelled || t.error === 'cancelled') toast('Задача отменена', 'info')
@@ -2085,6 +2114,28 @@ function followTask(name) {
         applyClipRenderResults(rs)
         const ok = rs.filter((r) => r && r.ok).length
         toast(`Готово: ${ok}/${rs.length} клипов`, ok === rs.length ? 'success' : 'error')
+      }
+      // C4: Авто-пак завершён — обновить UI (транскрипт/вырезы/клипы могли
+      // появиться в ходе задачи) и показать карточку-сводку с ссылками.
+      // Тост честный (паттерн render_clips «Готово: ok/total»): упавшие
+      // форматы/клипы — красный, а не зелёное «готово» при 0/3 клипов.
+      if (t.name === 'autopack' && t.results) {
+        const r = t.results
+        const fmts = (r.main && Array.isArray(r.main.formats)) ? r.main.formats : []
+        const badF = fmts.filter((f) => f && f.ok === false).length
+        const cls = Array.isArray(r.clips) ? r.clips : []
+        const okC = cls.filter((c) => c && c.ok).length
+        if (badF || okC < cls.length) {
+          const parts = []
+          if (badF) parts.push(`форматов с ошибкой: ${badF}/${fmts.length}`)
+          if (okC < cls.length) parts.push(`клипов готово: ${okC}/${cls.length}`)
+          toast('Авто-пак завершён, но не всё получилось — ' + parts.join(', '), 'error')
+        } else {
+          const nw = (r.warnings || []).length
+          toast(nw ? 'Авто-пак готов — есть предупреждения' : 'Авто-пак готов', nw ? 'info' : 'success')
+        }
+        autopackRefresh()
+        showAutopackResults(r)
       }
     }
   }
@@ -2376,8 +2427,11 @@ function renderFormatsChanged() {
   renderFormatsNote()
 }
 
-function openRenderModal() {
-  if (!st.hasSession) return
+// Посев полей модалки рендера дефолтами сервера/сессии. Вынесен из
+// openRenderModal ради C4: «Авто-пак» собирает render_opts из ЭТИХ полей
+// (collectRenderOpts), и они обязаны быть валидными даже если модалку
+// рендера в этой сессии страницы ни разу не открывали.
+function seedRenderModal() {
   const d = st.rdefaults || {}, m = st.media || {}
   const enc = d.encoder || 'nvenc'
   $('#rEncoder').value = enc
@@ -2435,6 +2489,12 @@ function openRenderModal() {
   }
   $('#rOutDir').value = st.outDir || ''
   $('#rFilename').value = ($('#filename').textContent || 'output').replace(/\.[^.]+$/, '')
+  st._rSeeded = true
+}
+
+function openRenderModal() {
+  if (!st.hasSession) return
+  seedRenderModal()
   openOverlay('#renderModal')
 }
 
@@ -2636,7 +2696,10 @@ function burnOptsFromUI() {
   return { burn_subtitles: true, burn_style: style }
 }
 
-function submitRender() {
+// Сбор render-opts из полей модалки рендера. Общая точка для обычного рендера
+// (submitRender) и «Авто-пака» (render_opts тела /api/autopack) — настройки
+// кодека/сабов/шумодава всегда одни и те же, без дублей.
+function collectRenderOpts() {
   const opts = {
     encoder: $('#rEncoder').value,
     quality: parseInt($('#rQuality').value, 10),
@@ -2668,6 +2731,11 @@ function submitRender() {
     opts.denoise_engine = $('#rDenoiseEngine') ? $('#rDenoiseEngine').value : 'afftdn'
   }
   Object.assign(opts, burnOptsFromUI() || { burn_subtitles: false })
+  return opts
+}
+
+function submitRender() {
+  const opts = collectRenderOpts()
   closeOverlay('#renderModal')
   startRender(opts)
 }
@@ -2750,9 +2818,133 @@ function showResults(r) {
   $('#btnCloseResults').onclick = () => closeOverlay('#results')
 }
 
+/* ---------- C4: «Авто-пак» — сырец → готовый ролик + пак Shorts ----------
+   Одна кнопка против 4 ручных облачных шагов CapCut: модалка собирает только
+   СВОИ поля (top_k / форматы основного / тумблер клипов), всё остальное
+   приходит из «Настроек рендера» через collectRenderOpts. Прогресс и стадии —
+   обычный followTask по SSE; результаты — карточка-сводка в #results. */
+const AP_FMT_IDS = { source: '#apFmtSource', '9x16': '#apFmt916', '1x1': '#apFmt11', '16x9': '#apFmt169' }
+
+function apFormatsCollect() {
+  return Object.keys(AP_FMT_IDS).filter((f) => { const el = $(AP_FMT_IDS[f]); return el && el.checked })
+}
+// Паттерн C2 (renderFormatsChanged): снять последний чекбокс нельзя — молча
+// возвращаем «Исходный», чтобы запуск никогда не отправил пустой список (400).
+function apFormatsChanged() {
+  if (!apFormatsCollect().length) { const el = $(AP_FMT_IDS.source); if (el) el.checked = true }
+}
+
+function openAutopackModal() {
+  if (!st.hasSession || st.task) return
+  // render_opts собираются из полей модалки рендера — засеять их дефолтами,
+  // если юзер ещё ни разу не открывал «Настройки рендера» в этой сессии.
+  if (!st._rSeeded) seedRenderModal()
+  // LLM off: чекбокс клипов остаётся доступным (свежий clips.json рендерится и
+  // без LLM — это умеет сам бэк), но подсказка честно объясняет ограничение.
+  const hint = $('#apLlmHint'); if (hint) hint.classList.toggle('hidden', st.llmReady)
+  const cb = $('#apClips')
+  if (cb) cb.parentElement.title = st.llmReady
+    ? 'Локальная LLM подберёт лучшие фрагменты и отрендерит топ-K вертикальных клипов'
+    : 'ИИ выключен (Ollama не найдена) — новые клипы не предложатся; уже подобранный список (если есть) отрендерится'
+  openOverlay('#autopackModal')
+}
+
+async function submitAutopack() {
+  if (!st.hasSession || st.task) return
+  const kEl = $('#apTopK')
+  const k = Math.max(1, Math.min(10, parseInt(kEl && kEl.value, 10) || 3))
+  if (kEl) kEl.value = k
+  const ro = collectRenderOpts()
+  delete ro.formats   // форматы ОСНОВНОГО ролика — отдельное поле тела autopack
+  const body = {
+    top_k: k,
+    formats: (() => { const l = apFormatsCollect(); return l.length ? l : ['source'] })(),
+    clips: !!($('#apClips') && $('#apClips').checked),
+    render_opts: ro,
+  }
+  closeOverlay('#autopackModal')
+  await save()   // как startRender: несохранённые правки вырезов — на сервер ДО старта
+  let res
+  try { res = await fetch('/api/autopack', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }) }
+  catch (e) { toast('Сеть: не удалось запустить Авто-пак (' + e.message + ')', 'error'); return }
+  if (!res.ok) { await failToast(res, 'Не удалось запустить Авто-пак'); return }
+  followTask('autopack')
+}
+
+// После Авто-пака сессия могла «повзрослеть»: появились транскрипт (был сырец),
+// катлист (детект) и clips.json (suggest) — дотянуть их в UI без перезагрузки.
+async function autopackRefresh() {
+  if (!(st.words || []).length) {
+    // транскрипта на старте не было — спросить сервер, появился ли (отмена на
+    // стадии транскрипции = ещё нет; гадать нельзя)
+    try {
+      const s = await (await fetch('/api/state')).json()
+      if (s && s.has_transcript) {
+        $('#btnTranscribe').classList.add('hidden'); $('#btnTranscribe').classList.remove('pulse')
+        await loadData()   // транскрипт + катлист + полный пере-рендер
+      }
+    } catch {}
+  } else if (!(st.segs || []).length) {
+    await reloadCutlist()  // катлист был пуст → его достроила детекция
+  }
+  loadClipsFromCache()     // карточки панели «Клипы» из свежего clips.json
+}
+
+// Карточка-сводка результатов Авто-пака (в общем оверлее #results):
+// «Готово: ролик −N% …» + ссылки на основной ролик по форматам и клипы с
+// хуками через /api/output. warnings — жёлтым (частичный успех ≠ ошибка),
+// skipped — приглушённо («уже было — пропущено» это норма, не проблема).
+function showAutopackResults(res, stopped) {
+  const link = (p, l) => {
+    if (!p || typeof p !== 'string') return '—'
+    const base = p.split(/[\\/]/).pop()
+    if (!base) return '—'
+    return `<a href="/api/output/${encodeURIComponent(base)}" target="_blank">${l}</a>`
+  }
+  const t = res.totals || {}
+  const before = +t.duration_before || 0
+  const after = (t.duration_after == null) ? null : +t.duration_after
+  const cuts = t.cuts || 0, nClips = t.clips_rendered || 0
+  let head
+  if (after != null && before > 0) {
+    const pct = Math.max(0, Math.round((1 - after / before) * 100))
+    head = `Готово: ролик <b>−${pct}%</b> длительности (<b>${fmt(before)} → ${fmt(after)}</b>), вырезов ${cuts}, клипов ${nClips}`
+  } else {
+    head = `Вырезов ${cuts}, клипов ${nClips}`
+  }
+  const fmts = (res.main && Array.isArray(res.main.formats)) ? res.main.formats : null
+  const mainHtml = fmts ? fmts.map((f) => {
+    const lbl = escapeHtml(f.label || f.format || '')
+    if (f.skipped) return `<p>Основной ${lbl}: пропущено — ${escapeHtml(f.note || 'совпадает с исходным')}</p>`
+    if (f.ok === false) return `<p>Основной ${lbl}: <span class="error">ошибка — ${escapeHtml(f.error || '')}</span></p>`
+    return `<p>Основной ${lbl}: ${link(f.mp4, 'открыть .mp4')}</p>`
+  }).join('') : '<p class="muted">Основной ролик: не отрендерен</p>'
+  let clipsHtml = ''
+  if (Array.isArray(res.clips) && res.clips.length) {
+    clipsHtml = res.clips.map((c, i) => {
+      const hook = (c && c.hook) ? ` — «${escapeHtml(c.hook)}»` : ''
+      if (c && c.ok) return `<p>Клип ${i + 1}: ${link(c.mp4, 'открыть .mp4')}${hook}</p>`
+      return `<p>Клип ${i + 1}: <span class="error">ошибка — ${escapeHtml((c && c.error) || '')}</span>${hook}</p>`
+    }).join('')
+  }
+  const warnHtml = (res.warnings || []).map((w) => `<p class="apWarn">⚠ ${escapeHtml(String(w))}</p>`).join('')
+  const skipHtml = (res.skipped || []).map((s2) => `<p class="muted apSkipped">${escapeHtml(String(s2))}</p>`).join('')
+  $('#resultsCard').innerHTML = `
+    <h2>${stopped ? 'Авто-пак остановлен' : 'Авто-пак готов ✓'}</h2>
+    ${stopped ? '<p class="muted">Задача прервана — уже сделанное сохранено:</p>' : ''}
+    <p>${head}</p>
+    ${warnHtml}
+    ${mainHtml}
+    ${clipsHtml}
+    ${skipHtml}
+    <button class="btn" id="btnCloseResults">Закрыть</button>`
+  openOverlay('#results')
+  $('#btnCloseResults').onclick = () => closeOverlay('#results')
+}
+
 /* ---------- modal / overlay management (a11y) ---------- */
 let lastFocus = null
-const OVERLAY_IDS = ['#help', '#results', '#files', '#renderModal', '#queueModal', '#privacyModal', '#modelsModal', '#clipsModal', '#detectModal']
+const OVERLAY_IDS = ['#help', '#results', '#files', '#renderModal', '#queueModal', '#privacyModal', '#modelsModal', '#clipsModal', '#detectModal', '#autopackModal']
 function openOverlay(id) {
   const ov = $(id); if (!ov) return
   lastFocus = document.activeElement
@@ -2818,6 +3010,15 @@ function bindUI() {
   $('#btnRedetect').onclick = redetect
   $('#btnRender').onclick = openRenderModal
   $('#btnCancelTask').onclick = cancelTask
+  // C4 — «Авто-пак»: кнопка топбара + модалка запуска
+  $('#btnAutopack').onclick = openAutopackModal
+  $('#btnCloseAutopack').onclick = () => closeOverlay('#autopackModal')
+  $('#btnApCancel').onclick = () => closeOverlay('#autopackModal')
+  $('#btnApStart').onclick = submitAutopack
+  // Кнопка-ссылка «Открыть настройки рендера»: те же поля, что читает Авто-пак.
+  $('#btnApOpenRender').onclick = () => { closeOverlay('#autopackModal'); openRenderModal() }
+  $('#apTopK').onchange = (e) => { e.target.value = Math.max(1, Math.min(10, parseInt(e.target.value, 10) || 3)) }
+  for (const id of Object.values(AP_FMT_IDS)) { const el = $(id); if (el) el.addEventListener('change', apFormatsChanged) }
   $('#btnCloseRender').onclick = () => closeOverlay('#renderModal')
   $('#btnCancelRender').onclick = () => closeOverlay('#renderModal')
   $('#btnDoRender').onclick = submitRender

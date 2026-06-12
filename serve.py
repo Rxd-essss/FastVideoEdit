@@ -2647,6 +2647,56 @@ def clips_save(body: dict = Body(default={})):
     return {"ok": True, "clip": clip}
 
 
+def _render_clip_job(s: Session, *, start: float, end: float, idx: int,
+                     n: int, fname: str, render_opts: dict, set_pct) -> dict:
+    """Рендер ОДНОГО клипа [start, end] — общий кирпич clips_render и Авто-пака.
+
+    Весь per-clip пайплайн (план §2.4) в одном месте: стадия/процент
+    «Клип i/N…», копия ЖИВОГО катлиста + 2 граничных REMOVE вокруг диапазона,
+    edge_fade из cfg.clips (F8: де-клик истинных краёв клипа — только для
+    клипов, обычный рендер живёт с дефолтом 0.0; кламп к 0–0.2 — внутри
+    render._edge_fade_filters), _resolve_render_opts + _run_render_pipeline
+    (``cutlist_override`` — сессия не мутируется) и try/except «упавший клип
+    не валит остальные».
+
+    Возвращает ``{"ok": True, **res}`` либо ``{"ok": False, "error": …}``
+    («cancelled», если ошибка вызвана отменой); специфику записи результата
+    (id/hook/filename) добавляют вызывающие. ``set_pct`` — колбэк общего
+    прогресса цикла 0..1: у clips_render это s.set_progress, у Авто-пака —
+    отрезок весов стадии «clips».
+    """
+    s.stage(f"Клип {idx + 1}/{n}: рендер…")
+    set_pct(idx / n)
+    # Катлист клипа = копия живых вырезов + 2 граничных REMOVE (§2.4).
+    cl = s.cutlist
+    clip_cl = CutList(source=cl.source, duration=cl.duration,
+                      segments=[copy.copy(seg) for seg in cl.segments])
+    if start > 0:
+        clip_cl.segments.append(CutSegment(
+            id=f"clipA{idx}", start=0.0, end=start,
+            type=TYPE_MANUAL, action=ACTION_REMOVE, enabled=True))
+    if end < cl.duration:
+        clip_cl.segments.append(CutSegment(
+            id=f"clipB{idx}", start=end, end=cl.duration,
+            type=TYPE_MANUAL, action=ACTION_REMOVE, enabled=True))
+    try:
+        cfg, scale_h, fps, out_dir, base = _resolve_render_opts(
+            s, {**render_opts, "filename": fname})
+        try:
+            ef = float(getattr(cfg.clips, "edge_fade", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            ef = 0.0
+        res = _run_render_pipeline(
+            s, cfg, scale_h, fps, out_dir, base,
+            on_progress=lambda f: set_pct((idx + min(1.0, max(0.0, f))) / n),
+            on_stage=lambda m: s.stage(f"Клип {idx + 1}/{n}: {m}"),
+            cutlist_override=clip_cl, edge_fade=ef)
+        return {"ok": True, **res}
+    except Exception as e:  # noqa: BLE001 — упавший клип не валит остальные
+        return {"ok": False,
+                "error": "cancelled" if s.task.get("cancelled") else str(e)}
+
+
 @app.post("/api/clips/render")
 def clips_render(body: dict = Body(default={})):
     """Рендер выбранных клипов — ОДНА фоновая задача ``render_clips`` (план §2.4).
@@ -2715,7 +2765,6 @@ def clips_render(body: dict = Body(default={})):
     _, _, _, out_dir0, _ = _resolve_render_opts(s, render_opts)
     s.last_out_dir = str(out_dir0.resolve())
 
-    cl = s.cutlist
     n = len(clips_in)
 
     def run():
@@ -2723,40 +2772,11 @@ def clips_render(body: dict = Body(default={})):
         for i, c in enumerate(clips_in):
             if s.task.get("cancelled"):
                 break                               # cancel между клипами
-            s.stage(f"Клип {i + 1}/{n}: рендер…")
-            s.set_progress(i / n)
-            # Катлист клипа = копия живых вырезов + 2 граничных REMOVE (§2.4).
-            clip_cl = CutList(source=cl.source, duration=cl.duration,
-                              segments=[copy.copy(seg) for seg in cl.segments])
-            if c["start"] > 0:
-                clip_cl.segments.append(CutSegment(
-                    id=f"clipA{i}", start=0.0, end=c["start"],
-                    type=TYPE_MANUAL, action=ACTION_REMOVE, enabled=True))
-            if c["end"] < cl.duration:
-                clip_cl.segments.append(CutSegment(
-                    id=f"clipB{i}", start=c["end"], end=cl.duration,
-                    type=TYPE_MANUAL, action=ACTION_REMOVE, enabled=True))
-            try:
-                opts_i = {**render_opts, "filename": c["filename"]}
-                cfg, scale_h, fps, out_dir, base = _resolve_render_opts(s, opts_i)
-                # F8: де-клик фейды истинных краёв клипа — ЯВНЫЙ параметр,
-                # только для клипов (обычный рендер живёт с дефолтом 0.0).
-                # Кламп к 0–0.2 — внутри render._edge_fade_filters.
-                try:
-                    ef = float(getattr(cfg.clips, "edge_fade", 0.0) or 0.0)
-                except (TypeError, ValueError):
-                    ef = 0.0
-                res = _run_render_pipeline(
-                    s, cfg, scale_h, fps, out_dir, base,
-                    on_progress=lambda f, i=i: s.set_progress(
-                        (i + min(1.0, max(0.0, f))) / n),
-                    on_stage=lambda m, i=i: s.stage(f"Клип {i + 1}/{n}: {m}"),
-                    cutlist_override=clip_cl, edge_fade=ef)
-                results.append({"ok": True, "filename": c["filename"], **res})
-            except Exception as e:  # noqa: BLE001 — упавший клип не валит остальные
-                err = "cancelled" if s.task.get("cancelled") else str(e)
-                results.append({"ok": False, "filename": c["filename"],
-                                "error": err})
+            job = _render_clip_job(s, start=c["start"], end=c["end"],
+                                   idx=i, n=n, fname=c["filename"],
+                                   render_opts=render_opts,
+                                   set_pct=s.set_progress)
+            results.append({"filename": c["filename"], **job})
         s.task["results"] = {"clips": results}
         if s.task.get("cancelled"):
             # Частичные results уже сохранены выше; воркер start_task отчитается
@@ -2765,6 +2785,248 @@ def clips_render(body: dict = Body(default={})):
 
     s.start_task("render_clips", run)
     return {"ok": True, "count": n}
+
+
+# --- C4: «Авто-пак» — сырец → готовый ролик + пак Shorts одной кнопкой ---------
+# Одна фоновая задача, склеенная из ГОТОВЫХ кирпичей: транскрипция (если нет),
+# детекция (если катлист пуст), мультиформат-рендер основного ролика (C2),
+# suggest (если нет свежего clips.json) и точный цикл рендера клипов
+# (/api/clips/render). Против 4 ручных облачных шагов CapCut — локально и
+# бесплатно. Веса стадий для общего percent (нормируются по активным стадиям,
+# чтобы пропущенная транскрипция не оставляла «дыру» в прогрессе):
+_AUTOPACK_WEIGHTS = {"transcribe": 0.35, "detect": 0.10, "main": 0.25,
+                     "suggest": 0.10, "clips": 0.20}
+
+
+def _autopack_top_clips(cands: list, duration: float, top_k: int) -> list[dict]:
+    """Первые ``top_k`` ВАЛИДНЫХ кандидатов (порядок списка = порядок re-rank).
+
+    Принимает и ``asdict(ClipCandidate)`` свежего suggest, и записи из
+    clips.json — диску доверять нельзя (файл мог быть правлен руками), поэтому
+    битые записи (не-объект, нечисловые/NaN границы, пустой диапазон) молча
+    пропускаются — паттерн _load_queue: мусор не валит задачу.
+    """
+    out: list[dict] = []
+    for c in cands:
+        if len(out) >= top_k:
+            break
+        if not isinstance(c, dict):
+            continue
+        try:
+            start, end = float(c.get("start")), float(c.get("end"))
+        except (TypeError, ValueError):
+            continue
+        if not (math.isfinite(start) and math.isfinite(end)):
+            continue
+        start = max(0.0, start)
+        end = min(float(duration), end)
+        if not end - start > 0:
+            continue
+        out.append({"id": str(c.get("id") or f"c{len(out) + 1:02d}"),
+                    "start": start, "end": end,
+                    "hook": str(c.get("hook_phrase") or "")})
+    return out
+
+
+@app.post("/api/autopack")
+def autopack(body: dict = Body(default={})):
+    """C4 «Авто-пак»: сырец → готовый ролик (+ пак Shorts) ОДНОЙ фоновой задачей.
+
+    Тело: ``{top_k: 1–10 (клампится, дефолт 3), formats: [...] для ОСНОВНОГО
+    ролика (как у /api/render, дефолт ["source"]), clips: bool (дефолт true),
+    render_opts: {...} (как у /api/render)}``.
+
+    Стадии (каждая видна в SSE stage, percent — по весам _AUTOPACK_WEIGHTS):
+      а) транскрипция, если её нет (кэш → стадия пропускается);
+      б) детекция, если катлист ПУСТ — существующий НЕ передетекчивается
+         (юзер мог править вырезы руками);
+      в) рендер основного ролика через _render_formats (C2, мультиформат);
+      г) clips=true: suggest — но свежий clips.json (hash совпал)
+         переиспользуется без LLM; LLM выключен → warning, основной остаётся;
+      д) рендер топ-K клипов — точный цикл /api/clips/render (per-clip ass,
+         edge_fade, chapters/metadata принудительно false).
+
+    Надёжность: упавший suggest (Ollama умерла) → частичный успех
+    (``ok:true`` + warnings, clips:{error}), упавший клип не валит остальные;
+    /api/cancel срабатывает между КАЖДОЙ стадией и между клипами/форматами,
+    сохраняя уже сделанное в ``task['results']``.
+    """
+    s = S()
+    _guard_no_task()
+
+    # --- валидация тела: 400 на запросе, а не ошибка задачи -------------------
+    raw_k = body.get("top_k", 3)
+    if (isinstance(raw_k, bool) or not isinstance(raw_k, (int, float))
+            or not math.isfinite(float(raw_k))):
+        raise HTTPException(400, "top_k: ожидается число 1–10")
+    top_k = max(1, min(10, int(raw_k)))
+    do_clips = bool(body.get("clips", True))
+    formats = _parse_formats({"formats": body.get("formats")})
+    render_opts = body.get("render_opts") or {}
+    if not isinstance(render_opts, dict):
+        raise HTTPException(400, "render_opts: ожидается объект")
+
+    need_transcribe = s.transcript is None
+    if need_transcribe and not s.media.has_audio:
+        raise HTTPException(
+            409, "В видео нет звуковой дорожки — транскрипция невозможна. "
+                 "/ This video has no audio track — cannot transcribe.")
+    # «Пуст» = нет вовсе ИЛИ ноль сегментов; непустой катлист — святое
+    # (кураторские правки), его не передетекчиваем.
+    need_detect = s.cutlist is None or not s.cutlist.segments
+
+    # Fail fast: битые общие опции (scale_h/fps) → 400 здесь, не ошибка задачи;
+    # заодно out_dir создан и ссылки /api/output смотрят туда (паттерн render).
+    _, _, _, out_dir0, _ = _resolve_render_opts(s, render_opts)
+    s.last_out_dir = str(out_dir0.resolve())
+
+    # Решения о клипах — ДО старта: от них зависят веса прогресса. Свежий
+    # clips.json (hash-валидация как в GET /api/clips) переиспользуется —
+    # 2.5-минутный LLM-проход не гоняется зря.
+    cached = _load_clips_json(s) if do_clips else None
+    cached_fresh = bool(cached and cached.get("hash") == s.audio_hash
+                        and cached.get("clips"))
+    will_suggest = do_clips and not cached_fresh and s.llm is not None
+    will_render_clips = do_clips and (cached_fresh or s.llm is not None)
+
+    plan = [k for k, on in (("transcribe", need_transcribe),
+                            ("detect", need_detect),
+                            ("main", True),
+                            ("suggest", will_suggest),
+                            ("clips", will_render_clips)) if on]
+    total_w = sum(_AUTOPACK_WEIGHTS[k] for k in plan)
+    spans: dict[str, tuple[float, float]] = {}
+    off = 0.0
+    for k in plan:
+        w = _AUTOPACK_WEIGHTS[k] / total_w
+        spans[k] = (off, w)
+        off += w
+
+    def sub(key: str):
+        """on_progress стадии: её 0..1 → свой отрезок общего percent."""
+        o, w = spans[key]
+        return lambda f: s.set_progress(o + min(1.0, max(0.0, f)) * w)
+
+    # Сервер принудительно глушит главы/метаданные для клипов (паттерн
+    # /api/clips/render) — иначе каждый клип гонял бы LLM и тёр metadata.txt.
+    clip_opts = {**render_opts, "chapters": False, "metadata": False}
+    cl_duration = float(s.media.duration)
+
+    def run():
+        warnings: list[str] = []
+        skipped: list[str] = []
+        results: dict = {"warnings": warnings, "skipped": skipped}
+        # Сразу в task: отмена/падение на любой стадии сохраняет уже сделанное.
+        s.task["results"] = results
+
+        def _chk() -> None:
+            if s.task.get("cancelled"):
+                raise RuntimeError("Задача отменена")
+
+        # --- (а) транскрипция -------------------------------------------------
+        if need_transcribe:
+            _chk()
+            p = sub("transcribe")
+            s.stage("Извлечение аудио…")
+            wav = extract_audio(s.ff, s.inp, s.work_dir / "audio16k.wav",
+                                total=s.media.duration,
+                                on_progress=lambda f: p(f * 0.1))
+            _chk()
+            s.stage("Транскрипция…")
+            s.transcript = transcribe_audio(
+                wav, s.cfg.transcribe, s.media.duration, s.audio_hash,
+                cache_dir=s.cache_dir,
+                log=lambda m="": s.stage(str(m).strip() or s.task["stage"]),
+                on_progress=lambda f: p(0.1 + f * 0.9))
+            p(1.0)
+        else:
+            skipped.append("Транскрипция: уже есть (кэш) — пропущена")
+
+        # --- (б) детекция -----------------------------------------------------
+        _chk()
+        if need_detect:
+            s.stage("Детекция вырезов…")
+            s._detect()
+            sub("detect")(1.0)
+        else:
+            skipped.append("Детекция: катлист уже есть — не передетекчиваем")
+
+        # --- (в) основной ролик (мультиформат C2) ------------------------------
+        _chk()
+        res_main = _render_formats(
+            s, dict(render_opts), formats,
+            on_progress=sub("main"),
+            on_stage=lambda m: s.stage(f"Основной ролик: {m}"),
+            is_cancelled=lambda: bool(s.task.get("cancelled")))
+        results["main"] = res_main
+        removed_now, _ = resolve(s.cutlist)
+        totals = {"duration_before": round(float(s.media.duration), 1),
+                  "duration_after": res_main.get("new_duration"),
+                  "cuts": len(removed_now),
+                  "clips_rendered": 0}
+        results["totals"] = totals
+        _chk()
+
+        # --- (г) подбор клипов --------------------------------------------------
+        cands = None       # None = рендерить нечего; list = кандидаты в порядке re-rank
+        if not do_clips:
+            skipped.append("Клипы: выключены (clips=false)")
+        elif cached_fresh:
+            skipped.append("Подбор клипов: использован сохранённый clips.json")
+            cands = cached["clips"]
+        elif s.llm is None:
+            # Зафиксированное решение (план §2.4): фолбэк-нарезки без LLM нет.
+            warnings.append("ИИ выключен — клипы не предложены")
+            results["clips"] = []
+        else:
+            _chk()
+            s.stage("Клипы: подбор…")
+            try:
+                fresh = clips_mod.suggest(
+                    s.transcript, s.cutlist, s.cfg.clips, s.cfg.llm, s.llm,
+                    log=lambda *_: None,
+                    on_progress=sub("suggest"), on_stage=s.stage)
+            except Exception as e:  # noqa: BLE001 — Ollama умерла: частичный успех
+                _chk()              # отмена «через» suggest — честный cancelled
+                warnings.append(f"Подбор клипов не удался: {e}")
+                results["clips"] = {"error": str(e)}
+            else:
+                sub("suggest")(1.0)
+                _save_clips_json(s, fresh)   # панель клипов оживёт без LLM
+                cands = [asdict(c) for c in fresh]
+                if not cands:
+                    warnings.append("ИИ не нашёл подходящих клипов")
+                    results["clips"] = []
+                    cands = None
+
+        # --- (д) рендер топ-K клипов — общий цикл с /api/clips/render ----------
+        if cands is not None:
+            top = _autopack_top_clips(cands, cl_duration, top_k)
+            n = len(top)
+            clip_results: list[dict] = []
+            results["clips"] = clip_results
+            p = sub("clips")
+            for i, c in enumerate(top):
+                if s.task.get("cancelled"):
+                    break                       # cancel между клипами
+                fname = f"{s.inp.stem}_clip{i + 1:02d}"
+                job = _render_clip_job(s, start=c["start"], end=c["end"],
+                                       idx=i, n=n, fname=fname,
+                                       render_opts=clip_opts, set_pct=p)
+                entry = {"ok": job["ok"], "id": c["id"], "filename": fname,
+                         "hook": c["hook"]}
+                if job["ok"]:
+                    entry["mp4"] = job.get("mp4")
+                else:
+                    entry["error"] = job.get("error")
+                clip_results.append(entry)
+            totals["clips_rendered"] = sum(1 for x in clip_results if x.get("ok"))
+
+        _chk()
+        results["ok"] = True   # частичный успех (warnings) — тоже успех
+
+    s.start_task("autopack", run)
+    return {"ok": True, "top_k": top_k, "formats": formats, "clips": do_clips}
 
 
 @app.get("/api/events")

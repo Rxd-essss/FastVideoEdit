@@ -780,6 +780,23 @@ button:focus-visible, .btn:focus-visible { outline: 2px solid var(--accent); out
 .dictInput { display: block; width: 100%; max-width: none; }
 .dictActions { display: flex; justify-content: flex-end; margin-top: 12px; }
 
+/* ---------- C4: «Авто-пак» (модалка запуска + сводка результатов) ---------- */
+.autopackCard { width: 500px; max-width: 94vw; }
+.apLead { margin: 0 0 12px; }
+.apNumLabel { display: inline-flex; align-items: center; gap: 8px;
+  color: var(--muted); font-size: 13px; margin: 0 0 12px; cursor: pointer; }
+.apNum { width: 64px; background: var(--surface2); color: var(--text);
+  border: 1px solid var(--line); border-radius: var(--r-sm); padding: 6px 8px;
+  font-size: 13px; font-family: inherit; }
+.apNum:focus { border-color: var(--accent); outline: none; }
+.apClipsChk { margin: 12px 0 4px; }
+.apNote { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
+/* Сводка: warnings частичного успеха — жёлтым (не красным: это НЕ ошибка),
+   skipped («уже было — пропущено») — приглушённо и мельче. */
+.apWarn { color: var(--filler); }
+.apSkipped { font-size: 12px; margin: 2px 0; }
+
 /* ---------- мобильная раскладка (P0-14) ---------- */
 @media (max-width: 900px) {
   main { flex-direction: column; }
