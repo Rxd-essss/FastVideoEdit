@@ -242,6 +242,8 @@
 
       <section id="panel-cuts" class="tabPanel" role="tabpanel" aria-labelledby="tab-cuts" tabindex="0">
         <div class="tabTools">
+          <!-- B5 — настройки детекции + словарь филлеров (паттерн #btnClipsSettings) -->
+          <button id="btnDetectSettings" class="btn small" title="Настройки детекции и словарь слов-паразитов" aria-label="Настройки детекции" aria-haspopup="dialog"><svg class="ic" aria-hidden="true"><use href="#i-sliders"/></svg></button>
           <button id="btnRedetect" class="btn small"><svg class="ic" aria-hidden="true"><use href="#i-redetect"/></svg>Передетектировать</button>
           <span class="spacer"></span>
           <div class="legend">
@@ -696,6 +698,58 @@
         <button class="btn" id="btnClipsOptsCancel">Отмена</button>
         <button class="btn btn-primary" id="btnClipsOptsSave">Сохранить</button>
       </div>
+    </div>
+  </div>
+
+  <!-- B5/B6 — настройки детекции (слайдеры + детекторы) и редактор словаря филлеров -->
+  <div id="detectModal" class="overlay hidden" role="dialog" aria-modal="true" aria-label="Настройки детекции">
+    <div class="card detectCard">
+      <div class="filesHead">
+        <h2><svg class="ic ic-h2" aria-hidden="true"><use href="#i-sliders"/></svg>Настройки детекции</h2>
+        <button class="btn btn-ghost btn-icon" id="btnCloseDetect" title="Закрыть" aria-label="Закрыть"><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg></button>
+      </div>
+      <div class="rgrid dGrid">
+        <label>Паузы: мин. тишина <span id="dMinSilVal" class="muted"></span>
+          <input id="dMinSil" type="range" min="0.3" max="2" step="0.05">
+          <div class="hint muted">Удалять тишину длиннее порога. Меньше — больше вырезов.</div>
+        </label>
+        <label>Паузы: паддинг <span id="dPadVal" class="muted"></span>
+          <input id="dPad" type="range" min="0" max="0.3" step="0.01">
+          <div class="hint muted">Сколько «воздуха» оставить по краям каждой паузы.</div>
+        </label>
+        <label class="dWide">Заминки: чувствительность <span id="dSensVal" class="muted"></span>
+          <input id="dSens" type="range" min="0" max="100" step="1">
+          <div class="hint muted">0% — режет реже (только длинные провалы), 50% — как настроено в config.yaml, 100% — агрессивнее.</div>
+        </label>
+      </div>
+      <div class="dDetectors" role="group" aria-label="Детекторы">
+        <span class="dDetTitle muted">Детекторы</span>
+        <label class="chk" title="Длинная тишина между словами"><input type="checkbox" id="dDetPauses"> Паузы</label>
+        <label class="chk" title="Слова-паразиты из словаря ниже"><input type="checkbox" id="dDetFillers"> Паразиты</label>
+        <label class="chk" title="Мат — цензурируется в звуке"><input type="checkbox" id="dDetProfanity"> Мат</label>
+        <label class="chk" title="Акустические сбои речи: затянутые «э-э», микро-провалы"><input type="checkbox" id="dDetHesitations"> Заминки</label>
+        <label class="chk" id="dDetBadtakesWrap"><input type="checkbox" id="dDetBadtakes"> Дубли (ИИ)</label>
+      </div>
+      <div class="dActions">
+        <button class="btn" id="btnDetectReset" title="Вернуть значения по умолчанию (применятся по кнопке справа)">Сбросить</button>
+        <span class="spacer"></span>
+        <button class="btn btn-primary" id="btnDetectApply"><svg class="ic" aria-hidden="true"><use href="#i-redetect"/></svg>Применить и передетектировать</button>
+      </div>
+
+      <section class="dictBlock">
+        <div class="dictHead">
+          <span class="dictTitle">Слова-паразиты</span>
+          <span class="hint muted">словарь fillers_ru.yaml — применится при передетекте</span>
+        </div>
+        <div id="dFillersChips" class="chips"><div class="empty">Загрузка…</div></div>
+        <input id="dFillerInput" class="search dictInput" type="text" placeholder="добавить слово или фразу («как бы») — Enter" aria-label="Добавить слово-паразит">
+        <div class="dictSub">Тянутые звуки <span class="hint muted">— regex на весь произнесённый токен: э{2,}, нуу+</span></div>
+        <div id="dStretchedChips" class="chips chipsSm"><div class="empty">Загрузка…</div></div>
+        <input id="dStretchedInput" class="search dictInput" type="text" placeholder="добавить паттерн — Enter" aria-label="Добавить паттерн тянутого звука">
+        <div class="dictActions">
+          <button class="btn" id="btnFillersSave"><svg class="ic" aria-hidden="true"><use href="#i-check"/></svg>Сохранить словарь</button>
+        </div>
+      </section>
     </div>
   </div>
 

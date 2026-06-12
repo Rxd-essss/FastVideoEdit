@@ -2,6 +2,8 @@
 /out/
 /cache/
 /work/
+# Auto-backup created by the first PUT /api/fillers (UI dictionary save)
+/fillers_ru.yaml.bak
 
 # Python
 .venv/

@@ -15,6 +15,8 @@ import json
 import logging
 import math
 import os
+import re
+import shutil
 import sys
 import threading
 import time
@@ -109,6 +111,11 @@ WHISPER_PRESETS = [
 ]
 WHISPER_ALLOWED = {p["model"] for p in WHISPER_PRESETS}
 
+# B5: the user-editable filler dictionary (repo root). The GET/PUT /api/fillers
+# endpoints read this module global at call time so tests can repoint it at a
+# tmp copy without ever touching the real file.
+FILLERS_PATH = Path(__file__).resolve().parent / "fillers_ru.yaml"
+
 APP: dict = {}   # launch-time settings reused when opening a new video
 TASK_LOCK = threading.Lock()   # serialize task starts / state mutations
 
@@ -194,12 +201,19 @@ class Session:
             self._ctor_fresh_detect = True
 
     # --- helpers -------------------------------------------------------------
-    def _detect(self) -> CutList:
+    def _detect(self, cfg: Optional[Config] = None) -> CutList:
+        """Run detection, optionally under a per-request config override (B5).
+
+        ``cfg=None`` (ctor / transcribe / queue) -> ``self.cfg``, byte-for-byte
+        the old behaviour. POST /api/detect passes the effective DEEP COPY built
+        by ``_apply_detect_opts`` — ``self.cfg`` is never mutated by overrides.
+        """
         assert self.transcript is not None
+        eff = cfg if cfg is not None else self.cfg
         # The 16 kHz wav (extracted during transcription) feeds the acoustic
         # hesitation detector; pass it when present so VAD can run.
         wav = self.work_dir / "audio16k.wav"
-        cl = run_detection(self.transcript, self.cfg, self.fillers, self.profanity,
+        cl = run_detection(self.transcript, eff, self.fillers, self.profanity,
                            source=str(self.inp), llm=self.llm, log=lambda *_: None,
                            audio_path=wav if wav.exists() else None)
         # Preserve any manual cuts the user already drew.
@@ -388,6 +402,160 @@ def _apply_saved_models(cfg: Config) -> None:
     m = saved.get("llm")
     if isinstance(m, str) and m.strip():
         cfg.llm.model = m.strip()
+
+
+# --- B5: detection parameters (per-request overrides + detect_ui.json) -------
+# The UI can tune detection without touching config.yaml. The canonical option
+# shape (everything optional):
+#   pause_min_silence: float   (clamped 0.3..2.0)  -> pauses.min_silence
+#   pause_padding:     float   (clamped 0..0.3)    -> pauses.pad_start/pad_end
+#   hesitation_sensitivity: float (clamped 0..1)   -> hesitations.* (see mapping)
+#   detectors: {pauses, fillers, profanity, hesitations, badtakes: bool}
+# No options at all -> run_detection receives the session cfg UNCHANGED (the
+# default behaviour is byte-for-byte the pre-B5 one; regression-tested).
+_DETECTOR_KEYS = ("pauses", "fillers", "profanity", "hesitations", "badtakes")
+
+
+def _detect_opts_path() -> Path:
+    """``cache_dir/detect_ui.json`` — where the persisted detect options live."""
+    return Path(APP["cfg"].paths.cache_dir) / "detect_ui.json"
+
+
+def _sanitize_detect_opts(raw: dict, *, strict: bool = True) -> dict:
+    """Validate + clamp UI detect options into the canonical persisted shape.
+
+    ``strict=True`` (POST /api/detect body): a wrong TYPE is a 400 — clear
+    feedback instead of silently ignoring a typo. Out-of-range NUMBERS are
+    clamped, not rejected (the UI slider needn't know the server's bounds).
+    ``strict=False`` (reading detect_ui.json back): a hand-edited / corrupt
+    value is silently dropped — a bad file must never 500 every /api/state.
+    Unknown keys are ignored in both modes (forward compatibility).
+    """
+    out: dict = {}
+
+    def _num(key: str, lo: float, hi: float) -> None:
+        if key not in raw or raw[key] is None:
+            return
+        v = raw[key]
+        # bool is an int subclass — true/false is not a number here.
+        if (isinstance(v, bool) or not isinstance(v, (int, float))
+                or not math.isfinite(float(v))):
+            if strict:
+                raise HTTPException(400, f"{key}: ожидается число")
+            return
+        out[key] = round(min(hi, max(lo, float(v))), 3)
+
+    _num("pause_min_silence", 0.3, 2.0)
+    _num("pause_padding", 0.0, 0.3)
+    _num("hesitation_sensitivity", 0.0, 1.0)
+
+    det = raw.get("detectors")
+    if det is not None:
+        if not isinstance(det, dict):
+            if strict:
+                raise HTTPException(400, "detectors: ожидается объект {имя: true/false}")
+        else:
+            clean: dict = {}
+            for k in _DETECTOR_KEYS:
+                if k not in det:
+                    continue
+                v = det[k]
+                if not isinstance(v, bool):
+                    if strict:
+                        raise HTTPException(400, f"detectors.{k}: ожидается true/false")
+                    continue
+                clean[k] = v
+            if clean:
+                out["detectors"] = clean
+    return out
+
+
+def _read_detect_opts() -> Optional[dict]:
+    """Persisted detect options, sanitized. ``None`` if never saved / corrupt."""
+    try:
+        data = json.loads(_detect_opts_path().read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 — missing / unreadable / bad JSON
+        return None
+    if not isinstance(data, dict):
+        return None
+    return _sanitize_detect_opts(data, strict=False)
+
+
+def _write_detect_opts(opts: dict) -> None:
+    """Persist sanitized detect options atomically (.tmp -> os.replace).
+
+    Best-effort like privacy.json / _save_queue: the request already holds the
+    effective options in memory; persistence is a bonus, never a 500.
+    """
+    p = _detect_opts_path()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(opts, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, p)
+    except OSError:
+        pass
+
+
+def _apply_detect_opts(cfg: Config, opts: Optional[dict]) -> Config:
+    """Effective detection config = ``cfg`` + sanitized UI options.
+
+    ``opts`` empty/None -> returns ``cfg`` ITSELF (same object), so the default
+    path hands run_detection an unchanged config — byte-for-byte the old
+    behaviour. Otherwise a DEEP COPY is modified and returned; the session cfg
+    is never mutated.
+
+    ``hesitation_sensitivity`` mapping (s in [0, 1], honest and symmetric
+    around the config.yaml tuning): f = 2*s - 1 in [-1, +1], so s=0.5 (f=0)
+    reproduces the configured values EXACTLY, s=0 «реже режет», s=1
+    «агрессивнее». Three knobs move together:
+      * min_duration  *= (1 - 0.5*f)   — s=0: only LONGER stumbles are flagged
+        (1.5x the configured minimum gap); s=1: gaps half as short also count.
+        Floor 0.04 s (≈1 video frame — below that a cut is imperceptible),
+        ceiling max_duration (above it pauses own the gap).
+      * vad_threshold += 0.15*f        — Silero speech probability needed to
+        call «speech». s=0: lower threshold -> more audio counted as speech ->
+        fewer non-speech gaps; s=1: higher -> more audio counted as non-speech
+        -> more candidate gaps. Clamped to [0.15, 0.6] (outside that Silero
+        becomes all-speech / all-noise and the gaps are garbage).
+      * pad_start/pad_end *= (1 - 0.5*f) — breathing room kept at each gap
+        edge. s=0: 1.5x pads (gentler, keeps more context); s=1: 0.5x pads
+        (eats closer to the words). Clamped to [0, 0.12].
+    ``max_duration`` is deliberately NOT touched: it is the contract line with
+    the pause detector (keep max_duration <= pauses.min_silence) — moving it
+    would double-flag pauses, which is dishonest «aggressiveness».
+    """
+    if not opts:
+        return cfg
+    c = cfg.model_copy(deep=True)
+    if "pause_min_silence" in opts:
+        c.pauses.min_silence = float(opts["pause_min_silence"])
+    if "pause_padding" in opts:
+        v = float(opts["pause_padding"])
+        c.pauses.pad_start = v
+        c.pauses.pad_end = v
+    if "hesitation_sensitivity" in opts:
+        f = 2.0 * float(opts["hesitation_sensitivity"]) - 1.0   # [-1 .. +1]
+        h = c.hesitations
+        h.min_duration = round(
+            min(h.max_duration, max(0.04, h.min_duration * (1.0 - 0.5 * f))), 3)
+        h.vad_threshold = round(min(0.6, max(0.15, h.vad_threshold + 0.15 * f)), 3)
+        h.pad_start = round(min(0.12, max(0.0, h.pad_start * (1.0 - 0.5 * f))), 3)
+        h.pad_end = round(min(0.12, max(0.0, h.pad_end * (1.0 - 0.5 * f))), 3)
+    det = opts.get("detectors") or {}
+    if "pauses" in det:
+        c.pauses.enabled = bool(det["pauses"])
+    if "fillers" in det:
+        c.fillers.enabled = bool(det["fillers"])
+    if "profanity" in det:
+        c.profanity.enabled = bool(det["profanity"])
+    if "hesitations" in det:
+        c.hesitations.enabled = bool(det["hesitations"])
+    if "badtakes" in det:
+        # run_detection short-circuits on bad_takes.enabled BEFORE touching the
+        # llm argument, so disabling bad takes here guarantees no LLM call.
+        c.bad_takes.enabled = bool(det["badtakes"])
+    return c
 
 
 # --- P2-#6: batch-queue persistence (queue.json) -----------------------------
@@ -1055,7 +1223,9 @@ def state():
                 # P2-#6: pending count so the queue badge lights up on bootstrap
                 # even with no clip open and the worker stopped (restored queue).
                 "queue_running": _queue_running,
-                "queue_pending": _queue_pending_count()}
+                "queue_pending": _queue_pending_count(),
+                # B5: saved detection options (null = never configured).
+                "detect_opts": _read_detect_opts()}
     s = S()
     m = s.media
     return {
@@ -1097,6 +1267,9 @@ def state():
             "llm_model": s.cfg.llm.model,
         },
         "task": s.task,
+        # B5: saved detection options from cache/detect_ui.json (null = never
+        # configured -> /api/detect runs with the untouched session cfg).
+        "detect_opts": _read_detect_opts(),
         "queue_running": _queue_running,   # F3: editor can flag a busy queue
         # P2-#6: pending count (incl. a queue restored from queue.json with the
         # worker stopped) so the «📋 Очередь» badge lights up on first load.
@@ -1327,18 +1500,174 @@ def put_cutlist(payload: dict = Body(...)):
 
 
 @app.post("/api/detect")
-def redetect():
+def redetect(body: Optional[dict] = Body(default=None)):
+    """Re-run detection, optionally with UI parameter overrides (B5).
+
+    * Body present  -> sanitize + clamp, persist to cache/detect_ui.json
+      (re-saved on every parametrized call), apply for this run.
+    * Body absent   -> apply the previously saved options, if any.
+    * No options either way -> ``_apply_detect_opts`` returns the session cfg
+      ITSELF, so run_detection sees an UNCHANGED config — the default
+      behaviour is byte-for-byte the old one (regression-tested).
+    Disabled detectors are not run at all: ``badtakes=false`` short-circuits
+    in run_detection before the LLM is ever touched.
+    """
     s = S()
     _guard_no_task()
     if s.transcript is None:
         raise HTTPException(409, "Transcribe first")
 
+    if body is None:
+        opts = _read_detect_opts()           # saved options (None = never set)
+    else:
+        opts = _sanitize_detect_opts(body)   # 400 on wrong types, clamps ranges
+        _write_detect_opts(opts)
+    eff = _apply_detect_opts(s.cfg, opts)
+
     def run():
         s.stage("Детекция вырезов…")
-        s._detect()
+        s._detect(cfg=eff)
 
     s.start_task("detect", run)
-    return {"ok": True}
+    return {"ok": True, "detect_opts": opts}
+
+
+# --- B5: editable filler dictionary (fillers_ru.yaml) -------------------------
+# API mapping (the YAML keeps its native three-list structure):
+#   "fillers"   <-> words + phrases: a one-token entry is a single word
+#                   (words:), a multi-token entry («как бы») is a consecutive
+#                   word group (phrases:) — split/joined on whitespace.
+#   "stretched" <-> mumbles: full-token regex patterns for stretched sounds.
+_FILLERS_LIMIT = 500
+_FILLERS_HEADER = """\
+# =============================================================================
+# Словарь русских филлеров для удаления. Файл редактируется И ИЗ UI
+# (PUT /api/fillers), поэтому при сохранении из интерфейса он перезаписывается
+# целиком — пользовательские комментарии в теле не сохраняются. Исходная
+# версия с подробными комментариями лежит рядом: fillers_ru.yaml.bak.
+#
+#   mumbles — regex-паттерны растянутых звуков-заминок (ээ, ммм, нуу...);
+#             паттерн матчится ЦЕЛИКОМ на произнесённый токен.
+#   words   — одиночные слова-филлеры (регистр/ё/пунктуация не важны).
+#   phrases — последовательности слов, удаляемые как группа.
+# =============================================================================
+"""
+
+
+def _dump_fillers_yaml(mumbles: list[str], words: list[str],
+                       phrases: list[list[str]]) -> str:
+    """Serialize the three lists as tidy, valid YAML with the editable header.
+
+    Scalars are emitted as JSON strings — a JSON string is a valid YAML
+    double-quoted scalar, so regex metacharacters / quotes round-trip exactly
+    through yaml.safe_load without pulling in a YAML *dumper* dependency.
+    """
+    def q(s: str) -> str:
+        return json.dumps(s, ensure_ascii=False)
+
+    lines = [_FILLERS_HEADER.rstrip("\n"), ""]
+    lines.append("mumbles:" if mumbles else "mumbles: []")
+    lines += [f"  - {q(m)}" for m in mumbles]
+    lines.append("")
+    lines.append("words:" if words else "words: []")
+    lines += [f"  - {q(w)}" for w in words]
+    lines.append("")
+    lines.append("phrases:" if phrases else "phrases: []")
+    lines += ["  - [" + ", ".join(q(t) for t in ph) + "]" for ph in phrases]
+    return "\n".join(lines) + "\n"
+
+
+def _fillers_api_lists(lists) -> dict:
+    """FillerLists -> the API shape {fillers, stretched}."""
+    return {
+        "fillers": list(lists.words) + [" ".join(ph) for ph in lists.phrases],
+        "stretched": list(lists.mumbles),
+    }
+
+
+def _validate_filler_strings(items, key: str) -> list[str]:
+    """Common validation for both lists: list of non-empty unique strings.
+
+    Whitespace is normalized (collapsed/stripped); duplicates are compared
+    case-insensitively with ё→е folded — exactly how the detector matches, so
+    «Вот» и «вот» honestly count as the same entry.
+    """
+    if not isinstance(items, list):
+        raise HTTPException(400, f"{key}: ожидается список строк")
+    if len(items) > _FILLERS_LIMIT:
+        raise HTTPException(
+            400, f"{key}: слишком много записей (максимум {_FILLERS_LIMIT})")
+    out: list[str] = []
+    seen: set[str] = set()
+    for i, it in enumerate(items):
+        if not isinstance(it, str):
+            raise HTTPException(400, f"{key}[{i + 1}]: ожидается строка")
+        s = " ".join(it.split())
+        if not s:
+            raise HTTPException(400, f"{key}[{i + 1}]: пустая строка")
+        if len(s) > 200:
+            raise HTTPException(
+                400, f"{key}[{i + 1}]: слишком длинная запись (максимум 200 символов)")
+        k = s.casefold().replace("ё", "е")
+        if k in seen:
+            raise HTTPException(400, f"{key}: дубликат «{s}»")
+        seen.add(k)
+        out.append(s)
+    return out
+
+
+@app.get("/api/fillers")
+def get_fillers():
+    """The editable filler dictionary in API shape (see mapping above)."""
+    lists = load_fillers(FILLERS_PATH)
+    return {**_fillers_api_lists(lists), "path": str(FILLERS_PATH)}
+
+
+@app.put("/api/fillers")
+def put_fillers(payload: dict = Body(...)):
+    """Save the filler dictionary: validate -> backup once -> atomic write ->
+    hot-reload into the live Session.
+
+    CSRF: covered automatically by the _csrf_guard middleware (PUT /api/*).
+    The .bak is created before the FIRST UI write only — it preserves the
+    original hand-commented file forever; subsequent saves never touch it.
+    """
+    _guard_no_task()   # the running detect task reads SESSION.fillers
+    fillers_in = _validate_filler_strings(payload.get("fillers"), "fillers")
+    stretched = _validate_filler_strings(payload.get("stretched"), "stretched")
+    for p in stretched:
+        try:
+            re.compile(p)
+        except re.error as e:
+            # A broken pattern would otherwise blow up the mumble matcher at
+            # the next detection — refuse it here with the exact reason.
+            raise HTTPException(400, f"stretched: некорректный regex «{p}» ({e})")
+
+    words = [f for f in fillers_in if len(f.split()) == 1]
+    phrases = [f.split() for f in fillers_in if len(f.split()) > 1]
+
+    path = FILLERS_PATH
+    bak = path.parent / (path.name + ".bak")
+    if path.exists() and not bak.exists():
+        try:
+            shutil.copy2(path, bak)
+        except OSError as e:
+            # No backup -> no write: the user's hand-edited file is sacred.
+            raise HTTPException(500, f"Не удалось создать резервную копию "
+                                     f"{bak.name}: {e}")
+    tmp = path.parent / (path.name + ".tmp")
+    tmp.write_text(_dump_fillers_yaml(stretched, words, phrases),
+                   encoding="utf-8")
+    os.replace(tmp, path)
+
+    # Hot-reload: Session caches FillerLists at construction (self.fillers in
+    # __init__) — without this swap only a server restart would see new words.
+    # Re-read FROM DISK (not from memory) so the response proves the file
+    # round-trips through load_fillers.
+    new_lists = load_fillers(path)
+    if SESSION is not None:
+        SESSION.fillers = new_lists
+    return {"ok": True, **_fillers_api_lists(new_lists), "path": str(path)}
 
 
 @app.post("/api/transcribe")

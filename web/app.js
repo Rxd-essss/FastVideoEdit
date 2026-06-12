@@ -56,6 +56,10 @@ const st = {
   // A6 — онбординг: тост о тихом CPU-фоллбэке показываем ОДИН раз на файл
   // (смена файла = location.reload() → st пересоздаётся, флаг сбрасывается сам)
   cpuWarned: false,
+  // B5 — настройки детекции (модалка ⚙ вкладки «Вырезы»)
+  llmReady: true,         // /api/state.llm_ready — гейт чекбокса «Дубли (ИИ)»
+  detectOpts: null,       // сохранённые опции из /api/state.detect_opts (null = дефолты);
+                          // обновляется из ответа POST /api/detect после «Применить»
 }
 const UNDO_CAP = 50
 const undoStack = [], redoStack = []
@@ -161,6 +165,9 @@ async function init() {
   // LLM-off badge
   if (s.llm_ready === false) $('#llmBadge').classList.remove('hidden')
   else $('#llmBadge').classList.add('hidden')
+  // B5: статус LLM + сохранённые настройки детекции (для модалки ⚙ «Вырезов»)
+  st.llmReady = s.llm_ready !== false
+  st.detectOpts = s.detect_opts || null
   // Cache-bust by session token so switching clips can never reuse a cached
   // /api/video (the bug where the new clip loaded but the OLD video played).
   const cb = s.v ? ('?v=' + encodeURIComponent(s.v)) : ''
@@ -1184,11 +1191,21 @@ function renderCutlist() {
 }
 
 /* ---------- undo / redo ---------- */
+// B6: ОБЩИЙ стек двух типов записей (различаются по .type):
+//   { type: 'cuts', segs }  — снапшот вырезов (прежнее поведение, один в один);
+//   { type: 'word', i, si, wi, old, new, prevEdited } — правка слова (dblclick):
+//     old/new — отображаемый текст БЕЗ ведущего пробела (конвенцию Whisper
+//     сервер восстанавливает сам), откат/повтор = обратный PUT.
 function snapshot() { return JSON.parse(JSON.stringify(st.segs)) }
 function pushUndo() {
-  undoStack.push(snapshot())
+  undoStack.push({ type: 'cuts', segs: snapshot() })
   if (undoStack.length > UNDO_CAP) undoStack.shift()
   redoStack.length = 0   // new action invalidates redo
+}
+function pushWordUndo(rec) {
+  undoStack.push({ type: 'word', ...rec })
+  if (undoStack.length > UNDO_CAP) undoStack.shift()
+  redoStack.length = 0
 }
 function restoreSegs(segs) {
   st.segs = segs
@@ -1196,16 +1213,75 @@ function restoreSegs(segs) {
   if (st.selected && !segOf(st.selected)) st.selected = null
   renderRegions(); renderCutlist(); refreshCuts(); markDirty()
 }
-function undo() {
+// Обратный (toOld=true) / повторный PUT правки слова + синхронизация st.words
+// и DOM-спана. false = ошибка сети/HTTP (тост уже показан) — вызывающий обязан
+// вернуть запись в свой стек, чтобы правка не потерялась.
+let wordUndoBusy = false   // PUT в полёте: повторный Ctrl+Z не дёргает стек
+async function applyWordRecord(rec, toOld) {
+  const text = toOld ? rec.old : rec.new
+  const verb = toOld ? 'отменить' : 'вернуть'
+  let res
+  try {
+    res = await fetch('/api/transcript/word', {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ si: rec.si, wi: rec.wi, text }),
+    })
+  } catch (e) { toast('Сеть: не удалось ' + verb + ' правку слова (' + e.message + ')', 'error'); return false }
+  if (!res.ok) {
+    let detail = 'HTTP ' + res.status
+    try { const j = await res.json(); if (j && j.detail) detail = j.detail } catch {}
+    toast('Не удалось ' + verb + ' правку слова: ' + detail, 'error')
+    return false
+  }
+  let j = {}; try { j = await res.json() } catch {}
+  const w = st.words[rec.i]
+  if (w) {
+    w.word = (j && typeof j.text === 'string') ? j.text : (' ' + text)
+    w.edited = toOld ? !!rec.prevEdited : true
+    const spans = st.spans || (st.spans = $('#transcript').querySelectorAll('.w'))
+    const sp = spans[rec.i]
+    if (sp && +sp.dataset.i === rec.i) {
+      sp.textContent = text + ' '
+      sp.classList.toggle('edited', w.edited)
+      if (w.edited) sp.title = 'изменено'; else sp.removeAttribute('title')
+    }
+  }
+  return true
+}
+async function undo() {
   if (!undoStack.length) { flash('Нечего отменять'); return }
-  redoStack.push(snapshot())
-  restoreSegs(undoStack.pop())
+  if (undoStack[undoStack.length - 1].type === 'word') {
+    if (wordUndoBusy) return
+    const rec = undoStack.pop()
+    wordUndoBusy = true
+    let ok = false
+    try { ok = await applyWordRecord(rec, true) }
+    finally { wordUndoBusy = false }
+    if (!ok) { undoStack.push(rec); return }   // PUT сорвался — запись не теряем
+    redoStack.push(rec)
+    flash('Правка слова отменена')
+    return
+  }
+  redoStack.push({ type: 'cuts', segs: snapshot() })
+  restoreSegs(undoStack.pop().segs)
   flash('Отменено')
 }
-function redo() {
+async function redo() {
   if (!redoStack.length) { flash('Нечего вернуть'); return }
-  undoStack.push(snapshot())
-  restoreSegs(redoStack.pop())
+  if (redoStack[redoStack.length - 1].type === 'word') {
+    if (wordUndoBusy) return
+    const rec = redoStack.pop()
+    wordUndoBusy = true
+    let ok = false
+    try { ok = await applyWordRecord(rec, false) }
+    finally { wordUndoBusy = false }
+    if (!ok) { redoStack.push(rec); return }   // PUT сорвался — запись не теряем
+    undoStack.push(rec)
+    flash('Правка слова возвращена')
+    return
+  }
+  undoStack.push({ type: 'cuts', segs: snapshot() })
+  restoreSegs(redoStack.pop().segs)
   flash('Возвращено')
 }
 
@@ -1319,10 +1395,13 @@ async function commitWordEdit(sp) {
     return
   }
   let j = {}; try { j = await res.json() } catch {}
+  const prevEdited = !!w.edited   // ДО выставления флага — для честного отката
   // Сервер вернул слово в конвенции Whisper (с ведущим пробелом, если был).
   w.word = (j && typeof j.text === 'string') ? j.text : (' ' + next)
   w.edited = true
   sp.classList.add('edited'); sp.title = 'изменено'
+  // B6: правка слова — отменяемая запись в ОБЩЕМ undo-стеке (Ctrl+Z / Ctrl+Shift+Z).
+  pushWordUndo({ i: +sp.dataset.i, si: w.si, wi: w.wi, old: orig, new: next, prevEdited })
   flash('Слово сохранено')
 }
 
@@ -1474,7 +1553,7 @@ async function doSave() {
 function setRunning(name) {
   st.task = name || null
   const busy = !!name
-  for (const id of ['#btnTranscribe', '#btnRedetect', '#btnRender', '#btnChaptersToggle', '#btnMetaGenerate', '#btnClipsSuggest', '#btnClipsRender']) { const b = $(id); if (b) b.disabled = busy }
+  for (const id of ['#btnTranscribe', '#btnRedetect', '#btnRender', '#btnChaptersToggle', '#btnMetaGenerate', '#btnClipsSuggest', '#btnClipsRender', '#btnDetectApply', '#btnFillersSave']) { const b = $(id); if (b) b.disabled = busy }
   setTabBusy(st.task)   // busy-спиннер на табе-адресате (вкладки НЕ дизейблим)
   const cancel = $('#btnCancelTask'); if (cancel) cancel.classList.toggle('hidden', !busy)
 }
@@ -1594,6 +1673,183 @@ async function redetect() {
   if (!res.ok) { await failToast(res, 'Не удалось запустить детекцию'); return }
   // /api/detect is now a background task; follow it over SSE and reload cutlist on done.
   followTask('detect')
+}
+
+/* ---------- B5: настройки детекции (модалка ⚙ вкладки «Вырезы») ---------- */
+// Дефолты зеркалят config.yaml: pauses.min_silence/pad_*, а sensitivity=0.5 на
+// сервере воспроизводит настроенные hesitations.* ТОЧНО (см. _apply_detect_opts).
+// Сохранённые значения приходят в /api/state.detect_opts (null = не настраивались).
+const DETECT_DEFAULTS = {
+  pause_min_silence: 0.6, pause_padding: 0.15, hesitation_sensitivity: 0.5,
+  detectors: { pauses: true, fillers: true, profanity: true, hesitations: true, badtakes: true },
+}
+const DET_IDS = { pauses: '#dDetPauses', fillers: '#dDetFillers', profanity: '#dDetProfanity', hesitations: '#dDetHesitations', badtakes: '#dDetBadtakes' }
+
+function updateDetectLabels() {
+  $('#dMinSilVal').textContent = (+$('#dMinSil').value).toFixed(2) + ' с'
+  $('#dPadVal').textContent = (+$('#dPad').value).toFixed(2) + ' с'
+  $('#dSensVal').textContent = Math.round(+$('#dSens').value) + '%'
+}
+
+// Заполнить форму из opts (null → дефолты); частично сохранённые ключи — поверх дефолтов.
+function seedDetectUI(opts) {
+  const o = opts || {}
+  const det = { ...DETECT_DEFAULTS.detectors, ...(o.detectors || {}) }
+  $('#dMinSil').value = (o.pause_min_silence != null) ? o.pause_min_silence : DETECT_DEFAULTS.pause_min_silence
+  $('#dPad').value = (o.pause_padding != null) ? o.pause_padding : DETECT_DEFAULTS.pause_padding
+  $('#dSens').value = Math.round(((o.hesitation_sensitivity != null) ? o.hesitation_sensitivity : DETECT_DEFAULTS.hesitation_sensitivity) * 100)
+  updateDetectLabels()
+  for (const [k, sel] of Object.entries(DET_IDS)) { const el = $(sel); if (el) el.checked = !!det[k] }
+  // «Дубли (ИИ)» без LLM недоступны: disabled + подсказка (как #llmBadge).
+  const bt = $('#dDetBadtakes'), wrap = $('#dDetBadtakesWrap')
+  bt.disabled = !st.llmReady
+  if (!st.llmReady) { bt.checked = false; if (wrap) wrap.title = 'ИИ выключен (Ollama не найдена) — детектор дублей недоступен' }
+  else if (wrap) wrap.title = 'Неудачные дубли и оборванные фразы — ищет локальная LLM'
+}
+
+function openDetectModal() {
+  seedDetectUI(st.detectOpts)
+  loadFillersDict()   // fire-and-forget: chips наполнятся, когда придёт GET /api/fillers
+  openOverlay('#detectModal')
+}
+
+// «Применить и передетектировать»: PUT настроек идёт ТЕЛОМ POST /api/detect
+// (сервер сам сохраняет detect_ui.json), confirm — как у redetect.
+async function applyDetect() {
+  if (st.task) { toast('Дождись завершения текущей задачи', 'info'); return }
+  if (!st.words.length) { toast('Сначала транскрибируй ролик — детектировать нечего', 'info'); return }
+  if (!flushDictInputs()) return   // недонабранное слово в словаре: не терять молча
+  if (!confirm('Перестроить вырезы с новыми настройками? Ручные вырезы сохранятся, остальные правки сбросятся.')) return
+  // Несохранённые правки словаря — авто-сейв ПЕРЕД детектом: иначе детект шёл бы
+  // по старому словарю, а правки молча пропадали бы при закрытии модалки.
+  if (dictDirty() && !(await saveFillersDict())) return   // фейл сейва: модалка остаётся, причина в тосте
+  const detectors = {}
+  for (const [k, sel] of Object.entries(DET_IDS)) {
+    // LLM выключена → ключ не шлём, чтобы не затирать сохранённый выбор юзера
+    // (сервер без LLM всё равно не запустит дубли).
+    if (k === 'badtakes' && !st.llmReady) continue
+    detectors[k] = !!$(sel).checked
+  }
+  const body = {
+    pause_min_silence: +$('#dMinSil').value,
+    pause_padding: +$('#dPad').value,
+    hesitation_sensitivity: Math.round(+$('#dSens').value) / 100,
+    detectors,
+  }
+  closeOverlay('#detectModal')
+  setActiveTab('cuts')   // старт действия — единственный разрешённый auto-switch (§3.3)
+  await save()           // как redetect(): зафиксировать несохранённый ручной вырез
+  let res
+  try { res = await fetch('/api/detect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }) }
+  catch (e) { toast('Сеть: не удалось запустить детекцию (' + e.message + ')', 'error'); return }
+  if (!res.ok) { await failToast(res, 'Не удалось запустить детекцию'); return }
+  let j = {}; try { j = await res.json() } catch {}
+  if (j && j.detect_opts !== undefined) st.detectOpts = j.detect_opts   // санитизированные сервером
+  followTask('detect')
+}
+
+/* ---------- B6: редактор словаря филлеров (блок «Слова-паразиты») ---------- */
+// fillers — слова и фразы одним списком (фраза = запись с пробелами),
+// stretched — regex-паттерны тянутых звуков. Источник правды — fillers_ru.yaml
+// через GET/PUT /api/fillers; правки живут локально до «Сохранить словарь».
+const dictState = { fillers: [], stretched: [], loaded: false, saved: '' }
+// Дубликаты считаем как сервер: регистронезависимо, ё == е.
+const dictKey = (s) => s.toLowerCase().replace(/ё/g, 'е')
+// Dirty-трекинг: snapshot сохранённого на диске состояния (обновляется после GET и
+// успешного PUT) — чипы можно править локально, не теряя их молча при закрытии/применении.
+const dictSnapshot = () => JSON.stringify([dictState.fillers, dictState.stretched])
+const dictDirty = () => dictState.loaded && dictSnapshot() !== dictState.saved
+
+async function loadFillersDict() {
+  let j
+  try { const r = await fetch('/api/fillers'); if (!r.ok) throw new Error('HTTP ' + r.status); j = await r.json() }
+  catch (e) { toast('Не удалось загрузить словарь филлеров: ' + e.message, 'error'); return }
+  dictState.fillers = Array.isArray(j.fillers) ? j.fillers : []
+  dictState.stretched = Array.isArray(j.stretched) ? j.stretched : []
+  dictState.loaded = true
+  dictState.saved = dictSnapshot()
+  renderDictChips()
+}
+
+function renderDictChips() {
+  renderChipList('#dFillersChips', dictState.fillers)
+  renderChipList('#dStretchedChips', dictState.stretched)
+}
+function renderChipList(sel, items) {
+  const box = $(sel); if (!box) return
+  box.replaceChildren()
+  if (!items.length) {
+    const ph = document.createElement('div'); ph.className = 'empty'
+    ph.textContent = dictState.loaded ? 'Пусто — добавь запись в поле ниже' : 'Загрузка…'
+    box.appendChild(ph); return
+  }
+  items.forEach((text, idx) => {
+    const chip = document.createElement('span'); chip.className = 'chipItem'
+    const t = document.createElement('span'); t.textContent = text; t.title = text
+    const x = document.createElement('button'); x.className = 'chipX'; x.innerHTML = icon('x')
+    x.title = 'Убрать'; x.setAttribute('aria-label', `Убрать «${text}»`)
+    x.onclick = () => { items.splice(idx, 1); renderDictChips() }
+    chip.appendChild(t); chip.appendChild(x)
+    box.appendChild(chip)
+  })
+}
+
+// Enter в инпуте → добавить запись (валидация зеркалит сервер; regex stretched
+// окончательно проверяет сервер при сохранении — с точной причиной в 400).
+function addDictEntry(key, inputSel) {
+  if (!dictState.loaded) { toast('Словарь ещё не загружен — секунду', 'info'); return }
+  const inp = $(inputSel); if (!inp) return
+  const s = (inp.value || '').replace(/\s+/g, ' ').trim()
+  if (!s) return
+  if (s.length > 200) { toast('Слишком длинная запись — максимум 200 символов', 'error'); return }
+  const items = dictState[key]
+  if (items.length >= 500) { toast('Слишком много записей — максимум 500', 'error'); return }
+  if (items.some((it) => dictKey(it) === dictKey(s))) { toast(`Уже в словаре: «${s}»`, 'info'); return }
+  items.push(s)
+  inp.value = ''
+  renderDictChips()
+}
+
+// Текст, набранный в инпуте без Enter, не должен молча теряться при «Сохранить
+// словарь»/«Применить…» — добавляем его как запись перед действием. Дубликат —
+// просто очищаем инпут (запись уже в словаре). Возвращает false, если запись не
+// прошла валидацию (тост уже показан) — вызывающий прерывает действие.
+function flushDictInputs() {
+  if (!dictState.loaded) return true
+  let ok = true
+  for (const [key, sel] of [['fillers', '#dFillerInput'], ['stretched', '#dStretchedInput']]) {
+    const inp = $(sel); if (!inp) continue
+    const s = (inp.value || '').replace(/\s+/g, ' ').trim()
+    if (!s) continue
+    if (dictState[key].some((it) => dictKey(it) === dictKey(s))) { inp.value = ''; continue }
+    addDictEntry(key, sel)
+    if (inp.value.trim()) ok = false   // валидация отбила запись — причина уже в тосте
+  }
+  return ok
+}
+
+// Возвращает true при успешном сохранении (applyDetect ждёт результат для авто-сейва).
+async function saveFillersDict() {
+  if (!dictState.loaded) { toast('Словарь ещё не загружен — сохранять нечего', 'info'); return false }
+  if (!flushDictInputs()) return false   // недонабранное слово: сначала валидная запись
+  const btn = $('#btnFillersSave'); if (btn) btn.disabled = true
+  let res
+  try {
+    res = await fetch('/api/fillers', {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fillers: dictState.fillers, stretched: dictState.stretched }),
+    })
+  } catch (e) { if (btn) btn.disabled = false; toast('Сеть: не удалось сохранить словарь (' + e.message + ')', 'error'); return false }
+  if (btn) btn.disabled = false
+  if (!res.ok) { await failToast(res, 'Словарь'); return false }
+  let j = {}; try { j = await res.json() } catch {}
+  // Ответ — словарь, как он реально лёг на диск (round-trip через load_fillers).
+  if (Array.isArray(j.fillers)) dictState.fillers = j.fillers
+  if (Array.isArray(j.stretched)) dictState.stretched = j.stretched
+  dictState.saved = dictSnapshot()
+  renderDictChips()
+  toast('Словарь сохранён — применится при передетекте', 'success')
+  return true
 }
 
 async function reloadCutlist() {
@@ -1814,7 +2070,7 @@ function showResults(r) {
 
 /* ---------- modal / overlay management (a11y) ---------- */
 let lastFocus = null
-const OVERLAY_IDS = ['#help', '#results', '#files', '#renderModal', '#queueModal', '#privacyModal', '#modelsModal', '#clipsModal']
+const OVERLAY_IDS = ['#help', '#results', '#files', '#renderModal', '#queueModal', '#privacyModal', '#modelsModal', '#clipsModal', '#detectModal']
 function openOverlay(id) {
   const ov = $(id); if (!ov) return
   lastFocus = document.activeElement
@@ -1824,6 +2080,11 @@ function openOverlay(id) {
 }
 function closeOverlay(id) {
   if (id === '#files') return closeFiles(null)   // files has its own exit path (picker cb + focus)
+  // Несохранённые правки словаря филлеров не теряем молча при ✕/Esc.
+  // applyDetect сюда приходит уже ПОСЛЕ авто-сейва (dictDirty()===false) — confirm не дублируется;
+  // повторное открытие модалки перезагружает словарь с диска (loadFillersDict).
+  if (id === '#detectModal' && dictDirty() &&
+      !confirm('В словаре есть несохранённые правки — закрыть без сохранения?')) return
   const ov = $(id); if (!ov || ov.classList.contains('hidden')) return
   ov.classList.add('hidden')
   if (lastFocus && document.contains(lastFocus)) { try { lastFocus.focus() } catch {} }
@@ -1895,6 +2156,15 @@ function bindUI() {
   // Кнопки генерации живут внутри своих вкладок — раскрывать нечего.
   $('#btnChaptersToggle').onclick = loadChapters
   $('#btnMetaGenerate').onclick = loadMetadata
+  // B5/B6 — настройки детекции + словарь филлеров (модалка ⚙ вкладки «Вырезы»)
+  $('#btnDetectSettings').onclick = openDetectModal
+  $('#btnCloseDetect').onclick = () => closeOverlay('#detectModal')
+  $('#btnDetectReset').onclick = () => { seedDetectUI(null); flash('Настройки сброшены к умолчаниям — применятся по «Применить…»') }
+  $('#btnDetectApply').onclick = applyDetect
+  for (const sel of ['#dMinSil', '#dPad', '#dSens']) { const el = $(sel); if (el) el.oninput = updateDetectLabels }
+  $('#btnFillersSave').onclick = saveFillersDict
+  $('#dFillerInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); addDictEntry('fillers', '#dFillerInput') } })
+  $('#dStretchedInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); addDictEntry('stretched', '#dStretchedInput') } })
   // F4 — Clip Maker: вкладка + модалка пресета рендера клипов
   $('#btnClipsSuggest').onclick = loadClips
   $('#btnClipsRender').onclick = clipsRender
@@ -1957,19 +2227,13 @@ function bindKeys() {
   document.addEventListener('keydown', (e) => {
     const k = e.key
 
-    // Undo / Redo — work regardless of focus context (except text inputs handled below).
-    // contenteditable (правка слова, поля метаданных) — тоже текстовый контекст:
-    // глобальные хоткеи не должны срабатывать поверх набора текста.
     const tagEarly = (e.target.tagName || '').toLowerCase()
     const inField = tagEarly === 'input' || tagEarly === 'textarea' || tagEarly === 'select' || e.target.isContentEditable
-    if ((e.ctrlKey || e.metaKey) && !inField && (k === 'z' || k === 'Z' || k === 'я' || k === 'Я')) {
-      e.preventDefault(); e.shiftKey ? redo() : undo(); return
-    }
-    if ((e.ctrlKey || e.metaKey) && !inField && (k === 'y' || k === 'Y' || k === 'н' || k === 'Н')) {
-      e.preventDefault(); redo(); return
-    }
 
     // EARLY-RETURN when any overlay is open: only handle that overlay's own keys (Esc, Tab-trap).
+    // ВАЖНО: блок стоит ДО undo/redo — иначе Ctrl+Z при открытой модалке (фокус на кнопке/чипе,
+    // не в текстовом поле) молча откатывал бы вырезы/правки слов ЗА затемнённым оверлеем,
+    // где не виден даже flash-фидбек.
     const ov = openOverlayEl()
     if (ov) {
       if (k === 'Tab') { trapTab(e, ov); return }
@@ -1980,6 +2244,16 @@ function bindKeys() {
         return
       }
       return  // swallow all other shortcuts while a modal is up
+    }
+
+    // Undo / Redo — work regardless of focus context (except text inputs and open modals above).
+    // contenteditable (правка слова, поля метаданных) — тоже текстовый контекст:
+    // глобальные хоткеи не должны срабатывать поверх набора текста.
+    if ((e.ctrlKey || e.metaKey) && !inField && (k === 'z' || k === 'Z' || k === 'я' || k === 'Я')) {
+      e.preventDefault(); e.shiftKey ? redo() : undo(); return
+    }
+    if ((e.ctrlKey || e.metaKey) && !inField && (k === 'y' || k === 'Y' || k === 'н' || k === 'Н')) {
+      e.preventDefault(); redo(); return
     }
 
     if (inField) {
