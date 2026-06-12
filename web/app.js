@@ -63,6 +63,13 @@ const st = {
   llmReady: true,         // /api/state.llm_ready — гейт чекбокса «Дубли (ИИ)»
   detectOpts: null,       // сохранённые опции из /api/state.detect_opts (null = дефолты);
                           // обновляется из ответа POST /api/detect после «Применить»
+  // C1 — пресеты стиля вшитых субтитров (источник — /api/state.caption_presets;
+  // значения НЕ дублируются на фронте). capPreset: ключ активного пресета в
+  // открытой модалке рендера или 'custom' («Свой» — значения из сырых полей).
+  captionPresets: [],
+  capPreset: null,
+  capBase: null,          // скрытые поля (outline/shadow/margin_v/outline_color)
+                          // последнего применённого пресета — «Свой» наследует их
 }
 const UNDO_CAP = 50
 const undoStack = [], redoStack = []
@@ -172,6 +179,9 @@ async function init() {
   st.outDir = s.out_dir || ''
   st._inpPath = s.path || ''   // F3: абсолютный путь текущего клипа (для постановки в очередь)
   st.rdefaults = s.defaults || {}
+  // C1: готовые стили вшитых субтитров (кнопки в модалке рендера). Пустой
+  // массив (старый бэк/сбой) — ряд кнопок просто не рисуется, поля работают.
+  st.captionPresets = Array.isArray(s.caption_presets) ? s.caption_presets : []
   // LLM-off badge
   if (s.llm_ready === false) $('#llmBadge').classList.remove('hidden')
   else $('#llmBadge').classList.add('hidden')
@@ -1010,6 +1020,15 @@ function openClipsModal() {
   $('#cCenterPos').value = Math.round(o.center_pos * 100)
   $('#cCenterVal').textContent = Math.round(o.center_pos * 100) + '%'
   $('#cBurn').checked = o.burn
+  // C1: полей стиля в этой модалке нет — честно говорим, какой пресет
+  // (выбранный в окне «Настройки рендера») уедет в капшены клипов.
+  const hintEl = $('#cBurnHint')
+  if (hintEl) {
+    const p = capPresetFind(capPresetSaved())
+    hintEl.textContent = p
+      ? `Стиль капшенов — пресет «${p.label}» (выбран в окне «Настройки рендера»).`
+      : 'Стиль капшенов — стандартный; пресет можно выбрать в окне «Настройки рендера».'
+  }
   $('#cOutDir').value = o.out_dir || st.outDir || ''
   openOverlay('#clipsModal')
 }
@@ -1044,8 +1063,14 @@ function clipsRenderOpts() {
     opts.vertical_target = '1080x1920'
     opts.vertical_center = o.center === 'manual' ? o.center_pos : 'auto'
   }
-  if (o.burn) { opts.burn_subtitles = true; opts.burn_style = { karaoke: true } }
-  else opts.burn_subtitles = false
+  if (o.burn) {
+    opts.burn_subtitles = true
+    // C1: стиль капшенов клипа = пресет, выбранный в настройках рендера
+    // (localStorage). «Свой» тут не воспроизводим — полей стиля в модалке
+    // клипов нет, так что честный фолбэк — серверные умолчания (как раньше).
+    const p = capPresetFind(capPresetSaved())
+    opts.burn_style = p ? { ...p.style } : { karaoke: true }
+  } else opts.burn_subtitles = false
   return opts
 }
 
@@ -2313,6 +2338,44 @@ function seedQuality(encoder, q) {
   $('#rQualVal').textContent = `${qualLabel(encoder)} ${val}`
 }
 
+/* ---------- C2: форматы вывода (мультиформат-рефрейм) ----------
+   Группа чекбоксов «Форматы вывода» в renderModal. Выбор живёт в localStorage
+   и применяется при каждом открытии модалки; дефолт — только «Исходный».
+   N>1 — честная подпись «время рендера ×N» (каждый формат = полный прогон). */
+const RENDER_FMT_KEY = 'fve_render_formats'
+const RENDER_FMT_IDS = { source: '#rFmtSource', '9x16': '#rFmt916', '1x1': '#rFmt11', '16x9': '#rFmt169' }
+
+function renderFormatsSaved() {
+  let v = null
+  try { v = JSON.parse(localStorage.getItem(RENDER_FMT_KEY) || 'null') } catch {}
+  const known = Object.keys(RENDER_FMT_IDS)
+  const list = Array.isArray(v) ? v.filter((f) => known.includes(f)) : []
+  return list.length ? list : ['source']
+}
+function renderFormatsStore(list) { try { localStorage.setItem(RENDER_FMT_KEY, JSON.stringify(list)) } catch {} }
+function renderFormatsCollect() {
+  return Object.keys(RENDER_FMT_IDS).filter((f) => { const el = $(RENDER_FMT_IDS[f]); return el && el.checked })
+}
+function renderFormatsApply(list) {
+  for (const [f, id] of Object.entries(RENDER_FMT_IDS)) { const el = $(id); if (el) el.checked = list.includes(f) }
+  renderFormatsNote()
+}
+// Подпись под группой: при N>1 — правда о цене (каждый формат = свой полный
+// рендер). Снять последний чекбокс нельзя — молча возвращаем «Исходный»,
+// чтобы кнопка «Рендер» никогда не отправляла пустой список.
+function renderFormatsNote() {
+  const note = $('#rFmtTimeNote'); if (!note) return
+  const n = renderFormatsCollect().length
+  note.classList.toggle('hidden', n <= 1)
+  if (n > 1) note.textContent = `Выбрано форматов: ${n} — время рендера ×${n} (каждый формат рендерится отдельным полным проходом).`
+}
+function renderFormatsChanged() {
+  let list = renderFormatsCollect()
+  if (!list.length) { list = ['source']; const el = $(RENDER_FMT_IDS.source); if (el) el.checked = true }
+  renderFormatsStore(list)
+  renderFormatsNote()
+}
+
 function openRenderModal() {
   if (!st.hasSession) return
   const d = st.rdefaults || {}, m = st.media || {}
@@ -2329,8 +2392,9 @@ function openRenderModal() {
     $('#rBurn').checked = false
     $('#rBurnOpts').classList.add('hidden')
     $('#rBurnSizeVal').textContent = `${$('#rBurnSize').value}px`
+    capInitFromSaved()   // C1: кнопки-пресеты + сохранённый стиль + превью
   }
-  if ($('#rVertical')) $('#rVertical').checked = false
+  renderFormatsApply(renderFormatsSaved())   // C2: форматы вывода из localStorage
   if ($('#rDenoise')) {
     $('#rDenoise').checked = !!d.denoise
     $('#rDenoiseOpts').classList.toggle('hidden', !d.denoise)
@@ -2383,6 +2447,161 @@ function hexToAss(hex) {
   return ('&H00' + bb + gg + rr).toUpperCase()
 }
 
+/* ---------- C1: пресеты стиля вшитых субтитров ----------
+   Источник значений — st.captionPresets (/api/state). Выбор живёт в
+   localStorage и применяется при каждом открытии модалки; ручная правка
+   любого поля стиля переключает на «Свой». */
+const CAP_PRESET_KEY = 'fve_caption_preset'
+// Поля стиля, которых НЕТ среди сырых полей модалки. При переключении на
+// «Свой» они наследуются от последнего применённого пресета (st.capBase,
+// дублируется в localStorage на случай перезагрузки страницы) — иначе тихо
+// откатились бы на серверные дефолты: выбрал «Неон» (приподнято, margin_v 160),
+// сдвинул кегль -> «Свой» -> сабы упали бы в самый низ кадра.
+const CAP_HIDDEN_FIELDS = ['outline_color', 'outline', 'shadow', 'margin_v']
+const CAP_BASE_KEY = 'fve_caption_custom_base'
+
+// Скрытая база «Своего»: из памяти, иначе из localStorage; null — пресет ещё
+// ни разу не применяли (тогда честно молчим — сервер возьмёт свои дефолты).
+function capHiddenBase() {
+  if (st.capBase) return st.capBase
+  try {
+    const j = JSON.parse(localStorage.getItem(CAP_BASE_KEY) || 'null')
+    if (j && typeof j === 'object' && !Array.isArray(j)) { st.capBase = j; return j }
+  } catch {}
+  return null
+}
+function capStoreBase(sl) {
+  const base = {}
+  for (const k of CAP_HIDDEN_FIELDS) if (sl[k] != null) base[k] = sl[k]
+  st.capBase = base
+  try { localStorage.setItem(CAP_BASE_KEY, JSON.stringify(base)) } catch {}
+}
+
+// &HAABBGGRR -> #rrggbb для <input type=color> (альфа отбрасывается).
+function assToHex(ass) {
+  const m = /^&H([0-9A-F]{8})$/i.exec((ass || '').trim())
+  if (!m) return null
+  const v = m[1]
+  return ('#' + v.slice(6, 8) + v.slice(4, 6) + v.slice(2, 4)).toLowerCase()
+}
+// &HAABBGGRR -> rgba() для CSS-превью (AA: 00 — непрозрачный, FF — невидимый).
+function assToCss(ass) {
+  const m = /^&H([0-9A-F]{8})$/i.exec((ass || '').trim())
+  if (!m) return null
+  const v = m[1], a = 1 - parseInt(v.slice(0, 2), 16) / 255
+  return `rgba(${parseInt(v.slice(6, 8), 16)},${parseInt(v.slice(4, 6), 16)},${parseInt(v.slice(2, 4), 16)},${a.toFixed(2)})`
+}
+
+function capPresetSaved() {
+  let k = null
+  try { k = localStorage.getItem(CAP_PRESET_KEY) } catch {}
+  return k || 'classic'   // первый запуск: «Классика» (совпадает с дефолтами полей)
+}
+function capPresetStore(k) { try { localStorage.setItem(CAP_PRESET_KEY, k) } catch {} }
+function capPresetFind(k) { return (st.captionPresets || []).find((p) => p && p.key === k) || null }
+
+// Ряд кнопок: пресеты с бэка + «Свой». Перестраивается на каждое открытие
+// модалки — список статичен и мал, зато active-состояние всегда свежее.
+function capRenderButtons() {
+  const box = $('#rBurnPresets'); if (!box) return
+  box.replaceChildren()
+  const mk = (key, label, hint) => {
+    const b = document.createElement('button')
+    b.type = 'button'; b.className = 'btn small capPresetBtn'; b.dataset.key = key
+    b.textContent = label; if (hint) b.title = hint
+    b.onclick = () => (key === 'custom' ? capSetCustom() : capApplyPreset(key))
+    box.appendChild(b)
+  }
+  for (const p of (st.captionPresets || [])) mk(p.key, p.label, p.hint)
+  if (st.captionPresets.length) mk('custom', 'Свой', 'Свои значения в полях ниже')
+}
+function capMarkActive(key) {
+  for (const b of document.querySelectorAll('#rBurnPresets .capPresetBtn')) {
+    const on = b.dataset.key === key
+    b.classList.toggle('active', on)
+    b.setAttribute('aria-pressed', on ? 'true' : 'false')
+  }
+}
+
+// Клик по пресету: заполнить сырые поля его значениями + запомнить выбор.
+// Программная установка .value события не стреляет, так что переключения
+// на «Свой» отсюда не случится.
+function capApplyPreset(key) {
+  const p = capPresetFind(key)
+  if (!p) { capSetCustom(); return }
+  const sl = p.style || {}
+  st.capPreset = key; capPresetStore(key); capMarkActive(key)
+  capStoreBase(sl)   // «Свой» после правки унаследует скрытые поля этого пресета
+  if ($('#rBurnFont')) $('#rBurnFont').value = sl.font || 'Arial'
+  if ($('#rBurnSize')) {
+    $('#rBurnSize').value = sl.size || 52
+    $('#rBurnSizeVal').textContent = `${$('#rBurnSize').value}px`
+  }
+  if ($('#rBurnPos')) $('#rBurnPos').value = sl.position || 'bottom'
+  if ($('#rBurnColor')) $('#rBurnColor').value = assToHex(sl.primary_color) || '#ffffff'
+  if ($('#rBurnKColor')) $('#rBurnKColor').value = assToHex(sl.karaoke_color) || '#ffd400'
+  if ($('#rBurnKaraoke')) $('#rBurnKaraoke').checked = sl.karaoke !== false
+  capUpdatePreview()
+}
+
+// Ручная правка любого поля стиля -> «Свой» (значения полей не трогаем).
+function capSetCustom() {
+  st.capPreset = 'custom'; capPresetStore('custom'); capMarkActive('custom')
+  capUpdatePreview()
+}
+
+// Стиль для превью: активный пресет целиком или текущие поля («Свой»,
+// скрытые поля — от последнего пресета через capHiddenBase, см. K1-коммент).
+function capCurrentStyle() {
+  const p = (st.capPreset && st.capPreset !== 'custom') ? capPresetFind(st.capPreset) : null
+  if (p) return p.style || {}
+  return {
+    outline_color: '&H00000000', outline: 2, shadow: 1,   // фолбэк = серверные дефолты
+    ...(capHiddenBase() || {}),
+    font: $('#rBurnFont') ? $('#rBurnFont').value : 'Arial',
+    size: $('#rBurnSize') ? parseInt($('#rBurnSize').value, 10) : 52,
+    position: $('#rBurnPos') ? $('#rBurnPos').value : 'bottom',
+    primary_color: hexToAss($('#rBurnColor') && $('#rBurnColor').value) || '&H00FFFFFF',
+    karaoke_color: hexToAss($('#rBurnKColor') && $('#rBurnKColor').value) || '&H0000D4FF',
+    karaoke: !!($('#rBurnKaraoke') && $('#rBurnKaraoke').checked),
+  }
+}
+
+// CSS-имитация строки субтитра (НЕ ASS-рендер): первый «спетый» word — цветом
+// подсветки, остальное — основным; контур — text-shadow-кольцом. Подпись под
+// превью честно говорит, что это приближение.
+function capUpdatePreview() {
+  const box = $('#rBurnPreview'); if (!box) return
+  const sl = capCurrentStyle()
+  const line = $('#rBurnPreviewText'), hi = $('#rBurnPrevHi'), base = $('#rBurnPrevBase')
+  const prim = assToCss(sl.primary_color) || '#ffffff'
+  const kara = assToCss(sl.karaoke_color) || '#ffd400'
+  const oc = assToCss(sl.outline_color) || 'rgba(0,0,0,1)'
+  line.style.fontFamily = `"${sl.font || 'Arial'}", sans-serif`
+  // PlayRes-кегль (на 1080p) -> превью-кегль: масштаб подобран на глаз.
+  line.style.fontSize = Math.max(13, Math.min(34, Math.round((sl.size || 52) * 0.36))) + 'px'
+  const o = Math.max(1, Math.round((sl.outline != null ? sl.outline : 2) * 0.7))
+  const ring = [`${o}px 0 0 ${oc}`, `-${o}px 0 0 ${oc}`, `0 ${o}px 0 ${oc}`, `0 -${o}px 0 ${oc}`,
+                `${o}px ${o}px 0 ${oc}`, `-${o}px ${o}px 0 ${oc}`,
+                `${o}px -${o}px 0 ${oc}`, `-${o}px -${o}px 0 ${oc}`]
+  const sh = Math.round((sl.shadow != null ? sl.shadow : 1) * 1.5)
+  if (sh > 0) ring.push(`${sh}px ${sh}px ${sh * 2}px rgba(0,0,0,.85)`)
+  line.style.textShadow = ring.join(', ')
+  base.style.color = prim
+  hi.style.color = (sl.karaoke !== false) ? kara : prim
+  box.style.alignItems = sl.position === 'top' ? 'flex-start'
+    : (sl.position === 'center' ? 'center' : 'flex-end')
+}
+
+// Открытие модалки: восстановить сохранённый выбор (пресет заполняет поля;
+// «Свой»/неизвестный ключ — поля остаются как есть, только подсветка).
+function capInitFromSaved() {
+  capRenderButtons()
+  const saved = capPresetSaved()
+  if (capPresetFind(saved)) capApplyPreset(saved)
+  else { st.capPreset = 'custom'; capMarkActive('custom'); capUpdatePreview() }
+}
+
 // Human label for the afftdn noise-floor slider (-12 soft … -40 strong).
 function denoiseStrengthLabel(nf) {
   const v = parseInt(nf, 10)
@@ -2399,7 +2618,14 @@ function setCutFadeLabel(ms) {
 // Collect the burn-in subtitle opts from the render modal (or null if off).
 function burnOptsFromUI() {
   if (!$('#rBurn') || !$('#rBurn').checked) return null
+  // C1: активный пресет шлём ЦЕЛИКОМ — в нём есть outline/shadow/margin_v,
+  // которых нет среди сырых полей; иначе пресет применился бы частично.
+  const p = (st.capPreset && st.capPreset !== 'custom') ? capPresetFind(st.capPreset) : null
+  if (p) return { burn_subtitles: true, burn_style: { ...p.style } }
+  // «Свой» = сырые поля + скрытые поля последнего пресета (capHiddenBase):
+  // правка кегля у «Неона» не должна молча ронять margin_v 160 -> 40.
   const style = {
+    ...(capHiddenBase() || {}),
     font: $('#rBurnFont').value,
     size: parseInt($('#rBurnSize').value, 10),
     position: $('#rBurnPos').value,
@@ -2420,7 +2646,9 @@ function submitRender() {
     censor_method: $('#rCensor').value,
     subtitles: $('#rSubs').checked,
     chapters: $('#rChapters').checked,
-    vertical: !!($('#rVertical') && $('#rVertical').checked),
+    // C2: мультиформат — массив форматов вместо старого чекбокса vertical
+    // (сервер сохраняет обратную совместимость со старым полем).
+    formats: (() => { const l = renderFormatsCollect(); return l.length ? l : ['source'] })(),
     denoise: !!($('#rDenoise') && $('#rDenoise').checked),
     // Мастеринг — отдельные флаги, шлются всегда (работают и без шумоподавления).
     denoise_deess: !!($('#rDeess') && $('#rDeess').checked),
@@ -2497,10 +2725,23 @@ function showResults(r) {
     if (!base) return '—'
     return `<a href="/api/output/${encodeURIComponent(base)}" target="_blank">${l}</a>`
   }
+  // C2: мультиформат — строка на каждый формат (готов / пропущен / ошибка).
+  // Без массива formats (старые результаты, очередь) — прежняя одиночная строка.
+  let videoHtml
+  if (Array.isArray(r.formats) && r.formats.length) {
+    videoHtml = r.formats.map((f) => {
+      const lbl = escapeHtml(f.label || f.format || '')
+      if (f.skipped) return `<p>Видео ${lbl}: пропущено — ${escapeHtml(f.note || 'совпадает с исходным')}</p>`
+      if (f.ok === false) return `<p>Видео ${lbl}: <span class="error">ошибка — ${escapeHtml(f.error || '')}</span></p>`
+      return `<p>Видео ${lbl}: ${link(f.mp4, 'открыть .mp4')}</p>`
+    }).join('')
+  } else {
+    videoHtml = `<p>Видео: ${link(r.mp4, 'открыть .mp4')}${r.vertical ? ' · вертикальный 9:16 ✓' : ''}</p>`
+  }
   $('#resultsCard').innerHTML = `
     <h2>Готово ✓</h2>
-    <p>Длительность: <b>${fmt(r.old_duration)} &rarr; ${fmt(r.new_duration)}</b> · кодек ${r.encoder}</p>
-    <p>Видео: ${link(r.mp4, 'открыть .mp4')}${r.vertical ? ' · вертикальный 9:16 ✓' : ''}</p>
+    <p>Длительность: <b>${fmt(r.old_duration)} &rarr; ${fmt(r.new_duration)}</b> · кодек ${r.encoder || '—'}</p>
+    ${videoHtml}
     <p>Субтитры: ${link(r.srt, '.srt')} · ${link(r.vtt, '.vtt')} (${r.cues} реплик)${r.burned_subtitles ? ' · вшиты в видео ✓' : ''}</p>
     <p>Главы: ${link(r.chapters, 'chapters.txt')} (${r.n_chapters})</p>
     <p>Метаданные: ${link(r.metadata_path, 'metadata.txt')}${r.metadata ? ' (' + escapeHtml(r.metadata.substring(0, 40)) + '…)' : ''}</p>
@@ -2586,10 +2827,24 @@ function bindUI() {
   if ($('#rBurn')) {
     $('#rBurn').onchange = (e) => $('#rBurnOpts').classList.toggle('hidden', !e.target.checked)
     $('#rBurnSize').oninput = (e) => $('#rBurnSizeVal').textContent = `${e.target.value}px`
+    // C1: ручная правка любого поля стиля -> «Свой» + живое превью.
+    // addEventListener — не затирает .oninput метки размера строкой выше;
+    // программное заполнение полей пресетом события не порождает.
+    for (const sel of ['#rBurnFont', '#rBurnPos', '#rBurnKaraoke']) {
+      const el = $(sel); if (el) el.addEventListener('change', capSetCustom)
+    }
+    for (const sel of ['#rBurnSize', '#rBurnColor', '#rBurnKColor']) {
+      const el = $(sel); if (el) el.addEventListener('input', capSetCustom)
+    }
   }
   if ($('#rDenoise')) {
     $('#rDenoise').onchange = (e) => $('#rDenoiseOpts').classList.toggle('hidden', !e.target.checked)
     $('#rDenoiseStrength').oninput = (e) => $('#rDenoiseStrengthVal').textContent = denoiseStrengthLabel(e.target.value)
+  }
+  // C2: форматы вывода — каждый чекбокс пишет выбор в localStorage и обновляет
+  // честную подпись «время рендера ×N»; пустой выбор откатывается к «Исходный».
+  for (const id of Object.values(RENDER_FMT_IDS)) {
+    const el = $(id); if (el) el.addEventListener('change', renderFormatsChanged)
   }
   // «точный (2 прохода)» доступен только при включённой «Громкости под YouTube».
   if ($('#rLoudnorm') && $('#rLoudnorm2p')) {

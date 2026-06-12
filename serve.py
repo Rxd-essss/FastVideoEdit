@@ -111,6 +111,47 @@ WHISPER_PRESETS = [
 ]
 WHISPER_ALLOWED = {p["model"] for p in WHISPER_PRESETS}
 
+# C1: готовые стили вшитых караоке-субтитров («стиль в 1 клик» поверх пяти
+# сырых полей renderModal). Как и WHISPER_PRESETS, это UI-уровневые бизнес-
+# данные — поэтому живут здесь, а не в vpipe. Каждый ``style`` — ПОЛНЫЙ набор
+# полей AssStyleCfg (кроме ортогонального тумблера ``enabled``); соответствие
+# pydantic-модели закреплено тестами (extra="ignore" молча съел бы опечатку
+# в ключе — тест сверяет точное множество ключей). Фронт получает список через
+# GET /api/state — один источник истины, без дубля констант в app.js.
+# Цвета — ASS &HAABBGGRR (AA=00 — непрозрачный); размеры/отступы — в пикселях
+# PlayRes (равен разрешению выхода). Подбор — под talking-head Shorts.
+CAPTION_PRESETS = [
+    {"key": "classic", "label": "Классика",
+     "hint": "Белый текст, жёлтая подсветка слова, снизу",
+     "style": {"font": "Arial", "size": 52,
+               "primary_color": "&H00FFFFFF", "outline_color": "&H00000000",
+               "karaoke_color": "&H0000D4FF",   # #FFD400 — тёплый жёлтый
+               "outline": 2.0, "shadow": 1.0,
+               "position": "bottom", "karaoke": True, "margin_v": 40}},
+    {"key": "neon", "label": "Неон",
+     "hint": "Крупнее, бирюзовая подсветка, приподнято над низом",
+     "style": {"font": "Verdana", "size": 62,
+               "primary_color": "&H00FFFFFF", "outline_color": "&H00000000",
+               "karaoke_color": "&H00FFE500",   # #00E5FF — бирюза
+               "outline": 3.0, "shadow": 0.0,
+               "position": "bottom", "karaoke": True, "margin_v": 160}},
+    {"key": "minimal", "label": "Минимал",
+     "hint": "Мельче и спокойнее: мягкая полупрозрачная обводка-плашка",
+     "style": {"font": "Tahoma", "size": 44,
+               "primary_color": "&H00FFFFFF",
+               "outline_color": "&H78000000",   # чёрный ≈53% непрозрачности
+               "karaoke_color": "&H006ED7F5",   # #F5D76E — приглушённое золото
+               "outline": 3.0, "shadow": 0.0,
+               "position": "bottom", "karaoke": True, "margin_v": 48}},
+    {"key": "bold", "label": "Крупный",
+     "hint": "Для просмотра без звука — большой кегль по центру кадра",
+     "style": {"font": "Impact", "size": 78,
+               "primary_color": "&H00FFFFFF", "outline_color": "&H00000000",
+               "karaoke_color": "&H0000D4FF",
+               "outline": 3.0, "shadow": 2.0,
+               "position": "center", "karaoke": True, "margin_v": 40}},
+]
+
 # B5: the user-editable filler dictionary (repo root). The GET/PUT /api/fillers
 # endpoints read this module global at call time so tests can repoint it at a
 # tmp copy without ever touching the real file.
@@ -778,6 +819,20 @@ def _resolve_render_opts(s: Session, opts: dict):
         if bs.get("position") in ("bottom", "top", "center"):
             b.position = bs["position"]
         b.karaoke = bool(bs.get("karaoke", True))
+        # C1 (пресеты стилей): числовые поля, которых нет среди «сырых» полей
+        # UI — приходят только целым пресетом. Клампы — здравые пределы ASS;
+        # мусор молча игнорируется (значение из config.yaml остаётся).
+        for key, lo, hi in (("outline", 0.0, 10.0), ("shadow", 0.0, 10.0)):
+            if bs.get(key) is not None:
+                try:
+                    setattr(b, key, max(lo, min(hi, float(bs[key]))))
+                except (TypeError, ValueError):
+                    pass
+        if bs.get("margin_v") is not None:
+            try:                                 # PlayRes-пиксели (выход ≤4K)
+                b.margin_v = max(0, min(800, int(bs["margin_v"])))
+            except (TypeError, ValueError):
+                pass
     else:
         cfg.subtitles.burn.enabled = False
 
@@ -887,7 +942,8 @@ def _resolve_render_opts(s: Session, opts: dict):
 def _run_render_pipeline(s: Session, cfg, scale_h, fps, out_dir: Path,
                          base: Path, on_progress, on_stage,
                          cutlist_override: Optional[CutList] = None,
-                         edge_fade: float = 0.0) -> dict:
+                         edge_fade: float = 0.0,
+                         sidecar_base: Optional[Path] = None) -> dict:
     """Render mp4 + (optional) subtitles + chapters, returning the results dict.
 
     ``on_progress(frac)`` / ``on_stage(msg)`` are callbacks so the same body
@@ -905,7 +961,13 @@ def _run_render_pipeline(s: Session, cfg, scale_h, fps, out_dir: Path,
     edges of the clip's final audio. An EXPLICIT parameter (not a heuristic on
     cutlist_override): only /api/clips/render passes a non-zero value (from
     cfg.clips.edge_fade); every regular full-video render keeps the default 0.0
-    and gets no edge fades."""
+    and gets no edge fades.
+
+    ``sidecar_base`` (C2 multi-format): base path for the SIDECAR subtitle files
+    (.srt/.vtt) when it must differ from the mp4 base — the formats loop names
+    the mp4 ``<stem>_9x16.mp4`` etc. but subtitles do not depend on the crop, so
+    they are written once as plain ``<stem>.srt``. ``None`` (default) keeps the
+    legacy behavior: sidecars share ``base`` with the mp4."""
     cl = cutlist_override or s.cutlist
     tr = s.transcript
     removed, _ = resolve(cl)
@@ -998,7 +1060,8 @@ def _run_render_pipeline(s: Session, cfg, scale_h, fps, out_dir: Path,
         try:
             on_stage("Субтитры…")
             sr = subs_mod.generate(tr, removed, cfg.subtitles, cfg.masking,
-                                   s.matcher, base, log=lambda *_: None)
+                                   s.matcher, sidecar_base or base,
+                                   log=lambda *_: None)
             subtitles_ok = True
         except Exception as e:  # noqa: BLE001 — keep the rendered mp4
             sr = {"error": str(e)}
@@ -1064,6 +1127,146 @@ def _run_render_pipeline(s: Session, cfg, scale_h, fps, out_dir: Path,
         "chapters_error": cr.get("error"),
         "metadata_error": mr.get("error"),
     }
+
+
+# --- C2: мультиформат-рефрейм — один клик, несколько форматов вывода ----------
+# (CapCut делает рефрейм в облаке за Pro; у нас — локально и бесплатно.)
+# Поддерживается ТОЛЬКО основным рендером /api/render; очередь (F3) и Clip Maker
+# (/api/clips/render) остаются одноформатными — TODO для следующей итерации.
+RENDER_FORMATS = ("source", "9x16", "1x1", "16x9")
+_FORMAT_LABEL = {"source": "Исходный", "9x16": "9:16", "1x1": "1:1",
+                 "16x9": "16:9"}
+_FORMAT_SUFFIX = {"source": "", "9x16": "_9x16", "1x1": "_1x1",
+                  "16x9": "_16x9"}
+# Аспект-кропы с разрешением источника (aspect_target). "9x16" сюда не входит —
+# это прежний vertical-путь с каноничной целью Shorts (1080x1920 по умолчанию).
+_FORMAT_ASPECT = {"1x1": (1, 1), "16x9": (16, 9)}
+
+
+def _parse_formats(opts: dict) -> list[str]:
+    """Validate/normalize the ``formats`` field of /api/render opts.
+
+    * ``formats`` absent -> backward compatibility: legacy ``vertical: true``
+      maps to ``["9x16"]``, otherwise ``["source"]`` (the pre-C2 behavior);
+    * present -> must be a non-empty list of known formats (else 400);
+      duplicates are dropped, client order is preserved.
+    """
+    raw = opts.get("formats")
+    if raw is None:
+        return ["9x16"] if opts.get("vertical") else ["source"]
+    if not isinstance(raw, list) or not raw:
+        raise HTTPException(400, "formats: ожидается непустой список из "
+                                 + ", ".join(RENDER_FORMATS))
+    out: list[str] = []
+    for f in raw:
+        if f not in RENDER_FORMATS:
+            raise HTTPException(400, f"Неизвестный формат вывода: {f!r} "
+                                     f"(допустимы: {', '.join(RENDER_FORMATS)})")
+        if f not in out:
+            out.append(f)
+    return out
+
+
+def _render_formats(s: Session, opts: dict, formats: list[str],
+                    on_progress, on_stage,
+                    is_cancelled=lambda: False) -> dict:
+    """Render the SAME cutlist in each requested output format, sequentially.
+
+    Цикл по паттерну render_clips: каждый формат — свой полный прогон
+    ``_resolve_render_opts`` + ``_run_render_pipeline`` (честное «время ×N»).
+    Имена: ``<stem>.mp4`` / ``<stem>_9x16.mp4`` / ``<stem>_1x1.mp4`` /
+    ``<stem>_16x9.mp4``. Общий percent = (i + frac)/N, stage «Формат i/N: …»
+    (при N=1 — прежние «голые» stage/percent, бит-в-бит со старым рендером).
+
+    Кропы: "9x16" — прежний vertical-путь (face-crop, цель 1080x1920);
+    "1x1"/"16x9" — vertical-механика с целью ``aspect_target`` от размеров
+    источника (face-crop по горизонтали переиспользуется). Формат, совпадающий
+    с аспектом источника (16:9-кроп из 16:9-ролика, 9:16 из вертикального
+    9:16-исходника, …), НЕ рендерится — в results он помечен ``skipped``
+    («совпадает с исходным»). Для "9x16" аспект сверяется явно (тем же
+    integer-точным правилом, что в ``aspect_target``); неизвестные размеры
+    источника (0x0) совпадением не считаются — рендерим, как раньше.
+
+    Сайдкары один раз: .srt/.vtt не зависят от кропа (пишутся как ``<stem>.srt``
+    через ``sidecar_base``), chapters/metadata — тоже только при первом удачном
+    прогоне; остальные форматы идут с subtitles/chapters/metadata=False.
+
+    Результат = dict первого УСПЕШНОГО прогона (обратная совместимость с
+    одноформатными потребителями: mp4/srt/chapters на верхнем уровне) плюс
+    ``formats`` — массив по форматам. Упавший формат не валит остальные;
+    если не удался НИ ОДИН (а попытки были) — задача падает, как раньше.
+    """
+    n = len(formats)
+    stem = Path((opts.get("filename") or s.inp.stem).strip() or s.inp.stem).stem
+    src_w = s.media.width or 0
+    src_h = s.media.height or 0
+    entries: list[dict] = []
+    merged: Optional[dict] = None
+    errors: list[str] = []
+    sidecars_done = False
+    for i, f in enumerate(formats):
+        if is_cancelled():
+            break                                  # cancel между форматами
+        label = _FORMAT_LABEL[f]
+        opts_i = {**opts, "filename": stem + _FORMAT_SUFFIX[f]}
+        if f == "source":
+            dup = False
+            opts_i["vertical"] = False
+        elif f == "9x16":
+            # 9:16 из 9:16-источника — такой же дубль, как 16:9-кроп из
+            # 16:9-ролика: сверяем аспект явно (integer-точное правило
+            # aspect_target); неизвестные размеры (0x0) совпадением не считаем.
+            dup = src_w > 0 and src_h > 0 and src_w * 16 == src_h * 9
+            if not dup:
+                opts_i["vertical"] = True          # цель/центр из opts, как раньше
+        else:
+            tgt = facecrop_mod.aspect_target(src_w, src_h, _FORMAT_ASPECT[f])
+            dup = tgt is None
+            if not dup:
+                opts_i["vertical"] = True
+                opts_i["vertical_target"] = f"{tgt[0]}x{tgt[1]}"
+        if dup:
+            entries.append({
+                "format": f, "label": label, "ok": True, "skipped": True,
+                "note": "совпадает с исходным форматом — пропущено "
+                        "(дубль не рендерим)"})
+            continue
+        if sidecars_done:
+            opts_i.update(subtitles=False, chapters=False, metadata=False)
+        if n > 1:
+            prog = (lambda fr, i=i: on_progress(
+                (i + min(1.0, max(0.0, fr))) / n))
+            stage = (lambda m, i=i, label=label: on_stage(
+                f"Формат {i + 1}/{n}: {label} — {m}"))
+            stage("подготовка…")
+        else:
+            prog, stage = on_progress, on_stage    # N=1: легаси бит-в-бит
+        try:
+            cfg, scale_h, fps, out_dir, base = _resolve_render_opts(s, opts_i)
+            res = _run_render_pipeline(
+                s, cfg, scale_h, fps, out_dir, base,
+                on_progress=prog, on_stage=stage,
+                sidecar_base=out_dir / stem)
+            sidecars_done = True
+            entries.append({
+                "format": f, "label": label, "ok": True, "skipped": False,
+                "mp4": res.get("mp4"), "encoder": res.get("encoder"),
+                "vertical": res.get("vertical"),
+                "burned_subtitles": res.get("burned_subtitles")})
+            if merged is None:
+                merged = res
+        except Exception as e:  # noqa: BLE001 — упавший формат не валит остальные
+            if n == 1:
+                raise                              # легаси: единственный = ошибка задачи
+            err = "cancelled" if is_cancelled() else str(e)
+            errors.append(f"{label}: {err}")
+            entries.append({"format": f, "label": label, "ok": False,
+                            "error": err})
+    if merged is None and errors:
+        raise RuntimeError("Не удался ни один формат — " + "; ".join(errors))
+    result = dict(merged) if merged is not None else {}
+    result["formats"] = entries
+    return result
 
 
 def _make_job_dict(job: QueueJob) -> dict:
@@ -1266,6 +1469,9 @@ def state():
             "whisper_model": s.cfg.transcribe.model,
             "llm_model": s.cfg.llm.model,
         },
+        # C1: готовые стили вшитых субтитров для кнопок-пресетов renderModal.
+        # Статичный список — фронт хранит его в st и НЕ дублирует значения.
+        "caption_presets": CAPTION_PRESETS,
         "task": s.task,
         # B5: saved detection options from cache/detect_ui.json (null = never
         # configured -> /api/detect runs with the untouched session cfg).
@@ -1737,15 +1943,21 @@ def do_render(opts: dict = Body(default={})):
     if s.transcript is None:
         raise HTTPException(409, "Transcribe first")
 
-    # Effective config + params = base config + UI overrides (shared with queue).
-    cfg, scale_h, fps, out_dir, base = _resolve_render_opts(s, opts)
+    # C2: форматы вывода — ["source"] / ["9x16"] / … (легаси vertical=true
+    # маппится внутри). Валидация форматов и общих опций (scale_h/fps) — 400
+    # на запросе, а не ошибка задачи; out_dir создан до старта.
+    formats = _parse_formats(opts)
+    _, _, _, out_dir, _ = _resolve_render_opts(s, opts)
     s.last_out_dir = str(out_dir.resolve())
 
     def run():
-        s.task["results"] = _run_render_pipeline(
-            s, cfg, scale_h, fps, out_dir, base,
-            on_progress=s.set_progress,
-            on_stage=s.stage)
+        s.task["results"] = _render_formats(
+            s, opts, formats,
+            on_progress=s.set_progress, on_stage=s.stage,
+            is_cancelled=lambda: bool(s.task.get("cancelled")))
+        if s.task.get("cancelled"):
+            # Частичные results уже сохранены — отчитываемся чистым «cancelled».
+            raise RuntimeError("Задача отменена")
 
     s.start_task("render", run)
     return {"ok": True}

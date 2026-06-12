@@ -469,6 +469,10 @@
       <div class="rburn">
         <label class="chk"><input type="checkbox" id="rBurn"> Вшить субтитры в видео (burn-in)</label>
         <div id="rBurnOpts" class="rburnopts hidden">
+          <!-- C1: кнопки-пресеты стиля (наполняются из /api/state.caption_presets) + CSS-превью -->
+          <div id="rBurnPresets" class="capPresets" role="group" aria-label="Стиль субтитров"></div>
+          <div id="rBurnPreview" class="capPreview" aria-hidden="true"><span id="rBurnPreviewText" class="capPreviewText"><span id="rBurnPrevHi">Пример</span> <span id="rBurnPrevBase">субтитра</span></span></div>
+          <div class="hint muted capNote">Превью приблизительное — точный вид смотри в готовом рендере.</div>
           <div class="rgrid">
             <label>Шрифт
               <select id="rBurnFont" class="select">
@@ -501,8 +505,17 @@
         </div>
       </div>
       <div class="rvert">
-        <label class="chk"><input type="checkbox" id="rVertical"> Вертикальный клип (9:16) под Shorts</label>
-        <div class="hint muted">Авто-кадр по лицу: кадр обрезается до 1080×1920 так, чтобы говорящий оставался в кадре (если лицо не найдено — по центру). Совместимо со вшитыми субтитрами.</div>
+        <div class="rfmtTitle">Форматы вывода</div>
+        <div class="rfmtRow" role="group" aria-label="Форматы вывода">
+          <label class="chk"><input type="checkbox" id="rFmtSource" checked> Исходный</label>
+          <label class="chk"><input type="checkbox" id="rFmt916"> 9:16 (Shorts)</label>
+          <label class="chk"><input type="checkbox" id="rFmt11"> 1:1 (квадрат)</label>
+          <label class="chk"><input type="checkbox" id="rFmt169"> 16:9-кроп</label>
+        </div>
+        <div class="hint muted">Каждый отмеченный формат рендерится отдельным файлом, имя дополняется суффиксом (_9x16, _1x1, _16x9). Формат, совпадающий с пропорциями исходника, пропускается — дубль не рендерим.</div>
+        <div class="hint muted">Кадрирование: когда срезаются края по ширине (горизонтальный исходник → 9:16 или 1:1) — авто-кадр по лицу, без лица — по центру; когда срезается верх и низ (вертикальный исходник → 1:1 или 16:9) — по центру кадра.</div>
+        <div class="hint muted">9:16 — 1080×1920 под Shorts; 1:1 и 16:9 — в разрешении источника. Совместимо со вшитыми субтитрами.</div>
+        <div id="rFmtTimeNote" class="hint muted hidden"></div>
       </div>
       <div class="rdenoise">
         <label class="chk"><input type="checkbox" id="rDenoise"> Шумоподавление (звук)</label>
@@ -686,7 +699,8 @@
         </label>
       </div>
       <label class="chk"><input type="checkbox" id="cBurn" checked> Вшить караоке-субтитры</label>
-      <div class="hint muted">Капшены в нижней трети кадра, в безопасной зоне интерфейса Shorts.</div>
+      <!-- C1: полей стиля здесь нет — клипы берут пресет из окна «Настройки рендера»; текст ставит openClipsModal() -->
+      <div class="hint muted" id="cBurnHint">Стиль капшенов — пресет из окна «Настройки рендера».</div>
       <div class="rout">
         <div class="routrow">
           <input id="cOutDir" class="search" type="text" placeholder="папка вывода" aria-label="Папка вывода клипов">

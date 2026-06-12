@@ -286,6 +286,47 @@ def vertical_filter(src_w: int, src_h: int, center_x: float,
             f"crop={tw}:{th}")
 
 
+def aspect_target(src_w: int, src_h: int, aspect: tuple[int, int]
+                  ) -> Optional[tuple[int, int]]:
+    """Source-resolution target ``(w, h)`` for reframing to ``aspect`` (aw:ah).
+
+    Generalizes the 9:16 crop to ANY aspect (C2 multi-format reframe: 1:1,
+    16:9-crop, …). Keeps the source pixel scale — the dimension that is "too
+    long" for the target aspect gets cropped, nothing is upscaled:
+
+    * source WIDER than target aspect  -> keep height, width = h * aw / ah;
+    * source NARROWER than target      -> keep width,  height = w * ah / aw;
+    * source ALREADY at the exact aspect (integer-exact ``src_w*ah == src_h*aw``)
+      -> ``None`` — the reframe would be a no-op duplicate of the source render,
+      so the caller skips it (and says so in the results).
+
+    Both dimensions are clamped to EVEN values (H.264 4:2:0 requires mod-2):
+    the kept source dimension is floored to even, the computed one rounded to
+    the nearest even and never beyond the source. Examples:
+    ``1920x1080 -> 9:16 = (608, 1080)``; ``1080x1920 -> 1:1 = (1080, 1080)``;
+    ``1920x1080 -> 16:9 = None``. Pure function — unit-tested without media.
+    """
+    try:
+        aw, ah = int(aspect[0]), int(aspect[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+    if aw <= 0 or ah <= 0 or src_w <= 0 or src_h <= 0:
+        return None
+    if src_w * ah == src_h * aw:           # already exactly that aspect: no-op
+        return None
+    if src_w * ah > src_h * aw:            # wider: keep height, crop width
+        th = src_h - (src_h % 2)
+        tw = int(round(th * aw / ah / 2.0)) * 2
+        tw = min(tw, src_w - (src_w % 2))
+    else:                                  # narrower: keep width, crop height
+        tw = src_w - (src_w % 2)
+        th = int(round(tw * ah / aw / 2.0)) * 2
+        th = min(th, src_h - (src_h % 2))
+    if tw <= 0 or th <= 0:
+        return None
+    return tw, th
+
+
 def crop_rect(src_w: int, src_h: int, center_x: float,
               target: tuple[int, int] = (1080, 1920)) -> Optional[tuple[int, int, int, int]]:
     """Concrete integer crop rectangle ``(x, y, w, h)`` for the given source.

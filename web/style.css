@@ -464,6 +464,11 @@ main { flex: 1; display: flex; min-height: 0; }
 .rburn { padding: 4px 0 12px; border-top: 1px solid var(--line); }
 .rvert { padding: 4px 0 12px; border-top: 1px solid var(--line); }
 .rvert .hint { margin-top: 4px; }
+/* C2 — мультиформат-рефрейм: группа «Форматы вывода» в renderModal */
+.rfmtTitle { font-size: 13px; color: var(--muted); margin: 2px 0 6px; }
+.rfmtRow { display: flex; flex-wrap: wrap; gap: 4px 22px; }
+.rfmtRow .chk { margin: 0; }
+#resultsCard .error { color: #ff8d8d; }   /* упавший формат в списке результатов */
 .rdenoise { padding: 4px 0 12px; border-top: 1px solid var(--line); }
 .rdenoise .hint { margin-top: 4px; }
 /* Sub-option nested under a parent checkbox (e.g. «точный (2 прохода)» under
@@ -478,6 +483,20 @@ main { flex: 1; display: flex; min-height: 0; }
 .rburnopts { margin-top: 10px; padding: 12px 14px; border: 1px solid var(--line); border-radius: var(--r-md); background: rgba(255,255,255,.02); }
 .rburnopts .rgrid { margin: 0 0 10px; }
 .rcolor { width: 100%; height: 32px; padding: 2px; border: 1px solid var(--line); border-radius: 6px; background: transparent; cursor: pointer; }
+/* C1 — пресеты стиля вшитых субтитров: ряд кнопок + CSS-мини-превью строки */
+.capPresets { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 10px; }
+.capPresets:empty { display: none; }
+.capPresetBtn.active { border-color: var(--accent); background: var(--elevated);
+  color: var(--text); box-shadow: 0 0 0 1px var(--accent) inset; }
+.capPreview { display: flex; justify-content: center; align-items: flex-end;
+  height: 88px; padding: 8px 12px; margin: 0 0 6px; overflow: hidden;
+  border: 1px solid var(--line); border-radius: var(--r-md);
+  background:
+    radial-gradient(120% 90% at 50% 0%, rgba(124,149,255,.10), transparent 60%),
+    linear-gradient(180deg, #232a3a 0%, #141925 65%, #0e1219 100%); }
+.capPreviewText { line-height: 1.15; white-space: nowrap; text-align: center;
+  letter-spacing: .01em; font-weight: 600; user-select: none; }
+.capNote { margin: 0 0 10px; font-size: 11px; }
 .rout { display: flex; flex-direction: column; gap: 8px; padding: 12px 0; border-top: 1px solid var(--line); }
 .routrow { display: flex; gap: 8px; align-items: center; }
 .routrow .search { flex: 1; max-width: none; }
