@@ -43,6 +43,14 @@ const st = {
   queueJobs: [],          // последний снимок [{id,name,status,percent,stage,result,error,...}]
   queueRunning: false,    // крутится ли воркер очереди
   queuePollTimer: 0,      // setInterval id опроса GET /api/queue
+  // F4 — Clip Maker: кандидаты Shorts (план §4) в ОРИГИНАЛЬНЫХ координатах
+  clipsData: [],          // кандидаты [{id,start,end,score,hook_phrase,...}], сорт. по score desc
+  clipsSel: new Set(),    // id карточек, выбранных чекбоксами под рендер
+  clipsActive: null,      // id карточки с янтарной подсветкой диапазона на волне (null = нет)
+  clipsResults: new Map(),// id → результат рендера {ok, mp4|error} (переживает пере-рендер карточек)
+  _clipsRenderIds: null,  // порядок id в последнем POST /api/clips/render (мапа результатов)
+  _clipPreviewEnd: null,  // ▶-предпросмотр: авто-пауза на этом orig-времени (null = выключен)
+  _clipPrevPreview: false,// каким был «пропускать вырезы» до ▶ (восстановить после авто-паузы)
   // save serialization
   dirty: false, saving: false, savingPromise: null, saveError: false, _navigating: false,
 }
@@ -50,6 +58,11 @@ const UNDO_CAP = 50
 const undoStack = [], redoStack = []
 let ws, regions, video, wrapper = null
 const regionById = new Map()
+// F4 — Clip Maker: подсветка диапазона кандидата на волне (янтарная, как .clipBadge)
+// + DOM-карточки по id (живые ссылки для обновления eff-длительности и результатов).
+const CLIP_HL_COLOR = 'rgba(245,158,11,0.20)'
+let clipHlRegion = null
+const clipEls = new Map()
 let saveTimer = null, es = null, raf = 0
 let phMetrics = { total: 0, client: 0 }   // cached scroll/client widths for playhead
 let phScrollRaf = 0
@@ -151,6 +164,7 @@ async function init() {
   setupWave(pk)
   bindUI(); bindKeys()
   if (s.has_transcript) await loadData()
+  loadClipsFromCache()   // F4: панель клипов из out/<stem>.clips.json — без LLM
   if (s.task && s.task.running) followTask(s.task.name)
 
   video.addEventListener('timeupdate', () => { if (video.paused) onFrame() })
@@ -258,6 +272,10 @@ function renderRegions() {
     const r = regions.addRegion({ id: seg.id, start: seg.start, end: seg.end, color: colorOf(seg), drag: true, resize: true })
     regionById.set(seg.id, r)
   }
+  // F4: clearRegions() снёс и янтарную подсветку выбранного клипа — вернуть её.
+  clipHlRegion = null
+  const ac = (st.clipsData || []).find((c) => String(c.id) === st.clipsActive)
+  if (ac) clipHlRegion = regions.addRegion({ id: 'clip-hl', start: ac.start, end: ac.end, color: CLIP_HL_COLOR, drag: false, resize: false })
   st.addingRegion = false
 }
 const refreshRegionColor = (id) => { const r = regionById.get(id), s = segOf(id); if (r && s) r.setOptions({ color: colorOf(s) }) }
@@ -514,9 +532,52 @@ async function loadChapters() {
   // Задача запущена — следим по SSE (renderChapters вызовется в followTask).
   followTask('preview_chapters')
 }
+// ---- Аккордеон вторичных панелей (Главы/Метаданные/Клипы) -------------------
+// Свёрнутая панель = одна 40px-шапка; данные приехали → панель раскрывается
+// сама (setPanelExpanded из render*-функций). Состояние — в localStorage.
+const ACC_PANELS = ['chaptersPanel', 'metadataPanel', 'clipsPanel']
+
+function setPanelExpanded(panelId, expanded) {
+  const p = document.getElementById(panelId); if (!p) return
+  p.classList.toggle('collapsed', !expanded)
+  const head = p.querySelector('.accHead')
+  if (head) head.setAttribute('aria-expanded', String(!!expanded))
+  try { localStorage.setItem('fve_acc_' + panelId, expanded ? '1' : '0') } catch {}
+  // Режим «один открыт»: вторичных панелей три, а вертикаль одна — раскрытие
+  // одной сворачивает остальные, и место всегда сходится на любом экране.
+  if (expanded) {
+    for (const other of ACC_PANELS) if (other !== panelId) {
+      const o = document.getElementById(other)
+      if (o && !o.classList.contains('collapsed')) setPanelExpanded(other, false)
+    }
+  }
+}
+
+function bindAccordion() {
+  for (const id of ACC_PANELS) {
+    const p = document.getElementById(id); if (!p) continue
+    const head = p.querySelector('.accHead'); if (!head) continue
+    // Восстановить сохранённое состояние (дефолт — свёрнуто, как в разметке).
+    let saved = null
+    try { saved = localStorage.getItem('fve_acc_' + id) } catch {}
+    if (saved === '1') setPanelExpanded(id, true)
+    const toggle = (e) => {
+      // Кнопки в шапке («Предпросмотр глав», «Сгенерировать», ⚙…) — действия,
+      // а не сворачивание: их клики аккордеон не трогает.
+      if (e.target.closest('button')) return
+      setPanelExpanded(id, p.classList.contains('collapsed'))
+    }
+    head.onclick = toggle
+    head.onkeydown = (e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(e) }
+    }
+  }
+}
+
 // Главы приходят в КООРДИНАТАХ ФИНАЛА; клик → seek(finalToOrig(time)).
 function renderChapters(chapters) {
   st.chaptersData = chapters || []
+  if (st.chaptersData.length) setPanelExpanded('chaptersPanel', true)
   const box = $('#chaptersList'); if (!box) return
   box.replaceChildren()
   if (!st.chaptersData.length) {
@@ -562,6 +623,7 @@ function renderMetadata(meta) {
   set('#metaHook', hook)
   const len = $('#metaTitleLen')
   if (len) len.textContent = title ? `(${title.length}/100)` : ''
+  if (title || desc || tags || hook) setPanelExpanded('metadataPanel', true)
 }
 // Текущее содержимое поля берём из DOM (пользователь мог отредактировать вручную).
 function metaFieldText(field) {
@@ -592,6 +654,273 @@ async function copyAllMeta() {
   if (await copyToClipboard(all)) toast('Скопировано всё', 'success')
 }
 
+/* ---------- F4: Clip Maker — кандидаты Shorts (план §4) ---------- */
+// Кандидаты живут в ОРИГИНАЛЬНЫХ координатах; eff-длительность считается НА
+// ФРОНТЕ через карту финального таймлайна (origToFinal/keptSegments) — сервер
+// для этого не нужен, и число живо реагирует на правки вырезов.
+function clipEffDur(c) { return Math.max(0, origToFinal(c.end) - origToFinal(c.start)) }
+
+// Пресет рендера клипов (модалка ⚙) — живёт в localStorage (план §4.4).
+const CLIPS_OPTS_KEY = 'fve_clips_opts'
+function clipsOptsLoad() {
+  let o = {}
+  try { o = JSON.parse(localStorage.getItem(CLIPS_OPTS_KEY) || '{}') || {} } catch { o = {} }
+  return {
+    vertical: o.vertical !== false,            // дефолт: вкл — канон Shorts (§1.2)
+    center: o.center === 'manual' ? 'manual' : 'auto',
+    center_pos: (typeof o.center_pos === 'number' && o.center_pos >= 0 && o.center_pos <= 1) ? o.center_pos : 0.5,
+    burn: o.burn !== false,                    // дефолт: вкл — караоке-капшены
+    out_dir: typeof o.out_dir === 'string' ? o.out_dir : '',
+  }
+}
+function clipsOptsStore(o) { try { localStorage.setItem(CLIPS_OPTS_KEY, JSON.stringify(o)) } catch {} }
+
+function openClipsModal() {
+  const o = clipsOptsLoad()
+  $('#cVertical').checked = o.vertical
+  $('#cCenterMode').value = o.center
+  $('#cCenterRow').classList.toggle('hidden', o.center !== 'manual')
+  $('#cCenterPos').value = Math.round(o.center_pos * 100)
+  $('#cCenterVal').textContent = Math.round(o.center_pos * 100) + '%'
+  $('#cBurn').checked = o.burn
+  $('#cOutDir').value = o.out_dir || st.outDir || ''
+  openOverlay('#clipsModal')
+}
+function saveClipsOpts() {
+  clipsOptsStore({
+    vertical: $('#cVertical').checked,
+    center: $('#cCenterMode').value === 'manual' ? 'manual' : 'auto',
+    center_pos: Math.max(0, Math.min(100, parseInt($('#cCenterPos').value, 10) || 0)) / 100,
+    burn: $('#cBurn').checked,
+    out_dir: $('#cOutDir').value.trim(),
+  })
+  closeOverlay('#clipsModal')
+  toast('Настройки рендера клипов сохранены', 'success')
+}
+
+// render_opts для POST /api/clips/render (план §2.4): пресет модалки + текущие
+// кодек/качество/громкость редактора. chapters/metadata сервер прибивает в
+// false и сам, но шлём честно — контракт виден в запросе.
+function clipsRenderOpts() {
+  const o = clipsOptsLoad()
+  const d = st.rdefaults || {}
+  const opts = {
+    ...currentRenderOpts(),
+    subtitles: false, chapters: false, metadata: false,
+    vertical: !!o.vertical,
+    denoise_loudnorm: !!d.denoise_loudnorm,
+    loudnorm_mode: d.loudnorm_mode === '2pass' ? '2pass' : 'dynamic',
+    out_dir: o.out_dir || st.outDir || '',
+  }
+  if (d.cut_fade != null) opts.cut_fade = d.cut_fade
+  if (o.vertical) {
+    opts.vertical_target = '1080x1920'
+    opts.vertical_center = o.center === 'manual' ? o.center_pos : 'auto'
+  }
+  if (o.burn) { opts.burn_subtitles = true; opts.burn_style = { karaoke: true } }
+  else opts.burn_subtitles = false
+  return opts
+}
+
+// «Предложить клипы» — фоновая задача preview_clips (паттерн loadChapters).
+async function loadClips() {
+  if (st.task) { toast('Дождись завершения задачи перед подбором клипов', 'info'); return }
+  let res
+  try { res = await fetch('/api/clips/suggest', { method: 'POST' }) }
+  catch (e) { toast('Сеть: не удалось запросить клипы (' + e.message + ')', 'error'); return }
+  if (!res.ok) { await failToast(res, 'Не удалось запустить подбор клипов'); return }
+  let j; try { j = await res.json() } catch { j = {} }
+  if (j && j.ok === false && j.reason === 'llm_off') {
+    toast('LLM выключена — клипы недоступны. Включи Ollama (модель qwen3:8b).', 'info'); return
+  }
+  followTask('preview_clips')
+}
+
+// Восстановление панели при открытии файла: GET /api/clips (кэш clips.json).
+// stale (хэш от другого входа) и пустота — молча оставляем placeholder.
+async function loadClipsFromCache() {
+  let j
+  try { const r = await fetch('/api/clips'); if (!r.ok) return; j = await r.json() } catch { return }
+  if (j && Array.isArray(j.clips) && j.clips.length && !j.stale) renderClips(j.clips)
+}
+
+function renderClips(clips) {
+  st.clipsData = (Array.isArray(clips) ? clips.slice() : [])
+    .filter((c) => c && typeof c === 'object')
+    .sort((a, b) => (b.score || 0) - (a.score || 0))
+  if (st.clipsData.length) setPanelExpanded('clipsPanel', true)
+  // Выбор/подсветка/результаты переживают пере-рендер, но не смену набора.
+  const ids = new Set(st.clipsData.map((c) => String(c.id)))
+  st.clipsSel = new Set([...st.clipsSel].filter((id) => ids.has(id)))
+  for (const id of [...st.clipsResults.keys()]) if (!ids.has(id)) st.clipsResults.delete(id)
+  if (st.clipsActive && !ids.has(st.clipsActive)) { st.clipsActive = null; clipsHighlight(null) }
+  const box = $('#clipsList'); if (!box) return
+  box.replaceChildren(); clipEls.clear()
+  if (!st.clipsData.length) {
+    const ph = document.createElement('div'); ph.className = 'empty placeholder'
+    ph.innerHTML = icon('film') + '<div>Достойных кандидатов не нашлось — попробуйте после правки вырезов</div>'
+    box.appendChild(ph); updateClipsFoot(); return
+  }
+  st.clipsData.forEach((c, i) => box.appendChild(clipCard(c, i)))
+  updateClipsFoot()
+}
+
+// Карточка кандидата (план §4.2, решение №1: ранг #N + скор-полоса, число —
+// только в title-tooltip). Все юзер-данные — ТОЛЬКО через textContent/title.
+function clipCard(c, i) {
+  const id = String(c.id || 'c' + (i + 1))
+  const row = document.createElement('div')
+  row.className = 'clip-row' + (st.clipsActive === id ? ' sel' : '')
+  if (c.reason) row.title = String(c.reason)            // причина от LLM — tooltip
+  const score = Math.max(0, Math.min(100, Math.round(c.score || 0)))
+
+  const cb = document.createElement('input')
+  cb.type = 'checkbox'; cb.className = 'csel'; cb.checked = st.clipsSel.has(id)
+  cb.setAttribute('aria-label', 'Выбрать клип для рендера')
+  cb.onclick = (e) => e.stopPropagation()
+  cb.onchange = () => { if (cb.checked) st.clipsSel.add(id); else st.clipsSel.delete(id); updateClipsFoot() }
+
+  const rank = document.createElement('div'); rank.className = 'clipRank'
+  rank.title = `Скор: ${score}/100`
+  const rn = document.createElement('span'); rn.className = 'rankN'; rn.textContent = '#' + (i + 1)
+  const bar = document.createElement('div'); bar.className = 'scoreBar'
+  const fill = document.createElement('i'); fill.style.width = score + '%'
+  bar.appendChild(fill); rank.appendChild(rn); rank.appendChild(bar)
+
+  const meta = document.createElement('div'); meta.className = 'cmeta'
+  const hook = document.createElement('div'); hook.className = 'clipHook'
+  hook.textContent = c.hook_phrase || 'Без названия'
+  const line = document.createElement('div'); line.className = 'tline muted'
+  const tc = document.createElement('span'); tc.textContent = `${fmt(c.start)}–${fmt(c.end)}`
+  const eff = document.createElement('span'); eff.className = 'clipEff'
+  eff.textContent = `~${Math.round(clipEffDur(c))}с`
+  eff.title = 'Эффективная длительность — за вычетом внутренних вырезов'
+  line.appendChild(tc); line.appendChild(eff)
+  if (c.fuzzy_boundary) {
+    const b = document.createElement('span'); b.className = 'clipBadge'
+    b.textContent = '~граница'; b.title = 'Граница определена неточно — проверьте начало и конец'
+    line.appendChild(b)
+  }
+  if (c.short) {
+    const b = document.createElement('span'); b.className = 'clipBadge'
+    b.textContent = 'коротковат'; b.title = '15–20 секунд — короче целевых 20–40'
+    line.appendChild(b)
+  }
+  meta.appendChild(hook); meta.appendChild(line)
+
+  const acts = document.createElement('div'); acts.className = 'acts'
+  const play = document.createElement('button')
+  play.innerHTML = icon('play'); play.title = 'Предпросмотр диапазона'
+  play.setAttribute('aria-label', 'Предпросмотр клипа')
+  play.onclick = (e) => { e.stopPropagation(); clipsPreview(c, id) }
+  acts.appendChild(play)
+
+  row.appendChild(cb); row.appendChild(rank); row.appendChild(meta); row.appendChild(acts)
+  const resBox = document.createElement('div'); resBox.className = 'clipResult hidden'
+  row.appendChild(resBox)
+  clipEls.set(id, { row, eff, res: resBox })
+  applyClipResult(id, st.clipsResults.get(id))
+
+  row.onclick = () => clipsSetActive(st.clipsActive === id ? null : id)
+  return row
+}
+
+// Выбор карточки: рамка + seek на старт + янтарный регион на волне; повторный
+// клик/Escape снимает выбор и убирает регион (план §4.2).
+function clipsSetActive(id) {
+  st.clipsActive = id || null
+  st._clipPreviewEnd = null            // смена выбора отменяет ждущую авто-паузу
+  for (const [cid, els] of clipEls) els.row.classList.toggle('sel', cid === st.clipsActive)
+  const c = st.clipsData.find((x) => String(x.id) === st.clipsActive)
+  clipsHighlight(c || null)
+  if (c) seek(c.start)
+}
+function clipsHighlight(c) {
+  if (!regions) return
+  st.addingRegion = true
+  if (clipHlRegion) { try { clipHlRegion.remove() } catch {} clipHlRegion = null }
+  if (c) clipHlRegion = regions.addRegion({ id: 'clip-hl', start: c.start, end: c.end, color: CLIP_HL_COLOR, drag: false, resize: false })
+  st.addingRegion = false
+}
+
+// ▶ — предпросмотр диапазона: seek(start), play с пропуском внутренних вырезов,
+// авто-пауза на end (срабатывает в onFrame). Прежний выбор «пропускать вырезы»
+// восстанавливается после авто-паузы.
+function clipsPreview(c, id) {
+  clipsSetActive(id)
+  st._clipPrevPreview = st.preview
+  st.preview = true
+  const skip = $('#skipCuts'); if (skip) skip.checked = true
+  st._clipPreviewEnd = c.end
+  seek(c.start)
+  video.play()
+}
+
+function updateClipsFoot() {
+  const n = st.clipsSel.size
+  const cnt = $('#clipsSelCount'); if (cnt) cnt.textContent = String(n)
+  const foot = $('#clipsFoot'); if (foot) foot.classList.toggle('hidden', n === 0)
+}
+// Вырезы изменились → eff-длительности карточек пересчитать (вызов из refreshCuts).
+function updateClipsEff() {
+  for (const c of st.clipsData) {
+    const els = clipEls.get(String(c.id)); if (!els) continue
+    els.eff.textContent = `~${Math.round(clipEffDur(c))}с`
+  }
+}
+
+// «Рендерить выбранные (N)» → одна фоновая задача render_clips (план §2.4).
+async function clipsRender() {
+  if (st.task) { toast('Дождись завершения текущей задачи', 'info'); return }
+  const chosen = st.clipsData.filter((c) => st.clipsSel.has(String(c.id)))
+  if (!chosen.length) { toast('Выбери хотя бы один клип — чекбокс на карточке', 'info'); return }
+  await save()   // сервер режет по своему live-катлисту — зафиксировать правки
+  const stem = ($('#filename').textContent || 'clip').replace(/\.[^.]+$/, '')
+  const body = {
+    clips: chosen.map((c, i) => ({
+      start: c.start, end: c.end,
+      filename: `${stem}_clip${String(i + 1).padStart(2, '0')}`,
+    })),
+    render_opts: clipsRenderOpts(),
+  }
+  st._clipsRenderIds = chosen.map((c) => String(c.id))
+  let res
+  try { res = await fetch('/api/clips/render', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }) }
+  catch (e) { toast('Сеть: не удалось запустить рендер клипов (' + e.message + ')', 'error'); return }
+  if (!res.ok) { await failToast(res, 'Не удалось запустить рендер клипов'); return }
+  followTask('render_clips')
+}
+
+// Результаты render_clips → на карточки: ссылка на mp4 или текст ошибки.
+// Порядок results совпадает с порядком clips в POST (st._clipsRenderIds).
+function applyClipRenderResults(results) {
+  const ids = st._clipsRenderIds || []
+  ;(results || []).forEach((r, i) => {
+    const id = ids[i]; if (!id) return
+    st.clipsResults.set(id, r)
+    applyClipResult(id, r)
+  })
+}
+function applyClipResult(id, r) {
+  const els = clipEls.get(id); if (!els || !r) return
+  const box = els.res
+  box.classList.remove('hidden', 'error')
+  box.replaceChildren()
+  if (r.ok) {
+    const base = (typeof r.mp4 === 'string' && r.mp4) ? r.mp4.split(/[\\/]/).pop()
+      : ((r.filename || 'clip') + '.mp4')
+    const a = document.createElement('a')
+    a.href = '/api/output/' + encodeURIComponent(base)
+    a.target = '_blank'
+    a.textContent = 'Открыть ' + base
+    a.onclick = (e) => e.stopPropagation()
+    box.appendChild(a)
+  } else {
+    box.classList.add('error')
+    box.textContent = 'Ошибка: ' + (r.error || 'неизвестная')
+  }
+}
+
 function refreshCuts() {
   // Always recompute from current segs: callers mutate st.segs then call us
   // BEFORE markDirty() invalidates the memo, so a stale st._merged would make
@@ -607,6 +936,7 @@ function refreshCuts() {
     sp.classList.toggle('cut', st.showCuts && insideRemoved(mid) != null)
   }
   updateKept()
+  updateClipsEff()        // F4: eff-длительность карточек клипов зависит от вырезов
   scheduleAfterRedraw()   // вырезы изменились → перерисовать «После»-полосу (debounced)
 }
 function updateKept() {
@@ -815,6 +1145,17 @@ function loop() { onFrame(); raf = requestAnimationFrame(loop) }
 function onFrame() {
   const t = video.currentTime
   if (st.preview && !video.paused) { const iv = insideRemoved(t); if (iv) { video.currentTime = iv[1] + 0.02; return } }
+  // F4: ▶-предпросмотр клипа — авто-пауза на конце диапазона (план §4.2);
+  // вернуть прежний выбор «пропускать вырезы» (кроме режима «После» — он сам
+  // держит пропуск включённым).
+  if (st._clipPreviewEnd != null && t >= st._clipPreviewEnd - 0.03) {
+    st._clipPreviewEnd = null
+    video.pause()
+    if (!st.afterMode) {
+      st.preview = !!st._clipPrevPreview
+      const sk = $('#skipCuts'); if (sk) sk.checked = st.preview
+    }
+  }
   $('#tcCur').textContent = fmtcs(t)
   updatePlayhead(); highlight(t + st.syncOffset)
   if (st.afterMode) {
@@ -934,7 +1275,7 @@ async function doSave() {
 function setRunning(name) {
   st.task = name || null
   const busy = !!name
-  for (const id of ['#btnTranscribe', '#btnRedetect', '#btnRender', '#btnChaptersToggle', '#btnMetaGenerate']) { const b = $(id); if (b) b.disabled = busy }
+  for (const id of ['#btnTranscribe', '#btnRedetect', '#btnRender', '#btnChaptersToggle', '#btnMetaGenerate', '#btnClipsSuggest', '#btnClipsRender']) { const b = $(id); if (b) b.disabled = busy }
   const cancel = $('#btnCancelTask'); if (cancel) cancel.classList.toggle('hidden', !busy)
 }
 async function cancelTask() {
@@ -975,6 +1316,9 @@ function followTask(name) {
         // A cancelled LLM chapters task may have finished anyway — keep results.
         if (t.name === 'preview_chapters' && t.results && (t.results.chapters || []).length) renderChapters(t.results.chapters)
         if (t.name === 'preview_metadata' && t.results && t.results.metadata) renderMetadata(t.results.metadata)
+        // F4: отменённый render_clips сохраняет частичные результаты — показать
+        // готовые клипы/ошибки на карточках (план §2.4: «остальные не теряются»).
+        if (t.name === 'render_clips' && t.results && t.results.clips) applyClipRenderResults(t.results.clips)
         if (t.cancelled || t.error === 'cancelled') toast('Задача отменена', 'info')
         else toast('Ошибка задачи: ' + t.error, 'error')
         return
@@ -984,6 +1328,17 @@ function followTask(name) {
       if (t.name === 'render' && t.results) { toast('Рендер завершён', 'success'); showResults(t.results) }
       if (t.name === 'preview_chapters' && t.results) { renderChapters(t.results.chapters || []); toast('Главы готовы', 'success') }
       if (t.name === 'preview_metadata' && t.results && t.results.metadata) { renderMetadata(t.results.metadata); toast('Метаданные готовы', 'success') }
+      if (t.name === 'preview_clips' && t.results) {
+        const cl = t.results.clips || []
+        renderClips(cl)
+        toast(cl.length ? `Найдено кандидатов: ${cl.length}` : 'Достойных кандидатов не нашлось', cl.length ? 'success' : 'info')
+      }
+      if (t.name === 'render_clips' && t.results && t.results.clips) {
+        const rs = t.results.clips
+        applyClipRenderResults(rs)
+        const ok = rs.filter((r) => r && r.ok).length
+        toast(`Готово: ${ok}/${rs.length} клипов`, ok === rs.length ? 'success' : 'error')
+      }
     }
   }
 }
@@ -1238,7 +1593,7 @@ function showResults(r) {
 
 /* ---------- modal / overlay management (a11y) ---------- */
 let lastFocus = null
-const OVERLAY_IDS = ['#help', '#results', '#files', '#renderModal', '#queueModal', '#privacyModal', '#modelsModal']
+const OVERLAY_IDS = ['#help', '#results', '#files', '#renderModal', '#queueModal', '#privacyModal', '#modelsModal', '#clipsModal']
 function openOverlay(id) {
   const ov = $(id); if (!ov) return
   lastFocus = document.activeElement
@@ -1316,8 +1671,23 @@ function bindUI() {
   $('#skipCuts').onchange = (e) => { if (st.afterMode) { e.target.checked = true; return } st.preview = e.target.checked }
   $('#btnAfterToggle').onclick = () => setAfterMode(!st.afterMode)
   $('#btnSubsToggle').onclick = () => setSubsMode(!st.subsMode)
-  $('#btnChaptersToggle').onclick = loadChapters
-  $('#btnMetaGenerate').onclick = loadMetadata
+  // Кнопка-действие в шапке раскрывает свою панель: результат/прогресс видно сразу.
+  $('#btnChaptersToggle').onclick = () => { setPanelExpanded('chaptersPanel', true); loadChapters() }
+  $('#btnMetaGenerate').onclick = () => { setPanelExpanded('metadataPanel', true); loadMetadata() }
+  bindAccordion()
+  // F4 — Clip Maker: панель + модалка пресета рендера клипов
+  $('#btnClipsSuggest').onclick = () => { setPanelExpanded('clipsPanel', true); loadClips() }
+  $('#btnClipsRender').onclick = clipsRender
+  $('#btnClipsSettings').onclick = openClipsModal
+  $('#btnCloseClips').onclick = () => closeOverlay('#clipsModal')
+  $('#btnClipsOptsCancel').onclick = () => closeOverlay('#clipsModal')
+  $('#btnClipsOptsSave').onclick = saveClipsOpts
+  $('#cCenterMode').onchange = (e) => $('#cCenterRow').classList.toggle('hidden', e.target.value !== 'manual')
+  $('#cCenterPos').oninput = (e) => { const el = $('#cCenterVal'); if (el) el.textContent = e.target.value + '%' }
+  $('#cBrowseOut').onclick = () => {
+    $('#clipsModal').classList.add('hidden')
+    openFiles(true, (dir) => { if (dir) $('#cOutDir').value = dir; openOverlay('#clipsModal') })
+  }
   for (const el of document.querySelectorAll('.metaCopyBtn')) { el.onclick = () => copyField(el.dataset.field) }
   $('#btnMetaCopyAll').onclick = copyAllMeta
   $('#metaTitle').addEventListener('input', () => { const l = $('#metaTitleLen'); const t = ($('#metaTitle').textContent || '').trim(); if (l) l.textContent = t ? `(${t.length}/100)` : '' })
@@ -1427,7 +1797,7 @@ function bindKeys() {
     else if (k === ';' || k === 'ж') { st.syncOffset = Math.round((st.syncOffset - 0.05) * 100) / 100; saveSync() }
     else if (k === "'" || k === 'э') { st.syncOffset = Math.round((st.syncOffset + 0.05) * 100) / 100; saveSync() }
     else if (k === '?' || k === 'h') openOverlay('#help')
-    else if (k === 'Escape') { window.getSelection().removeAllRanges(); $('#cutFloat').classList.add('hidden'); st.selected = null; renderCutlist() }
+    else if (k === 'Escape') { window.getSelection().removeAllRanges(); $('#cutFloat').classList.add('hidden'); st.selected = null; clipsSetActive(null); renderCutlist() }
   })
 }
 

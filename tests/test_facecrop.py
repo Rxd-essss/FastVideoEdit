@@ -349,6 +349,71 @@ def test_create_yunet_none_when_api_missing(monkeypatch, tmp_path):
     assert fc._create_yunet(1920, 1080) is None
 
 
+# --- F2 (план §2.3.3): detect_center samples only within [start, end] ---------
+def _seek_times(monkeypatch, *, total_frames=500.0, fps=25.0):
+    """Record cap.set(POS_FRAMES) seeks; return the list of seeked timestamps."""
+    seeks: list[float] = []
+    monkeypatch.setattr(
+        _FakeCap, "get",
+        lambda self, prop: {1: fps, 3: 1920.0, 4: 1080.0,
+                            7: total_frames}.get(prop, 0.0))
+    monkeypatch.setattr(
+        _FakeCap, "set",
+        lambda self, prop, val: seeks.append(val / fps) if prop == 2 else None)
+    return seeks
+
+
+def _yunet_ready(monkeypatch, tmp_path, cx=0.7):
+    model = tmp_path / "m.onnx"
+    model.write_bytes(b"onnx")
+    monkeypatch.setattr(fc, "yunet_model_path", lambda: model)
+    _fake_cv2(monkeypatch, yunet_faces=[_yunet_row(cx, 0.9)])
+
+
+def test_detect_center_samples_only_within_range(monkeypatch, tmp_path):
+    _yunet_ready(monkeypatch, tmp_path)
+    ts = _seek_times(monkeypatch)
+    val = fc.detect_center("fake.mp4", None, 20.0, samples=4,
+                           start=5.0, end=15.0, log=lambda m: None)
+    assert abs(val - 0.7) < 1e-6
+    assert len(ts) == 4
+    assert all(5.0 <= t <= 15.0 for t in ts)
+    # точные сэмплы: t = start + (end-start)*(i+0.5)/n -> 6.25, 8.75, 11.25, 13.75
+    expected = [5.0 + 10.0 * (i + 0.5) / 4 for i in range(4)]
+    assert ts == [int(t * 25.0) / 25.0 for t in expected]
+
+
+def test_detect_center_default_range_is_old_whole_file_behavior(monkeypatch,
+                                                                tmp_path):
+    # Дефолты (start=0, end=None) = прежняя формула duration*(i+0.5)/n бит-в-бит.
+    _yunet_ready(monkeypatch, tmp_path)
+    ts = _seek_times(monkeypatch, total_frames=250.0)
+    fc.detect_center("fake.mp4", None, 10.0, samples=4, log=lambda m: None)
+    old = [int(10.0 * (i + 0.5) / 4 * 25.0) / 25.0 for i in range(4)]
+    assert ts == old
+
+
+def test_detect_center_end_clamped_to_duration(monkeypatch, tmp_path):
+    _yunet_ready(monkeypatch, tmp_path)
+    ts = _seek_times(monkeypatch, total_frames=250.0)
+    fc.detect_center("fake.mp4", None, 10.0, samples=4,
+                     start=5.0, end=15.0, log=lambda m: None)
+    assert all(5.0 <= t <= 10.0 for t in ts)    # end заклампен к длительности
+
+
+def test_detect_center_garbage_range_falls_back_to_whole_file(monkeypatch,
+                                                              tmp_path):
+    _yunet_ready(monkeypatch, tmp_path)
+    ts = _seek_times(monkeypatch, total_frames=250.0)
+    # start за концом файла -> весь файл; инвертированный диапазон -> весь файл
+    fc.detect_center("fake.mp4", None, 10.0, samples=4,
+                     start=50.0, end=60.0, log=lambda m: None)
+    fc.detect_center("fake.mp4", None, 10.0, samples=4,
+                     start=8.0, end=3.0, log=lambda m: None)
+    old = [int(10.0 * (i + 0.5) / 4 * 25.0) / 25.0 for i in range(4)]
+    assert ts == old + old
+
+
 def test_vendored_yunet_model_is_real():
     # The downloaded artifact must be the actual onnx (~230 KB), not an
     # LFS pointer stub (~130 bytes) and not missing.

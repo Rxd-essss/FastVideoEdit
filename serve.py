@@ -10,14 +10,17 @@ Nothing leaves the machine.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
+import math
 import os
 import sys
 import threading
 import time
 import uuid
 import webbrowser
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 for _s in (sys.stdout, sys.stderr):   # Windows consoles default to cp1251
@@ -55,6 +58,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 import anyio
 
 from vpipe import chapters as chapters_mod
+from vpipe import clips as clips_mod
 from vpipe import facecrop as facecrop_mod
 from vpipe import ffmpeg_utils
 from vpipe import metadata as metadata_mod
@@ -68,7 +72,8 @@ from vpipe.detect import run_detection
 from vpipe.detect.profanity import ProfanityMatcher
 from vpipe.ffmpeg_utils import FFmpeg
 from vpipe.llm import OllamaClient, get_client
-from vpipe.models import CutList, Transcript, TYPE_MANUAL
+from vpipe.models import (ACTION_REMOVE, CutList, CutSegment, Transcript,
+                          TYPE_MANUAL)
 from vpipe.probe import extract_audio, hash_input, probe_media
 from vpipe.timeline import Timeline, remap_words
 from vpipe.transcribe import transcribe_audio
@@ -576,6 +581,11 @@ def _resolve_render_opts(s: Session, opts: dict):
         cfg.subtitles.enabled = bool(opts["subtitles"])
     if "chapters" in opts:
         cfg.chapters.enabled = bool(opts["chapters"])
+    # Clip Maker (план §2.3.2): явный тумблер LLM-метаданных. Без ключа —
+    # прежнее поведение (значение из config.yaml); рендер клипов шлёт false,
+    # иначе КАЖДЫЙ клип гонял бы LLM и перезаписывал общий metadata.txt.
+    if "metadata" in opts:
+        cfg.metadata.enabled = bool(opts["metadata"])
 
     # --- A: burn-in (вшитые) subtitles + style -------------------------------
     if opts.get("burn_subtitles"):
@@ -705,14 +715,22 @@ def _resolve_render_opts(s: Session, opts: dict):
 
 
 def _run_render_pipeline(s: Session, cfg, scale_h, fps, out_dir: Path,
-                         base: Path, on_progress, on_stage) -> dict:
+                         base: Path, on_progress, on_stage,
+                         cutlist_override: Optional[CutList] = None) -> dict:
     """Render mp4 + (optional) subtitles + chapters, returning the results dict.
 
     ``on_progress(frac)`` / ``on_stage(msg)`` are callbacks so the same body
     drives both the editor task (writes Session.task) and a queue job (writes
     QueueJob.percent/stage). Mirrors do_render: the mp4 is the irreplaceable
-    artifact — a subtitles/chapters failure must NOT lose it."""
-    cl, tr = s.cutlist, s.transcript
+    artifact — a subtitles/chapters failure must NOT lose it.
+
+    ``cutlist_override`` (Clip Maker, план §2.3.1): render against THIS cutlist
+    instead of the session's (one Shorts clip = the live internal cuts plus
+    boundary REMOVEs around [start, end]). Burn-in ASS subs and the Timeline are
+    built from the SAME cutlist, and the session is never mutated. ``None``
+    (the default) keeps the legacy single-render behavior bit-for-bit."""
+    cl = cutlist_override or s.cutlist
+    tr = s.transcript
     removed, _ = resolve(cl)
 
     # C: vertical 9:16 Shorts crop. Detect the face X-center (center='auto') once
@@ -730,8 +748,18 @@ def _run_render_pipeline(s: Session, cfg, scale_h, fps, out_dir: Path,
         if vcfg.center == "auto":
             if facecrop_mod.cv2_available():
                 on_stage("Поиск лица для авто-кадра…")
+            # Clip Maker (план §2.4): для клипа сэмплируем лицо ТОЛЬКО внутри
+            # его диапазона (спикер мог сместиться за 26 минут). Диапазон —
+            # выживший спан override-катлиста (граничные REMOVE его и задают);
+            # без override дефолты detect_center = прежний проход по всему файлу.
+            fc_start, fc_end = 0.0, None
+            if cutlist_override is not None:
+                kept = Timeline(removed, s.media.duration).kept_segments()
+                if kept:
+                    fc_start, fc_end = kept[0][0], kept[-1][1]
             cx = facecrop_mod.detect_center(
-                s.media.path, s.ff, s.media.duration, samples=vcfg.samples)
+                s.media.path, s.ff, s.media.duration, samples=vcfg.samples,
+                start=fc_start, end=fc_end)
         else:
             try:
                 cx = min(1.0, max(0.0, float(vcfg.center)))
@@ -764,7 +792,11 @@ def _run_render_pipeline(s: Session, cfg, scale_h, fps, out_dir: Path,
                 src_w = s.media.width or 1920
                 src_h = s.media.height or 1080
                 out_w = int(round(src_w * out_h / src_h)) if src_h else 1920
-            ass_file = Path(s.work_dir) / "burn.ass"
+            # Clip Maker (план §2.3.4): per-clip имя ASS, чтобы клипы цикла не
+            # перетирали один burn.ass; обычный рендер — прежнее имя бит-в-бит.
+            ass_name = ("burn.ass" if cutlist_override is None
+                        else f"burn_{base.name}.ass")
+            ass_file = Path(s.work_dir) / ass_name
             subs_mod.write_ass(
                 cues_ass, ass_file, cfg.subtitles.burn,
                 karaoke=cfg.subtitles.burn.karaoke,
@@ -1779,6 +1811,211 @@ def preview_metadata():
 
     s.start_task("preview_metadata", run)
     return {"ok": True}
+
+
+# --- Clip Maker (план §2.4–2.5): suggest / cache / render ---------------------
+def _clips_json_path(s: Session) -> Path:
+    """``out/<stem>.clips.json`` — где живут кандидаты клипов (план §2.5)."""
+    return s.out_dir / f"{s.inp.stem}.clips.json"
+
+
+def _save_clips_json(s: Session, cands: list) -> None:
+    """Persist clip candidates atomically (.tmp -> os.replace), формат §2.5.
+
+    Best-effort like the other persistence helpers (_save_queue & co): the
+    task's ``results`` dict is the source of truth for the UI; this file only
+    feeds ``GET /api/clips`` when the video is reopened, so a failed write must
+    never lose a 2.5-minute LLM pass.
+    """
+    payload = {
+        "version": 1,
+        "hash": s.audio_hash,
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "model": s.cfg.llm.model,
+        "clips": [asdict(c) for c in cands],
+    }
+    p = _clips_json_path(s)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                       encoding="utf-8")
+        os.replace(tmp, p)
+    except OSError:
+        pass  # non-fatal: candidates are already in task['results']
+
+
+def _load_clips_json(s: Session) -> Optional[dict]:
+    """Read ``out/<stem>.clips.json``. Missing/corrupt/wrong shape -> ``None``
+    (never raises). Hash freshness is judged by the caller (GET /api/clips),
+    which needs to distinguish «нет файла» from «файл от другого входа»."""
+    try:
+        data = json.loads(_clips_json_path(s).read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 — missing / unreadable / bad JSON
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("clips"), list):
+        return None
+    return data
+
+
+@app.post("/api/clips/suggest")
+def clips_suggest():
+    """Кандидаты Shorts от локальной LLM. Медленно (окна × qwen3) → фоновая
+    задача ``preview_clips``.
+
+    Паттерн /api/preview/chapters: без LLM — мгновенный 200
+    ``{ok:false, reason:'llm_off'}`` БЕЗ задачи (честный тост; фолбэк-нарезки
+    без LLM нет — решение основателя). Результат кладётся в
+    ``task['results']['clips']`` и кэшируется в out/<stem>.clips.json, чтобы
+    повторное открытие видео заполняло панель без LLM.
+    """
+    s = S()
+    if s.transcript is None or s.cutlist is None:
+        raise HTTPException(409, "Transcribe and detect first")
+    if s.llm is None:
+        return {"ok": False, "reason": "llm_off"}
+    _guard_no_task()
+
+    def run():
+        s.stage("Клипы…")
+        cands = clips_mod.suggest(
+            s.transcript, s.cutlist, s.cfg.clips, s.cfg.llm, s.llm,
+            log=lambda *_: None,
+            on_progress=s.set_progress, on_stage=s.stage)
+        _save_clips_json(s, cands)
+        s.task["results"] = {"clips": [asdict(c) for c in cands]}
+
+    s.start_task("preview_clips", run)
+    return {"ok": True}
+
+
+@app.get("/api/clips")
+def get_clips():
+    """Сохранённые кандидаты (clips.json) — для восстановления панели при
+    открытии файла, без LLM. Hash-валидация: файл от другого входа честно
+    помечается ``stale:true`` и не показывается (план §2.4)."""
+    s = S()
+    data = _load_clips_json(s)
+    if data is None:
+        return {"clips": []}
+    if data.get("hash") != s.audio_hash:
+        return {"clips": [], "stale": True}
+    return {"clips": data["clips"], "stale": False,
+            "generated_at": data.get("generated_at"),
+            "model": data.get("model")}
+
+
+@app.post("/api/clips/render")
+def clips_render(body: dict = Body(default={})):
+    """Рендер выбранных клипов — ОДНА фоновая задача ``render_clips`` (план §2.4).
+
+    НЕ через F3-очередь (зафиксированное решение): очередь строит новую Session
+    per job и пере-детектирует катлист — выбрасывая кураторские правки
+    enable/disable. Здесь — цикл по клипам в живой сессии: на каждый клип копия
+    live-катлиста + 2 граничных REMOVE вокруг [start, end], рендер через
+    ``_run_render_pipeline(cutlist_override=…)`` (сессия не мутируется).
+
+    Серверные гарантии: ``chapters``/``metadata`` принудительно false
+    независимо от клиента (иначе каждый клип гонял бы LLM и перетирал общий
+    metadata.txt); упавший клип не валит остальные; /api/cancel останавливает
+    цикл между клипами (частичные результаты сохраняются);
+    percent = (i+f)/N, stage «Клип i/N: …».
+    """
+    s = S()
+    _guard_no_task()
+    if s.cutlist is None:
+        raise HTTPException(409, "Nothing to render")
+    if s.transcript is None:
+        raise HTTPException(409, "Transcribe first")
+
+    raw = body.get("clips")
+    if not isinstance(raw, list) or not raw:
+        raise HTTPException(400, "Не передано ни одного клипа "
+                                 "(ожидается clips: [{start, end}])")
+    render_opts = body.get("render_opts") or {}
+    if not isinstance(render_opts, dict):
+        render_opts = {}
+    # Сервер принудительно глушит главы/метаданные для клипов (план §2.4) —
+    # независимо от того, что прислал клиент.
+    render_opts = {**render_opts, "chapters": False, "metadata": False}
+
+    duration = float(s.media.duration)
+    clips_in: list[dict] = []
+    for i, c in enumerate(raw):
+        if not isinstance(c, dict):
+            raise HTTPException(400, f"Клип №{i + 1}: ожидается объект "
+                                     "{start, end}")
+        try:
+            start, end = float(c.get("start")), float(c.get("end"))
+        except (TypeError, ValueError):
+            raise HTTPException(400, f"Клип №{i + 1}: start/end должны быть "
+                                     "числами (секунды)")
+        # NaN/±Infinity валидны для json.loads и пролезают сквозь клампы:
+        # max(0.0, nan) → 0.0, min(duration, nan) → duration (Python отдаёт
+        # первый аргумент при ложном сравнении) — получился бы клип на весь
+        # файл. Отсекаем ДО клампов.
+        if not (math.isfinite(start) and math.isfinite(end)):
+            raise HTTPException(400, f"Клип №{i + 1}: start/end должны быть "
+                                     "конечными числами")
+        start = max(0.0, start)
+        end = min(duration, end)
+        if not end - start > 0:
+            raise HTTPException(400, f"Клип №{i + 1}: пустой диапазон")
+        name = c.get("filename")
+        if name is not None and not isinstance(name, str):
+            raise HTTPException(400, f"Клип №{i + 1}: filename должен быть строкой")
+        clips_in.append({"start": start, "end": end,
+                         "filename": ((name or "").strip()
+                                      or f"{s.inp.stem}_clip{i + 1:02d}")})
+
+    # Fail fast: битые ОБЩИЕ опции (scale_h/fps) дают 400 на запросе, а не
+    # ошибку задачи; заодно out_dir создан и ссылки /api/output смотрят туда.
+    _, _, _, out_dir0, _ = _resolve_render_opts(s, render_opts)
+    s.last_out_dir = str(out_dir0.resolve())
+
+    cl = s.cutlist
+    n = len(clips_in)
+
+    def run():
+        results: list[dict] = []
+        for i, c in enumerate(clips_in):
+            if s.task.get("cancelled"):
+                break                               # cancel между клипами
+            s.stage(f"Клип {i + 1}/{n}: рендер…")
+            s.set_progress(i / n)
+            # Катлист клипа = копия живых вырезов + 2 граничных REMOVE (§2.4).
+            clip_cl = CutList(source=cl.source, duration=cl.duration,
+                              segments=[copy.copy(seg) for seg in cl.segments])
+            if c["start"] > 0:
+                clip_cl.segments.append(CutSegment(
+                    id=f"clipA{i}", start=0.0, end=c["start"],
+                    type=TYPE_MANUAL, action=ACTION_REMOVE, enabled=True))
+            if c["end"] < cl.duration:
+                clip_cl.segments.append(CutSegment(
+                    id=f"clipB{i}", start=c["end"], end=cl.duration,
+                    type=TYPE_MANUAL, action=ACTION_REMOVE, enabled=True))
+            try:
+                opts_i = {**render_opts, "filename": c["filename"]}
+                cfg, scale_h, fps, out_dir, base = _resolve_render_opts(s, opts_i)
+                res = _run_render_pipeline(
+                    s, cfg, scale_h, fps, out_dir, base,
+                    on_progress=lambda f, i=i: s.set_progress(
+                        (i + min(1.0, max(0.0, f))) / n),
+                    on_stage=lambda m, i=i: s.stage(f"Клип {i + 1}/{n}: {m}"),
+                    cutlist_override=clip_cl)
+                results.append({"ok": True, "filename": c["filename"], **res})
+            except Exception as e:  # noqa: BLE001 — упавший клип не валит остальные
+                err = "cancelled" if s.task.get("cancelled") else str(e)
+                results.append({"ok": False, "filename": c["filename"],
+                                "error": err})
+        s.task["results"] = {"clips": results}
+        if s.task.get("cancelled"):
+            # Частичные results уже сохранены выше; воркер start_task отчитается
+            # чистым «cancelled» — как у обычного отменённого рендера.
+            raise RuntimeError("Задача отменена")
+
+    s.start_task("render_clips", run)
+    return {"ok": True, "count": n}
 
 
 @app.get("/api/events")

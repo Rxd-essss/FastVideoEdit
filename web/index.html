@@ -124,6 +124,11 @@
       <rect x="2" y="2" width="20" height="20" rx="2"/>
       <path d="M7 2v20M17 2v20M2 12h20M2 7h5M2 17h5M17 17h5M17 7h5"/>
     </symbol>
+    <symbol id="i-sliders" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="16" cy="5" r="2"/><path d="M3 5h11M18 5h3"/>
+      <circle cx="8" cy="12" r="2"/><path d="M3 12h3M10 12h11"/>
+      <circle cx="14" cy="19" r="2"/><path d="M3 19h9M16 19h5"/>
+    </symbol>
     <symbol id="i-upload" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
       <polyline points="16,16 12,12 8,16"/><line x1="12" y1="12" x2="12" y2="21"/>
       <path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/>
@@ -216,8 +221,10 @@
       <div id="cutlist" class="cutlist">
         <div class="empty placeholder"><svg class="ic ic-empty" aria-hidden="true"><use href="#i-scissors"/></svg><div>Вырезов пока нет — выдели текст или нажми «Передетектировать»</div></div>
       </div>
-      <div id="chaptersPanel" class="chaptersPanel">
-        <div class="chaptersHead">
+      <div id="chaptersPanel" class="chaptersPanel collapsible collapsed">
+        <div class="chaptersHead accHead" role="button" tabindex="0" aria-expanded="false"
+             aria-controls="chaptersList" title="Развернуть/свернуть">
+          <svg class="ic chev" aria-hidden="true"><use href="#i-chevron-down"/></svg>
           <span class="paneTitle">Главы</span>
           <button id="btnChaptersToggle" class="btn small" title="Сгенерировать главы по финальному таймлайну">Предпросмотр глав</button>
         </div>
@@ -225,8 +232,10 @@
           <div class="empty placeholder"><svg class="ic ic-empty" aria-hidden="true"><use href="#i-clock"/></svg><div>Глав пока нет — нажми «Предпросмотр глав»</div></div>
         </div>
       </div>
-      <div id="metadataPanel" class="metadataPanel">
-        <div class="metadataHead">
+      <div id="metadataPanel" class="metadataPanel collapsible collapsed">
+        <div class="metadataHead accHead" role="button" tabindex="0" aria-expanded="false"
+             aria-controls="metadataBody" title="Развернуть/свернуть">
+          <svg class="ic chev" aria-hidden="true"><use href="#i-chevron-down"/></svg>
           <span class="paneTitle">Метаданные YouTube</span>
           <button id="btnMetaGenerate" class="btn small" title="Сгенерировать заголовок, описание и теги по финальному таймлайну">Сгенерировать</button>
         </div>
@@ -254,6 +263,24 @@
           <div class="metaActions">
             <button id="btnMetaCopyAll" class="btn small"><svg class="ic" aria-hidden="true"><use href="#i-copy"/></svg>Копировать всё</button>
           </div>
+        </div>
+      </div>
+      <!-- F4 — Clip Maker: панель кандидатов Shorts (план §4.1) -->
+      <div id="clipsPanel" class="clipsPanel collapsible collapsed">
+        <div class="clipsHead accHead" role="button" tabindex="0" aria-expanded="false"
+             aria-controls="clipsList" title="Развернуть/свернуть">
+          <svg class="ic chev" aria-hidden="true"><use href="#i-chevron-down"/></svg>
+          <span class="paneTitle">Клипы (Shorts)</span>
+          <div class="clipsHeadBtns">
+            <button id="btnClipsSettings" class="btn small" title="Настройки рендера клипов" aria-label="Настройки рендера клипов" aria-haspopup="dialog"><svg class="ic" aria-hidden="true"><use href="#i-sliders"/></svg></button>
+            <button id="btnClipsSuggest" class="btn small" title="Локальная LLM предложит фрагменты под Shorts (20–60 с)">Предложить клипы</button>
+          </div>
+        </div>
+        <div id="clipsList" class="clipsList">
+          <div class="empty placeholder"><svg class="ic ic-empty" aria-hidden="true"><use href="#i-film"/></svg><div>Нажмите «Предложить клипы» — локальная LLM найдёт кандидатов под Shorts</div></div>
+        </div>
+        <div id="clipsFoot" class="clipsFoot hidden">
+          <button id="btnClipsRender" class="btn btn-primary"><svg class="ic" aria-hidden="true"><use href="#i-render"/></svg>Рендерить выбранные (<span id="clipsSelCount">0</span>)</button>
         </div>
       </div>
     </section>
@@ -599,6 +626,43 @@
       <div class="modelsActions">
         <button class="btn" id="btnModelsCancel">Закрыть</button>
         <button class="btn btn-primary" id="btnModelsSave">Сохранить</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- F4 — Clip Maker: пресет рендера клипов (план §4.4; дефолты §1.2, живут в localStorage) -->
+  <div id="clipsModal" class="overlay hidden" role="dialog" aria-modal="true" aria-label="Настройки рендера клипов">
+    <div class="card clipsCard">
+      <div class="filesHead">
+        <h2><svg class="ic ic-h2" aria-hidden="true"><use href="#i-film"/></svg>Рендер клипов (Shorts)</h2>
+        <button class="btn btn-ghost btn-icon" id="btnCloseClips" title="Закрыть" aria-label="Закрыть"><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg></button>
+      </div>
+      <label class="chk"><input type="checkbox" id="cVertical" checked> Вертикально 9:16 (1080×1920)</label>
+      <div class="hint muted">Выключено — клип рендерится в формате исходника.</div>
+      <div class="rgrid">
+        <label>Центр кадра
+          <select id="cCenterMode" class="select">
+            <option value="auto">Авто (по лицу)</option>
+            <option value="manual">Вручную</option>
+          </select>
+        </label>
+        <label id="cCenterRow" class="hidden">Положение центра <span id="cCenterVal" class="muted">50%</span>
+          <input id="cCenterPos" type="range" min="0" max="100" step="1" value="50">
+          <div class="hint muted">0% — левый край кадра, 100% — правый</div>
+        </label>
+      </div>
+      <label class="chk"><input type="checkbox" id="cBurn" checked> Вшить караоке-субтитры</label>
+      <div class="hint muted">Капшены в нижней трети кадра, в безопасной зоне интерфейса Shorts.</div>
+      <div class="rout">
+        <div class="routrow">
+          <input id="cOutDir" class="search" type="text" placeholder="папка вывода" aria-label="Папка вывода клипов">
+          <button class="btn" id="cBrowseOut"><svg class="ic" aria-hidden="true"><use href="#i-folder-open"/></svg>Обзор</button>
+        </div>
+      </div>
+      <div class="hint muted">Главы и метаданные для клипов отключены; вырезы пауз/заминок и цензура применяются внутри клипа автоматически. Кодек, качество и громкость — как в обычном рендере.</div>
+      <div class="ractions">
+        <button class="btn" id="btnClipsOptsCancel">Отмена</button>
+        <button class="btn btn-primary" id="btnClipsOptsSave">Сохранить</button>
       </div>
     </div>
   </div>

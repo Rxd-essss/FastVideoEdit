@@ -317,6 +317,18 @@ class MetadataCfg(_Base):
     max_hook_chars: int = 200
 
 
+class ClipsCfg(_Base):
+    enabled: bool = True
+    max_per_window: int = 3        # прошито и в промпт («не больше 3»)
+    min_duration: float = 20.0     # целевая нижняя граница, сек (eff)
+    hard_min: float = 15.0         # ниже — дроп
+    max_duration: float = 60.0     # трим кодом
+    window_overlap: int = 12       # сегментов (≈60с при медиане ~5с/сегмент)
+    keep_alive_between: int = 300  # сек, между окнами; 0 на последнем
+    max_candidates: int = 15
+    rerank: bool = True            # v1.1; в MVP игнорируется
+
+
 class Config(_Base):
     language: str = "ru"
     paths: PathsCfg = Field(default_factory=PathsCfg)
@@ -334,6 +346,7 @@ class Config(_Base):
     llm: LlmCfg = Field(default_factory=LlmCfg)
     chapters: ChaptersCfg = Field(default_factory=ChaptersCfg)
     metadata: MetadataCfg = Field(default_factory=MetadataCfg)
+    clips: ClipsCfg = Field(default_factory=ClipsCfg)
 
 
 def load_config(path: Optional[str | Path] = None) -> Config:

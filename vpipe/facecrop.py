@@ -116,7 +116,8 @@ def _haar_center(cascade, frame) -> Optional[float]:
 
 
 def detect_center(video_path: str | Path, ff=None, duration: float = 0.0,
-                  *, samples: int = 12, log=print) -> float:
+                  *, samples: int = 12, start: float = 0.0,
+                  end: Optional[float] = None, log=print) -> float:
     """Median face-center X fraction in ``[0, 1]``; ``0.5`` on any failure.
 
     Opens ``video_path`` with ``cv2.VideoCapture`` and seeks to ``samples`` evenly
@@ -127,6 +128,13 @@ def detect_center(video_path: str | Path, ff=None, duration: float = 0.0,
     returned. ``log`` reports which engine was used. ``ff`` is accepted for
     signature symmetry with the rest of the pipeline (reserved for a future
     ffmpeg-frame fallback) and is unused. Never raises.
+
+    ``start``/``end`` (Clip Maker, план §2.3.3) restrict the sampled span to
+    ``[start, end]`` — a Shorts clip crops by the face WITHIN the clip, where the
+    speaker may sit elsewhere than the whole-video median. Samples are taken at
+    ``t = start + (end - start) * (i + 0.5) / n``. The defaults (``start=0.0``,
+    ``end=None`` -> ``duration``) reproduce the old whole-file sweep exactly; a
+    nonsense range (inverted/out of bounds) degrades to the whole file.
     """
     if not _CV2_OK or duration is None or duration <= 0:
         return 0.5
@@ -153,9 +161,23 @@ def detect_center(video_path: str | Path, ff=None, duration: float = 0.0,
         if fps_src <= 0:
             fps_src = 25.0
         n = max(1, int(samples))
+        # Sampled span [t0, t1]: the clip range when given, the whole file by
+        # default. Defensive clamping mirrors the rest of this function — any
+        # garbage range falls back to the legacy whole-file sweep, never raises.
+        try:
+            t0 = max(0.0, float(start or 0.0))
+        except (TypeError, ValueError):
+            t0 = 0.0
+        try:
+            t1 = float(end) if end is not None else float(duration)
+        except (TypeError, ValueError):
+            t1 = float(duration)
+        t1 = min(t1, float(duration))
+        if t1 <= t0 or t0 >= duration:
+            t0, t1 = 0.0, float(duration)
         centers: list[float] = []
         for i in range(n):
-            t = duration * (i + 0.5) / n          # frame mid-point of each slice
+            t = t0 + (t1 - t0) * (i + 0.5) / n    # frame mid-point of each slice
             frame_idx = int(t * fps_src)
             if total_frames > 0:
                 frame_idx = min(frame_idx, int(total_frames) - 1)

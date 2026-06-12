@@ -306,6 +306,9 @@ web/vendor/        wavesurfer.js v7 vendored locally (no CDN — fully offline)
 - [x] Editable transcript (double-click a word to fix a Whisper typo;
       select text + Del → cut), loudness mastering (−14 LUFS, 1- и 2-pass),
       neural denoise engine (DeepFilterNet 3, opt-in).
+- [x] **Clip Maker**: локальная LLM предлагает кандидатов под Shorts
+      (хук-фраза, 20–60 с, без пересечений); рендер выбранных — 9:16 с
+      face-crop по диапазону, караоке-сабами и внутренними вырезами.
 
 ## 8. Troubleshooting
 
