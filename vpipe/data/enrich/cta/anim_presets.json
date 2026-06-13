@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "fps": 25,
+  "frames": 48,
+  "presets": {
+    "pulse": {
+      "dur_s": 1.92,
+      "easing": "sine",
+      "amplitude": 0.06,
+      "loop": true
+    },
+    "pop_in": {
+      "dur_s": 0.48,
+      "easing": "overshoot",
+      "from": 0.95,
+      "over": 1.02,
+      "to": 1.0,
+      "loop": false
+    },
+    "bell_wiggle": {
+      "dur_s": 1.92,
+      "easing": "damped_sine",
+      "amplitude_deg": 12.0,
+      "cycles": 2.0,
+      "loop": true
+    }
+  },
+  "assets": {
+    "subscribe_like.webm": "pulse",
+    "comment.webm": "pop_in",
+    "like.webm": "pulse",
+    "bell.webm": "bell_wiggle"
+  }
+}

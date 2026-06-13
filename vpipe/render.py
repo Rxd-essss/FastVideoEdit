@@ -20,6 +20,7 @@ from typing import Optional
 from .censor import build_censor_graph
 from .config import Config
 from .cutlist import resolve
+from .enrich import MAX_ANIMS, MAX_STILLS, AnimOverlay, RenderEnrich, StillOverlay
 from .ffmpeg_utils import FFmpeg
 from .models import CutList
 from .probe import MediaInfo
@@ -620,13 +621,75 @@ def _ass_path_for_filter(p: str) -> str:
     return p
 
 
+# --- enrich overlays (ENRICH_PLAN §2.1) ---------------------------------------
+def _enrich_video_chain(src_lbl: str, vpre: list[str],
+                        stills: list[StillOverlay], anims: list[AnimOverlay],
+                        first_idx: int, vsubs: list[str]) -> str:
+    """Video sub-graph from ``src_lbl`` to ``[outv]`` with enrich overlays.
+
+    Statement order is the §2.1 contract: ``vpre`` (crop -> scale -> fps)
+    first, then one overlay node per still/anim — the input indices follow the
+    order the enrich ``-i`` entries were appended after the music input — and
+    finally the subtitles filters from ``vsubs`` (enrich.ass with fontsdir
+    FIRST, burn.ass LAST). All t0/t1 are FINAL (post-concat) seconds; the
+    fractions are formatted by :func:`_f` (f-strings — always a dot, the
+    filtergraph never sees a locale comma).
+
+    PNG stills get ``format=rgba`` + alpha fade in/out (R2 §1); WebM anims get
+    ``setpts=PTS+t0/TB`` to shift their clock to the show window and — ONLY
+    when the input is looped with ``-stream_loop -1`` — ``shortest=1`` on the
+    overlay, otherwise framesync's default ``eof_action=repeat`` keeps
+    repeating the bed's last frame FOREVER and the render never ends (R2
+    trap #2). A finite (non-looped) anim must NOT get ``shortest=1`` — that
+    would truncate the whole program at the anim's end.
+    """
+    stmts: list[str] = []
+    cur = src_lbl
+    nb = 0
+    if vpre:
+        stmts.append(f"{cur}{','.join(vpre)}[vb{nb}]")
+        cur = f"[vb{nb}]"
+        nb += 1
+    idx = first_idx
+    for k, st in enumerate(stills):
+        # TODO(kenburns v1.1): st.kenburns renders as a plain PNG overlay for
+        # now; the zoompan + alphamerge branch (R2 §2) is deferred — the model
+        # field exists so plans stay forward-compatible.
+        fade = max(0.0, float(st.fade_s or 0.0))
+        prep = f"[{idx}:v]format=rgba,scale={int(st.scale_w)}:-1"
+        if fade > 0:
+            prep += (f",fade=t=in:st={_f(st.t0)}:d={_f(fade)}:alpha=1"
+                     f",fade=t=out:st={_f(max(st.t0, st.t1 - fade))}"
+                     f":d={_f(fade)}:alpha=1")
+        stmts.append(prep + f"[ov{k}]")
+        out = f"[vb{nb}]"
+        stmts.append(f"{cur}[ov{k}]overlay={st.x_expr}:{st.y_expr}"
+                     f":enable='between(t,{_f(st.t0)},{_f(st.t1)})'{out}")
+        cur, nb, idx = out, nb + 1, idx + 1
+    for k, an in enumerate(anims):
+        stmts.append(f"[{idx}:v]scale={int(an.scale_w)}:-1,"
+                     f"setpts=PTS+{_f(an.t0)}/TB[an{k}]")
+        out = f"[vb{nb}]"
+        stmts.append(f"{cur}[an{k}]overlay={an.x_expr}:{an.y_expr}"
+                     f":enable='between(t,{_f(an.t0)},{_f(an.t1)})'"
+                     f"{':shortest=1' if an.loop else ''}{out}")
+        cur, nb, idx = out, nb + 1, idx + 1
+    if vsubs:
+        stmts.append(f"{cur}{','.join(vsubs)}[outv]")
+    else:
+        # No subtitles: rename the last overlay's output label to [outv].
+        stmts[-1] = stmts[-1][:-len(cur)] + "[outv]"
+    return ";".join(stmts)
+
+
 def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
            out_path: str | Path, work_dir: str | Path,
            on_progress=None, log=print,
            scale_h: Optional[int] = None, fps: Optional[float] = None,
            ass_path: Optional[str] = None,
            crop_filter: Optional[str] = None,
-           edge_fade: float = 0.0) -> dict:
+           edge_fade: float = 0.0,
+           enrich: Optional[RenderEnrich] = None) -> dict:
     """Run both stages and write the final mp4. Returns a small summary dict.
 
     ``scale_h``/``fps`` override the output resolution height / frame rate; None
@@ -650,6 +713,18 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
     FINAL speech, mixed in BEFORE loudnorm (see :func:`_music_audio_graph`).
     Disabled (the default) keeps every graph byte-for-byte unchanged. Clip
     Maker renders never receive it — serve strips ``music`` from clip opts.
+
+    ``enrich`` (ENRICH_PLAN §2.1): a render-ready :class:`vpipe.enrich
+    .RenderEnrich` — already remapped to FINAL coordinates, validated and
+    conflict-resolved by ``vpipe.enrich.plan_render``; render.py stays a dumb
+    executor (the ``ass_path`` pattern). Its PNG stills / WebM-alpha anims
+    enter as extra ``-i`` inputs AFTER the music bed, the overlay nodes sit
+    between the crop/scale/fps prefix and the subtitles filters, and its
+    ``cards_ass`` burns FIRST (with ``fontsdir``) so the card scrim never dims
+    the karaoke subs — ``ass_path`` (burn.ass) stays the LAST video filter.
+    A non-empty ``enrich`` forces a re-encode through the existing non-empty-
+    vpost mechanism; ``None`` (or an all-empty plan) keeps every graph and
+    fast-path byte-for-byte unchanged. The audio graph is NEVER touched.
     """
     removed, censors = resolve(cl)
     tl = Timeline(removed, media.duration)
@@ -733,21 +808,49 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
     out_path = str(out_path)
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
 
-    vpost = []
+    # An all-empty enrich plan behaves exactly like None (byte-for-byte legacy
+    # graphs); a non-empty one rides the non-empty-vpost re-encode mechanism.
+    enr = (enrich if enrich is not None
+           and (enrich.stills or enrich.anims or enrich.cards_ass) else None)
+    enr_stills: list[StillOverlay] = list(enr.stills) if enr else []
+    enr_anims: list[AnimOverlay] = list(enr.anims) if enr else []
+    # Engine safety net (§2.1 п.5, duplicates the planner's score-trim): the
+    # planner already trimmed by score and sorted by t0 — here we only cap the
+    # input count so a hand-written plan cannot explode the filtergraph.
+    if len(enr_stills) > MAX_STILLS:
+        log(f"  ВНИМАНИЕ: enrich даёт {len(enr_stills)} PNG-оверлеев — "
+            f"лимит движка {MAX_STILLS}, лишние отброшены.")
+        enr_stills = enr_stills[:MAX_STILLS]
+    if len(enr_anims) > MAX_ANIMS:
+        log(f"  ВНИМАНИЕ: enrich даёт {len(enr_anims)} WebM-оверлеев — "
+            f"лимит движка {MAX_ANIMS}, лишние отброшены.")
+        enr_anims = enr_anims[:MAX_ANIMS]
+    has_overlays = bool(enr_stills or enr_anims)
+
+    # vpost = vpre (crop -> scale -> fps) + vsubs (subtitles last). Without
+    # enrich overlays it is one comma chain — byte-for-byte the legacy vpost.
+    vpre = []
     # Vertical 9:16 crop+scale must run FIRST: crop -> scale -> fps -> subtitles.
     # crop_filter already bakes in the exact target scale (e.g. ...,scale=1080:1920),
     # so the caller passes scale_h=None and the generic scale step below is skipped.
     if crop_filter:
-        vpost.append(crop_filter)
+        vpre.append(crop_filter)
     if scale_h:
-        vpost.append(f"scale=-2:{int(scale_h)}")
+        vpre.append(f"scale=-2:{int(scale_h)}")
     if fps:
-        vpost.append(f"fps={fps}")
+        vpre.append(f"fps={fps}")
+    vsubs = []
+    # Card/CTA-text ASS goes FIRST with the vendored Inter fontsdir (§2.2: the
+    # card scrim must not dim the karaoke subs below).
+    if enr is not None and enr.cards_ass:
+        vsubs.append(f"subtitles='{_ass_path_for_filter(enr.cards_ass)}'"
+                     f":fontsdir='{_ass_path_for_filter(enr.fonts_dir)}'")
     # Burn-in subtitles MUST be the last filter so karaoke timings line up with
     # the final (scaled/retimed) frames. A non-empty vpost forces re-encode, so
     # the no-cuts/no-scale copy fast-path is correctly bypassed when burning.
     if ass_path:
-        vpost.append(f"subtitles='{_ass_path_for_filter(ass_path)}'")
+        vsubs.append(f"subtitles='{_ass_path_for_filter(ass_path)}'")
+    vpost = vpre + vsubs
     vpost_s = ",".join(vpost)
     # The graph's audio source: the DFN-enhanced wav (already censored, when
     # there was anything to censor) wins over the censored FLAC, which wins
@@ -775,6 +878,26 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
         log(f"  фоновая музыка: {Path(music_path).name} "
             f"(громкость {cfg.render.music.gain_db:g} дБ, "
             f"приглушение при речи {cfg.render.music.duck_db:g} дБ)")
+    # Enrich overlay inputs (§2.1) — ALWAYS after the music bed, same dynamic
+    # index pattern as music_idx. PNG stills need `-loop 1 -t <end of window>`
+    # (a single frame otherwise — the alpha fades have nothing to run on, R2
+    # §1); WebM-alpha anims MUST be decoded with `-c:v libvpx-vp9` BEFORE the
+    # `-i` (ffmpeg's native vp9 decoder silently drops the alpha — R2 trap #1)
+    # and loop via `-stream_loop -1` (their overlay then carries shortest=1).
+    # measure_loudness later receives these inputs too: it maps only [mout]
+    # audio, so the extra video inputs are never decoded (R1 §1.6) — verified
+    # live against ffmpeg 8.1.1, incl. a looped webm (the -f null pass ends).
+    enrich_in_idx = (2 if audio_src else 1) + (1 if music_path else 0)
+    if has_overlays:
+        for st in enr_stills:
+            inputs = inputs + ["-loop", "1", "-t", _f(st.t1 + 0.5),
+                               "-i", st.path]
+        for an in enr_anims:
+            inputs = (inputs + (["-stream_loop", "-1"] if an.loop else [])
+                      + ["-c:v", "libvpx-vp9", "-i", an.path])
+    if enr is not None:
+        log(f"  обогащение: {len(enr_stills)} PNG + {len(enr_anims)} WebM"
+            + (" + карточки/CTA-текст (ASS)" if enr.cards_ass else ""))
     # Two-pass loudnorm (opt-in via denoise.loudnorm_mode="2pass"): measure the
     # FINAL audio (cuts + censor + denoise + deesser + the ducked music bed,
     # WITHOUT loudnorm) first, then hand the stats to build_apost for the
@@ -801,9 +924,11 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
     # stay byte-for-byte identical.
     efades = _edge_fade_filters(edge_fade, out_adur) if has_audio else []
 
-    if not removed and not vpost:
+    if not removed and not vpost and not has_overlays:
         # No cuts, no rescale: just mux (video copied — no quality loss). Denoise,
         # when on, forces the audio through filter_complex (video still copied).
+        # (has_overlays joins the non-empty-vpost gate: overlay-only enrich has
+        # an empty vpost string yet still demands a video re-encode.)
         if not has_audio:
             log("  no cuts — remuxing (video copied).")
             args = ["-i", media.path, "-map", "0:v",
@@ -846,28 +971,32 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
                 "music": bool(music_path)}
 
     if not removed:
-        # No cuts but rescale/fps requested -> re-encode video; pass audio through.
+        # No cuts but rescale/fps/enrich requested -> re-encode video; pass
+        # audio through. With overlays the video part becomes the §2.1 chain
+        # ([0:v] -> vpre -> overlay nodes -> subtitles), byte-for-byte the
+        # legacy single statement otherwise.
+        vgraph = (_enrich_video_chain("[0:v]", vpre, enr_stills, enr_anims,
+                                      enrich_in_idx, vsubs)
+                  if has_overlays else f"[0:v]{vpost_s}[outv]")
         if has_audio and (apost or efades or music_path):
             # Audio must enter the graph for the denoise/edge-fade/music filters.
             if music_path:
-                graph = (f"[0:v]{vpost_s}[outv];"
+                graph = (vgraph + ";"
                          + _music_audio_graph(cfg, f"[{asrc_idx}:a]", music_idx,
                                               out_adur, apost, efades))
             else:
                 achain = ",".join(apost + efades)
-                graph = (f"[0:v]{vpost_s}[outv];"
+                graph = (vgraph + ";"
                          f"[{asrc_idx}:a]{achain}[outa]")
             args = [*inputs, "-filter_complex", graph, "-map", "[outv]",
                     "-map", "[outa]", *venc, *_audio_args(cfg),
                     *_faststart(cfg), out_path]
         elif has_audio:
-            graph = f"[0:v]{vpost_s}[outv]"
-            args = [*inputs, "-filter_complex", graph, "-map", "[outv]",
+            args = [*inputs, "-filter_complex", vgraph, "-map", "[outv]",
                     "-map", f"{asrc_idx}:a", *venc, *_audio_args(cfg),
                     *_faststart(cfg), out_path]
         else:
-            graph = f"[0:v]{vpost_s}[outv]"
-            args = [*inputs, "-filter_complex", graph, "-map", "[outv]",
+            args = [*inputs, "-filter_complex", vgraph, "-map", "[outv]",
                     "-an", *venc, *_faststart(cfg), out_path]
         log(f"  re-encoding (no cuts, {vpost_s or 'reencode'}) -> {enc_name}")
         try:
@@ -899,7 +1028,12 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
         # _edge_fade_filters for why that order protects the de-click ramp.
         afinal = apost + efades
         a_lbl = "[outa_raw]" if (afinal or music_path) else "[outa]"
-        if vpost:
+        if has_overlays:
+            # §2.1: overlays live AFTER concat, on the FINAL timeline ([vc]).
+            graph = (base + f"concat=n={len(kept)}:v=1:a=1[vc]{a_lbl};"
+                     + _enrich_video_chain("[vc]", vpre, enr_stills, enr_anims,
+                                           enrich_in_idx, vsubs))
+        elif vpost:
             graph = base + f"concat=n={len(kept)}:v=1:a=1[vc]{a_lbl};[vc]{vpost_s}[outv]"
         else:
             graph = base + f"concat=n={len(kept)}:v=1:a=1[outv]{a_lbl}"
@@ -919,7 +1053,11 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
             vparts.append(f"[0:v]trim=start={_f(a)}:end={_f(b)},setpts=PTS-STARTPTS[v{i}]")
             concat.append(f"[v{i}]")
         base = ";".join(vparts) + ";" + "".join(concat)
-        if vpost:
+        if has_overlays:
+            graph = (base + f"concat=n={len(kept)}:v=1:a=0[vc];"
+                     + _enrich_video_chain("[vc]", vpre, enr_stills, enr_anims,
+                                           enrich_in_idx, vsubs))
+        elif vpost:
             graph = base + f"concat=n={len(kept)}:v=1:a=0[vc];[vc]{vpost_s}[outv]"
         else:
             graph = base + f"concat=n={len(kept)}:v=1:a=0[outv]"
