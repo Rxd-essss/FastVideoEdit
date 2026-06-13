@@ -297,6 +297,35 @@ def test_cta_drop_before_60s_and_tail_and_junk():
     assert out == []
 
 
+def test_cta_weak_generic_question_dropped_kept_topical():
+    """Вырожденный общий вопрос-попрошайка («пишите/станет интересной», без
+    «?») считается «нет вопроса» и дропается; живой тематический вопрос с «?»
+    остаётся. Если общий был единственным comment — гарантия добирает шаблон."""
+    tr = _build_tr(1200)                                 # 600 c
+    llm = MockLLM([{"ctas": [
+        _cta("comment", 300, q="Если эта тема станет интересной, пишите"),  # общий
+        _cta("comment", 800, q="Какой дистрибутив выбрали и почему?"),      # живой
+    ]}])
+    out = detect_all(tr, _cl(tr), _only("cta"), llm, log=_SILENT)
+    qs = [it.payload.question for it in out if it.type == ENR_CTA_COMMENT]
+    assert "Какой дистрибутив выбрали и почему?" in qs
+    assert all("станет интересной" not in q for q in qs)
+
+
+def test_cta_weak_question_helper_keeps_questions_with_qmark():
+    # «?» -> это вопрос, даже если есть слово-триггер: не дропаем
+    assert enrich_llm._is_weak_question("Какой дистрибутив выбрали, пишите?") \
+        is False
+    assert enrich_llm._is_weak_question("Что думаете?") is False
+    # без «?» и общий паттерн -> вырожденный
+    assert enrich_llm._is_weak_question(
+        "Если эта тема станет интересной, пишите") is True
+    assert enrich_llm._is_weak_question("Оставь лайк под видео") is True
+    # без «?» но осмысленный (предмет есть, паттерна нет) -> НЕ дропаем
+    assert enrich_llm._is_weak_question(
+        "Расскажите про свой опыт с Linux") is False
+
+
 def test_cta_question_trimmed_to_120():
     tr = _build_tr(300)
     long_q = "почему " * 30                              # > 120 символов
@@ -327,8 +356,41 @@ def test_cta_dedup_within_120s():
         _cta("comment", 400, q="Вопрос?"),               # t≈205: <120 c от sub
     ]}])
     out = detect_all(tr, _cl(tr), _only("cta"), llm, log=_SILENT)
-    # comment (score 70) обрабатывается первым → дедуп выкидывает subscribe
-    assert [it.type for it in out] == [ENR_CTA_COMMENT]
+    # comment (score 70) обрабатывается первым → дедуп выкидывает МОДЕЛЬНЫЙ
+    # subscribe@155 (он в <120 c). Гарантия пакета добирает subscribe ШАБЛОНОМ
+    # в задней трети — но он обязан стоять ≥120 c от выжившего comment@205.
+    com = next(it for it in out if it.type == ENR_CTA_COMMENT)
+    assert com.payload.question == "Вопрос?"              # выжил модельный comment
+    assert com.t_start == pytest.approx(409 * WD + 0.4)  # сегмент слова 400 → 409
+    for it in out:
+        if it.type == ENR_CTA_SUBSCRIBE:
+            assert abs(it.t_start - com.t_start) >= 120.0  # не модельный @155
+
+
+def test_cta_subscribe_only_gets_fallback_comment():
+    """Требование «призыв в комментарии» гарантировано: модель отдала только
+    subscribe → код синтезирует шаблонный comment-CTA в задней трети, не
+    нарушая гардов (дедуп ≥120 c от subscribe)."""
+    tr = _build_tr(1200)                                 # 600 c
+    llm = MockLLM([{"ctas": [_cta("subscribe", 300)]}])  # t≈155, только sub
+    out = detect_all(tr, _cl(tr), _only("cta"), llm, log=_SILENT)
+    assert sorted(it.type for it in out) == [ENR_CTA_COMMENT, ENR_CTA_SUBSCRIBE]
+    com = next(it for it in out if it.type == ENR_CTA_COMMENT)
+    assert com.payload.question == enrich_llm._FALLBACK_QUESTION
+    assert com.score == 70
+    # фолбэк ≥120 c от принятого subscribe (t≈155) и в задней трети
+    sub = next(it for it in out if it.type == ENR_CTA_SUBSCRIBE)
+    assert abs(com.t_start - sub.t_start) >= 120.0
+    assert com.t_start > tr.duration * 0.5
+
+
+def test_cta_empty_after_guards_no_forced_fallback():
+    """На пустом результате (всё за гардами/мусор) фолбэк НЕ навязывается —
+    насильно вставлять CTA в ролик без валидного места неправильно."""
+    tr = _build_tr(300)                                  # 150 c
+    llm = MockLLM([{"ctas": [_cta("subscribe", 20)]}])   # t≈14.9 < 60 → дроп
+    out = detect_all(tr, _cl(tr), _only("cta"), llm, log=_SILENT)
+    assert out == []
 
 
 def test_cta_effective_text_excludes_cut_retake_and_maps_to_original():
