@@ -151,6 +151,18 @@
     <symbol id="i-bolt" viewBox="0 0 24 24" fill="currentColor" stroke="none">
       <path d="M13 2 5 13.5h5L9 22l8-11.5h-5z"/>
     </symbol>
+    <!-- P4 — авто-обогащение («Монтаж»): искры/штрихи поверх кадра -->
+    <symbol id="i-sparkles" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M12 3l1.6 4.4L18 9l-4.4 1.6L12 15l-1.6-4.4L6 9l4.4-1.6z"/>
+      <path d="M18 14l.8 2.2L21 17l-2.2.8L18 20l-.8-2.2L15 17l2.2-.8z"/>
+      <path d="M5 14l.6 1.7L7.3 16.3 5.6 16.9 5 18.6 4.4 16.9 2.7 16.3 4.4 15.7z"/>
+    </symbol>
+    <!-- P4 — превью-кадр карточки предложения (плейсхолдер ассета) -->
+    <symbol id="i-image" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="3" y="3" width="18" height="18" rx="2"/>
+      <circle cx="8.5" cy="8.5" r="1.5"/>
+      <path d="M21 15l-5-5L5 21"/>
+    </symbol>
   </svg>
 
   <header id="topbar">
@@ -208,6 +220,9 @@
       <div class="videoWrap">
         <video id="video" preload="metadata" aria-label="Предпросмотр ролика"></video>
         <div id="subOverlay" class="subOverlay hidden"></div>
+        <!-- P4 — превью-мокап обогащения поверх плеера (▶ на карточке): позиционированный
+             CSS-макет оверлея на время предложения. Честно подписан «превью-макет». -->
+        <div id="enrichOverlay" class="enrOverlay hidden" aria-hidden="true"></div>
       </div>
       <!-- Микро-таб-бар правой колонки: 4 вкладки, панели смонтированы ВСЕГДА
            (переключение — только атрибут hidden), бейджи/точки живут в табах. -->
@@ -240,8 +255,16 @@
           <svg class="ic tSpin" aria-hidden="true"><use href="#i-spinner"/></svg>
           <span class="tDot hidden" aria-hidden="true"></span>
         </button>
+        <!-- P4 — авто-обогащение: 5-я вкладка «Монтаж» (картинки/анимации/карточки/CTA по контексту) -->
+        <button id="tab-enrich" class="paneTab" role="tab" aria-selected="false" tabindex="-1" aria-controls="panel-enrich" title="Монтаж — авто-обогащение (картинки, карточки, CTA по контексту)" aria-label="Монтаж">
+          <svg class="ic" aria-hidden="true"><use href="#i-sparkles"/></svg>
+          <span class="tLabel">Монтаж</span>
+          <span class="tCount" aria-hidden="true"></span>
+          <svg class="ic tSpin" aria-hidden="true"><use href="#i-spinner"/></svg>
+          <span class="tDot hidden" aria-hidden="true"></span>
+        </button>
         <span class="spacer"></span>
-        <span id="llmBadge" class="llmBadge--compact hidden" title="ИИ выключен (Ollama не найдена) — главы, метаданные и клипы недоступны" role="img" aria-label="ИИ выключен (Ollama не найдена)">⚠</span>
+        <span id="llmBadge" class="llmBadge--compact hidden" title="ИИ выключен (Ollama не найдена) — главы, метаданные, клипы и монтаж недоступны" role="img" aria-label="ИИ выключен (Ollama не найдена)">⚠</span>
       </nav>
 
       <section id="panel-cuts" class="tabPanel" role="tabpanel" aria-labelledby="tab-cuts" tabindex="0">
@@ -320,6 +343,33 @@
           <button id="btnClipsRender" class="btn btn-primary"><svg class="ic" aria-hidden="true"><use href="#i-render"/></svg>Рендерить выбранные (<span id="clipsSelCount">0</span>)</button>
         </div>
       </section>
+
+      <!-- P4 — авто-обогащение: вкладка «Монтаж» (ENRICH_PLAN §6).
+           ИИ предлагает картинки/анимации/карточки-перечисления/CTA по контексту —
+           юзер видит карточки с CSS-мокап-превью и решает каждое решение вкл/выкл. -->
+      <section id="panel-enrich" class="tabPanel" role="tabpanel" aria-labelledby="tab-enrich" tabindex="0" hidden>
+        <div class="tabTools">
+          <button id="btnEnrichSuggest" class="btn small" title="ИИ предложит картинки, карточки-перечисления и призывы (подписка/комментарий) по контексту речи"><svg class="ic" aria-hidden="true"><use href="#i-sparkles"/></svg>Предложить монтаж</button>
+          <span class="spacer"></span>
+          <!-- Bulk: кнопка + меню в одной relative-обёртке, чтобы меню якорилось к кнопке,
+               а не к #previewPane (у него container-type → containing block для absolute). -->
+          <div class="enrBulkWrap">
+            <button id="btnEnrichBulk" class="btn small" title="Массовые действия с предложениями" aria-haspopup="true" aria-expanded="false"><svg class="ic" aria-hidden="true"><use href="#i-sliders"/></svg>Действия</button>
+            <div id="enrichBulkMenu" class="enrBulkMenu hidden" role="menu" aria-label="Массовые действия"></div>
+          </div>
+          <span id="enrichCount" class="muted enrCount"></span>
+        </div>
+        <!-- Мягкий баннер «вырезы изменились» (cutlist_changed) -->
+        <div id="enrichStaleBanner" class="enrStaleBanner hidden" role="status">
+          <svg class="ic" aria-hidden="true"><use href="#i-info"/></svg>
+          <span>Вырезы изменились после анализа — предложения могли устареть. Рендер всё равно корректен; для свежих позиций нажмите «Предложить монтаж».</span>
+        </div>
+        <!-- Фильтр-чипы по типу с counts -->
+        <div id="enrichFilters" class="enrFilters hidden" role="group" aria-label="Фильтр предложений по типу"></div>
+        <div id="enrichList" class="enrichList">
+          <div class="empty placeholder"><svg class="ic ic-empty" aria-hidden="true"><use href="#i-sparkles"/></svg><div>Нажмите «Предложить монтаж» — ИИ найдёт места для картинок, карточек-перечислений и призывов по контексту речи</div></div>
+        </div>
+      </section>
     </section>
   </main>
 
@@ -329,6 +379,8 @@
     <div id="waveform" class="waveform">
       <div id="phLabel" class="phLabel">0:00</div>
     </div>
+    <!-- P4 — тонкая дорожка enrich-маркеров под волной (цвет = тип, клик → к карточке) -->
+    <div id="enrichTrack" class="enrTrack hidden" aria-hidden="true"></div>
     <!-- «После» — финальный (пострезный) таймлайн: производная полоса, рисуется на canvas -->
     <div id="afterWrap" class="afterWrap hidden">
       <div class="afterLabel muted">После (итог)</div>
@@ -392,7 +444,9 @@
         <tr><td><kbd>A</kbd></td><td>переключить «До / После» (финальный таймлайн)</td></tr>
         <tr><td><kbd>+</kbd> <kbd>−</kbd></td><td>зум таймлайна</td></tr>
         <tr><td><kbd>;</kbd> <kbd>'</kbd></td><td>сдвиг подсветки (синхрон) ∓50 мс</td></tr>
-        <tr><td><kbd>1</kbd>–<kbd>4</kbd></td><td>вкладки справа: Вырезы / Главы / Мета / Клипы</td></tr>
+        <tr><td><kbd>1</kbd>–<kbd>5</kbd></td><td>вкладки справа: Вырезы / Главы / Мета / Клипы / Монтаж</td></tr>
+        <tr><td><kbd>j</kbd> <kbd>k</kbd></td><td>навигация по карточкам «Монтаж»</td></tr>
+        <tr><td><kbd>e</kbd></td><td>вкл/выкл активного предложения «Монтаж»; <kbd>Enter</kbd> — превью</td></tr>
         <tr><td><kbd>S</kbd> / <kbd>R</kbd></td><td>сохранить / рендер (настройки)</td></tr>
         <tr><td><kbd>Esc</kbd></td><td>снять выделение / закрыть</td></tr>
       </table>
@@ -520,6 +574,11 @@
         <div class="hint muted">Кадрирование: когда срезаются края по ширине (горизонтальный исходник → 9:16 или 1:1) — авто-кадр по лицу, без лица — по центру; когда срезается верх и низ (вертикальный исходник → 1:1 или 16:9) — по центру кадра.</div>
         <div class="hint muted">9:16 — 1080×1920 под Shorts; 1:1 и 16:9 — в разрешении источника. Совместимо со вшитыми субтитрами.</div>
         <div id="rFmtTimeNote" class="hint muted hidden"></div>
+      </div>
+      <!-- P4 — авто-обогащение: вшить включённые предложения (картинки/карточки/CTA) в рендер -->
+      <div class="renrich">
+        <label class="chk"><input type="checkbox" id="rEnrich"> Обогащение <span id="rEnrichCount" class="muted"></span></label>
+        <div class="hint muted">Вшивает включённые во вкладке «Монтаж» предложения: PiP-картинки, карточки-перечисления и призывы (подписка/комментарий). Включается только то, что вы оставили включённым; пиксельная правда — в готовом mp4. Для 9:16-клипов обогащение пока не применяется.</div>
       </div>
       <div class="rdenoise">
         <label class="chk"><input type="checkbox" id="rDenoise"> Шумоподавление (звук)</label>
@@ -826,6 +885,9 @@
       </div>
       <label class="chk apClipsChk"><input type="checkbox" id="apClips" checked> Предложить и отрендерить Shorts</label>
       <div id="apLlmHint" class="hint muted hidden">ИИ выключен (Ollama не найдена) — новые клипы не предложатся; уже подобранный список клипов (если есть) отрендерится.</div>
+      <!-- P4 — авто-обогащение в автопаке: только score≥70 предложения, без ручного ревью -->
+      <label class="chk apEnrichChk"><input type="checkbox" id="apEnrich"> Обогащение (картинки, карточки, CTA)</label>
+      <div id="apEnrichHint" class="hint muted">Автоматически добавит в основной ролик уверенные предложения (оценка ≥ 70) — без ручного ревью. ИИ-анализ выполнится в ходе пака. Требует включённого ИИ (Ollama).</div>
       <div class="apNote hint muted">
         <span>Настройки кодека, субтитров и шумодава берутся из «Настроек рендера».</span>
         <button class="btn small" id="btnApOpenRender">Открыть настройки рендера</button>
@@ -833,6 +895,54 @@
       <div class="ractions">
         <button class="btn" id="btnApCancel">Отмена</button>
         <button class="btn btn-primary" id="btnApStart"><svg class="ic" aria-hidden="true"><use href="#i-bolt"/></svg>Запустить Авто-пак</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- P4 — авто-обогащение: мини-модалка запуска «Предложить монтаж» (ENRICH_PLAN §6).
+       Пер-типовые чекбоксы (выключенный тип не ищется), плотность, источник картинок. -->
+  <div id="enrichModal" class="overlay hidden" role="dialog" aria-modal="true" aria-label="Предложить монтаж">
+    <div class="card enrichCard">
+      <div class="filesHead">
+        <h2><svg class="ic ic-h2" aria-hidden="true"><use href="#i-sparkles"/></svg>Предложить монтаж</h2>
+        <button class="btn btn-ghost btn-icon" id="btnCloseEnrich" title="Закрыть" aria-label="Закрыть"><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg></button>
+      </div>
+      <p class="hint muted">ИИ проанализирует речь и предложит места для оформления. Вы увидите карточки с превью и решите каждое решение по отдельности — в ролик попадёт только то, что вы оставите включённым.</p>
+      <div class="enrTypes" role="group" aria-label="Что искать">
+        <span class="enrSubTitle muted">Что искать</span>
+        <label class="chk" title="Картинки/иллюстрации по контексту (PiP в углу кадра)"><input type="checkbox" id="enType_image" checked> Картинки</label>
+        <label class="chk" title="Анимированные пиктограммы (pop-in/pulse)"><input type="checkbox" id="enType_animation" checked> Анимации</label>
+        <label class="chk" title="Карточки-перечисления: пункты на затемнённом фоне"><input type="checkbox" id="enType_list_card" checked> Карточки-перечисления</label>
+        <label class="chk" title="Призывы: значок подписки/лайка и вопрос в комментарии"><input type="checkbox" id="enType_cta" checked> Призывы (CTA)</label>
+      </div>
+      <div class="rgrid enrGrid">
+        <label>Плотность
+          <select id="enDensity" class="select">
+            <option value="min">Минимум</option>
+            <option value="normal" selected>Норма</option>
+            <option value="aggressive">Агрессивно</option>
+          </select>
+          <div class="hint muted">Сколько оформления допускать. «Минимум» — профессионально-сдержанно.</div>
+        </label>
+        <label>Источник картинок
+          <select id="enImageSource" class="select">
+            <option value="auto" selected>Авто (папка → эмодзи)</option>
+            <option value="emoji">Только эмодзи</option>
+            <option value="user_folder">Папка с ассетами</option>
+          </select>
+        </label>
+      </div>
+      <div id="enUserFolderRow" class="rout hidden">
+        <div class="routrow">
+          <input id="enUserFolder" class="search" type="text" placeholder="папка с вашими картинками (png, jpg, webp)" aria-label="Папка ассетов пользователя">
+          <button class="btn" id="btnEnPickFolder"><svg class="ic" aria-hidden="true"><use href="#i-folder-open"/></svg>Обзор</button>
+        </div>
+        <div class="hint muted">ИИ подберёт картинки из этой папки по контексту (по именам файлов / descriptions.txt). Не найдёт подходящую — предложит выбрать вручную.</div>
+      </div>
+      <div id="enrichModalLlm" class="hint muted hidden">ИИ выключен (Ollama не найдена) — анализ недоступен. Включите Ollama (модель qwen3:8b).</div>
+      <div class="ractions">
+        <button class="btn" id="btnEnrichCancel">Отмена</button>
+        <button class="btn btn-primary" id="btnEnrichRun"><svg class="ic" aria-hidden="true"><use href="#i-sparkles"/></svg>Анализировать</button>
       </div>
     </div>
   </div>
