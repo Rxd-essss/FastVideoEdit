@@ -1,28 +1,40 @@
 # -*- coding: utf-8 -*-
-"""Draft CTA asset pack generator (ENRICH_PLAN §2.3) — P1 placeholder style.
+"""Chistovoy (final) CTA asset pack generator (ENRICH_PLAN §4 Tier 0, §7-P5).
 
-Renders the four CTA overlay animations as RGBA frame sequences with Pillow
-and encodes them to WebM VP9 yuva420p (the ONLY sane alpha format per R2 §3:
-GIF kills gradient alpha and is banned, APNG is the documented fallback):
+Renders the four CTA overlay animations as RGBA frame sequences with Pillow and
+encodes them to WebM VP9 yuva420p (the ONLY sane alpha format per R2 §3: GIF
+kills gradient alpha and is banned, APNG is the documented fallback):
 
-    vpipe/data/enrich/cta/subscribe_like.webm   rounded «ПОДПИСАТЬСЯ» badge +
-                                                thumb-up, sine pulse 1.00–1.06
-    vpipe/data/enrich/cta/comment.webm          speech bubble, pop_in
+    vpipe/data/enrich/cta/subscribe_like.webm   dark pill «ПОДПИСАТЬСЯ» + thumb,
+                                                sine pulse 1.00–1.06
+    vpipe/data/enrich/cta/comment.webm          speech bubble + dots, pop_in
                                                 0.95 -> 1.02 -> 1.0
-    vpipe/data/enrich/cta/like.webm             thumb-up disc, sine pulse
-    vpipe/data/enrich/cta/bell.webm             bell, damped wiggle (reserve)
+    vpipe/data/enrich/cta/like.webm             thumb-up on accent disc, pulse
+    vpipe/data/enrich/cta/bell.webm             bell glyph, damped wiggle
     vpipe/data/enrich/cta/anim_presets.json     preset parameters (dur/easing/
                                                 amplitude) consumed by P5/UI
 
-HARD rules (R3/§2.3): the artwork is OUR OWN, drawn from scratch — no play
-logo, no word «YouTube», no third-party packs. This is the DRAFT pack for the
-G1 style gate; the final SVG-based set arrives in P5.
+STYLE (§4, гейт G4) — собственный тёмно-премиум-стиль в духе UI проекта
+(web/style.css): глубокие подложки surface (#18202e / #1c2433), сине-фиолетовый
+акцент (#7c95ff → #5b76f7), мягкие скруглённые формы, аккуратная типографика
+Inter SemiBold, верхний световой блик и нижняя тень с градиентной альфой
+(градиент-альфа = лакмус качества VP9). Без кринжа, без «кислотных» цветов.
+
+HARD rules (R3/§4): artwork — НАШ собственный, нарисован с нуля. НИКАКОГО
+play-логотипа YouTube и слова «YouTube». Никаких чужих паков/Lottie.
 
 Determinism: no randomness, no timestamps. Frames are pure Pillow math; the
 encode runs single-threaded (`-threads 1 -row-mt 0`) with `-bitexact` and
 stripped metadata, so re-running the generator reproduces the .webm files
 byte-for-byte on the same machine (across machines the PNG rasterization may
 differ by a hair with another freetype — "близко" per plan).
+
+VP9 alpha note (verified 8.1.1): libvpx-vp9 stores alpha as a hidden secondary
+stream + Matroska `alpha_mode=1` tag. `ffprobe` with its NATIVE decoder reports
+`yuv420p` for such a file; only `ffprobe -c:v libvpx-vp9 …` (the decoder the
+render graph forces) exposes the true `yuva420p`. The alpha IS there — decode a
+frame back to PNG and the transparency round-trips. Verify with libvpx, not the
+native probe.
 
 Decode reminder for consumers (R2 traps, enforced in vpipe/render.py):
 `-c:v libvpx-vp9` strictly BEFORE `-i` (the native decoder silently drops the
@@ -51,16 +63,19 @@ FONT_SEMIBOLD = REPO / "vpipe" / "data" / "enrich" / "fonts" / "Inter-SemiBold.t
 
 FPS = 25
 N_FRAMES = 48                       # 1.92 s per loop (§2.3: 48 кадров / 25 fps)
-SS = 2                              # supersampling factor for crisp edges
-MAX_WEBM_BYTES = 200_000            # §7-P5 guard: every webm stays < 200 КБ
+SS = 3                              # supersampling factor for crisp edges
+MAX_WEBM_BYTES = 200_000           # §7-P5 guard: every webm stays < 200 КБ
 
-# Draft palette — простые черновые значки, чистовик в P5 (гейт G1/G4).
-BADGE_BG = (224, 53, 75, 255)       # subscribe badge — red-ish, НЕ YouTube-лого
-WHITE = (255, 255, 255, 255)
-INK = (31, 41, 55, 255)             # dark slate (bubble dots / bell clapper)
-ACCENT = (245, 158, 11, 255)        # #f59e0b — единый акцент проекта
-BUBBLE_BG = (255, 255, 255, 242)
-SHADOW = (0, 0, 0, 110)             # soft gradient-alpha shadow (VP9-лакмус)
+# --- тёмно-премиум-палитра (зеркало web/style.css) ----------------------------
+PANEL = (24, 32, 46, 255)           # #18202e — surface2 (подложка значка)
+PANEL_HI = (34, 44, 62, 255)        # верхний блик подложки (мягкий градиент)
+LINE = (148, 163, 199, 46)          # #94a3c7 @ .18 — тонкая граница (--line-strong)
+ACCENT = (124, 149, 255, 255)       # #7c95ff — акцент проекта (--accent)
+ACCENT2 = (91, 118, 247, 255)       # #5b76f7 — низ акцентного градиента (--accent2)
+WHITE = (236, 239, 246, 255)        # #e8ebf2 — текст (--text), не чисто-белый
+INK = (200, 209, 230, 255)          # светлый «холодный» штрих на тёмной подложке
+SHADOW = (0, 0, 0, 130)             # мягкая тень с градиент-альфой (VP9-лакмус)
+GLOW = (124, 149, 255, 70)          # лёгкое сияние акцента (gradient-alpha)
 
 # Animation presets (the json mirrors these numbers — single source below).
 PULSE_AMP = 0.06                    # scale 1.00 -> 1.06 -> 1.00 по синусу
@@ -98,99 +113,186 @@ def bell_angle(i: int, n: int = N_FRAMES) -> float:
         * (1.0 - i / n)
 
 
-# --- artwork (drawn once at SS resolution, transformed per frame) ---------------
-def _shadow(size: tuple[int, int], box: tuple[int, int, int, int],
-            radius: int) -> Image.Image:
-    """Soft rounded-rect shadow — gradient alpha is the VP9-quality litmus."""
+# --- low-level draw helpers (all coords already at SS resolution) ---------------
+def _lerp(a: tuple, b: tuple, t: float) -> tuple:
+    return tuple(round(a[k] + (b[k] - a[k]) * t) for k in range(len(a)))
+
+
+def _vgrad_rounded(size: tuple[int, int], box: tuple[float, float, float, float],
+                   radius: float, top: tuple, bottom: tuple) -> Image.Image:
+    """Vertical-gradient rounded rectangle (мягкий объём подложки/диска).
+
+    Рисуем градиент построчно и обрезаем по rounded-rect маске — даёт чистый
+    переход top->bottom с градиентной альфой по краю (лакмус VP9)."""
+    w, h = size
+    x0, y0, x1, y1 = box
+    grad = Image.new("RGBA", size, (0, 0, 0, 0))
+    px = grad.load()
+    span = max(1.0, y1 - y0)
+    ix0, ix1 = int(math.floor(x0)), int(math.ceil(x1))
+    for y in range(int(math.floor(y0)), int(math.ceil(y1))):
+        t = min(1.0, max(0.0, (y - y0) / span))
+        col = _lerp(top, bottom, t)
+        for x in range(ix0, ix1):
+            if 0 <= x < w and 0 <= y < h:
+                px[x, y] = col
+    mask = Image.new("L", size, 0)
+    ImageDraw.Draw(mask).rounded_rectangle(box, radius=radius, fill=255)
+    out = Image.new("RGBA", size, (0, 0, 0, 0))
+    out.paste(grad, (0, 0), mask)
+    return out
+
+
+def _drop_shadow(size: tuple[int, int], box: tuple[float, float, float, float],
+                 radius: float, dy: float, blur: float,
+                 color=SHADOW) -> Image.Image:
+    """Soft rounded-rect drop shadow — gradient alpha is the VP9 litmus."""
     img = Image.new("RGBA", size, (0, 0, 0, 0))
-    ImageDraw.Draw(img).rounded_rectangle(box, radius=radius, fill=SHADOW)
-    return img.filter(ImageFilter.GaussianBlur(10 * SS))
+    x0, y0, x1, y1 = box
+    ImageDraw.Draw(img).rounded_rectangle(
+        (x0, y0 + dy, x1, y1 + dy), radius=radius, fill=color)
+    return img.filter(ImageFilter.GaussianBlur(blur))
+
+
+def _soft_glow(size: tuple[int, int], box: tuple[float, float, float, float],
+               radius: float, blur: float, color=GLOW) -> Image.Image:
+    """Лёгкое акцентное сияние под значком (тонкая градиент-альфа)."""
+    img = Image.new("RGBA", size, (0, 0, 0, 0))
+    ImageDraw.Draw(img).rounded_rectangle(box, radius=radius, fill=color)
+    return img.filter(ImageFilter.GaussianBlur(blur))
+
+
+def _top_highlight(d: ImageDraw.ImageDraw,
+                   box: tuple[float, float, float, float], radius: float,
+                   width: int) -> None:
+    """Тонкий световой контур по верху подложки (стеклянный объём)."""
+    x0, y0, x1, y1 = box
+    d.rounded_rectangle((x0, y0, x1, y1), radius=radius,
+                        outline=LINE, width=width)
+    # верхняя дуга чуть ярче — имитация падающего света сверху
+    d.arc((x0 + width, y0 + width, x1 - width, y0 + 2 * radius),
+          start=200, end=340, fill=(255, 255, 255, 38), width=width)
 
 
 def _thumb_up(d: ImageDraw.ImageDraw, x: float, y: float, s: float,
               color=WHITE) -> None:
-    """Simple draft thumb-up in a 100x100 box at (x, y) scaled by ``s``."""
+    """Чистый палец-лайк (rounded) в боксе 100x100 при (x, y), масштаб ``s``."""
     def b(*xy):
         return [x + v * s if k % 2 == 0 else y + v * s
                 for k, v in enumerate(xy)]
-    d.rounded_rectangle(b(10, 48, 28, 88), radius=6 * s, fill=color)
-    d.rounded_rectangle(b(32, 46, 86, 88), radius=10 * s, fill=color)
-    d.polygon(b(36, 50, 40, 22, 56, 26, 56, 50), fill=color)
-    d.ellipse(b(40, 14, 58, 30), fill=color)
+    # манжета (кисть) + ладонь
+    d.rounded_rectangle(b(8, 50, 30, 92), radius=7 * s, fill=color)
+    d.rounded_rectangle(b(30, 48, 90, 92), radius=14 * s, fill=color)
+    # большой палец: стебель + подушечка
+    d.polygon(b(36, 52, 42, 20, 60, 24, 58, 52), fill=color)
+    d.ellipse(b(40, 12, 62, 34), fill=color)
 
 
+def _bell(d: ImageDraw.ImageDraw, w: int, h: int, color=WHITE) -> None:
+    """Аккуратный колокольчик по центру (rounded dome + язычок)."""
+    cx = w * 0.5
+    # купол
+    d.pieslice((w * 0.26, h * 0.16, w * 0.74, h * 0.66),
+               180, 360, fill=color)
+    d.rectangle((w * 0.26, h * 0.40, w * 0.74, h * 0.62), fill=color)
+    # навершие (knob)
+    r = w * 0.05
+    d.ellipse((cx - r, h * 0.10, cx + r, h * 0.10 + 2 * r), fill=color)
+    # основание (юбка) + язычок
+    d.rounded_rectangle((w * 0.18, h * 0.60, w * 0.82, h * 0.71),
+                        radius=w * 0.05, fill=color)
+    rr = w * 0.07
+    d.ellipse((cx - rr, h * 0.71, cx + rr, h * 0.71 + 2 * rr), fill=color)
+
+
+# --- artwork (drawn once at SS resolution, transformed per frame) ---------------
 def draw_subscribe_like(size: tuple[int, int]) -> Image.Image:
-    """Rounded badge «ПОДПИСАТЬСЯ» + thumb-up — one combined CTA (R5)."""
+    """Тёмная скруглённая капсула «ПОДПИСАТЬСЯ» + лайк (один объединённый CTA, R5)."""
     w, h = size
-    img = _shadow(size, (int(w * 0.035), int(h * 0.16),
-                         int(w * 0.965), int(h * 0.86)), int(h * 0.18))
+    rad = int(h * 0.30)
+    box = (int(w * 0.025), int(h * 0.12), int(w * 0.975), int(h * 0.88))
+    img = _drop_shadow(size, box, rad, dy=int(h * 0.05), blur=11 * SS)
+    img.alpha_composite(_vgrad_rounded(size, box, rad, PANEL_HI, PANEL))
     d = ImageDraw.Draw(img)
-    d.rounded_rectangle((int(w * 0.03), int(h * 0.12), int(w * 0.97),
-                         int(h * 0.82)), radius=int(h * 0.18), fill=BADGE_BG)
-    # thumb-up в круге слева
-    cx, cy, r = int(w * 0.115), int(h * 0.47), int(h * 0.26)
-    d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=WHITE)
-    _thumb_up(d, cx - r * 0.66, cy - r * 0.70, r * 0.0132, color=BADGE_BG)
-    # Текст вписывается в зону правее круга (детерминированный fit-цикл).
+    _top_highlight(d, box, rad, max(1, SS))
+    # акцентный диск слева с лайком
+    cx, cy = int(w * 0.155), int(h * 0.50)
+    r = int(h * 0.31)
+    disc_box = (cx - r, cy - r, cx + r, cy + r)
+    img.alpha_composite(_vgrad_rounded(size, disc_box, r, ACCENT, ACCENT2))
+    d = ImageDraw.Draw(img)
+    d.ellipse(disc_box, outline=(255, 255, 255, 40), width=max(1, SS))
+    _thumb_up(d, cx - r * 0.62, cy - r * 0.66, r * 0.0128, color=WHITE)
+    # «ПОДПИСАТЬСЯ» — детерминированный fit-цикл в зону правее диска
     text = "ПОДПИСАТЬСЯ"
-    zone_x0, zone_x1 = cx + r + int(h * 0.10), int(w * 0.93)
-    size = int(h * 0.30)
-    while size > 8:
-        font = ImageFont.truetype(str(FONT_SEMIBOLD), size)
+    zone_x0, zone_x1 = cx + r + int(h * 0.10), int(w * 0.95)
+    fsize = int(h * 0.32)
+    font = ImageFont.truetype(str(FONT_SEMIBOLD), fsize)
+    while fsize > 8:
+        font = ImageFont.truetype(str(FONT_SEMIBOLD), fsize)
         tx0, ty0, tx1, ty1 = d.textbbox((0, 0), text, font=font)
         if tx1 - tx0 <= zone_x1 - zone_x0:
             break
-        size -= 2
+        fsize -= 2
     d.text(((zone_x0 + zone_x1) / 2 - (tx1 - tx0) / 2 - tx0,
             cy - (ty1 - ty0) / 2 - ty0), text, font=font, fill=WHITE)
     return img
 
 
 def draw_like(size: tuple[int, int]) -> Image.Image:
-    """Thumb-up on an accent disc (standalone like, ручные вставки)."""
+    """Палец-лайк на акцентном диске (standalone like, ручные вставки)."""
     w, h = size
-    img = _shadow(size, (int(w * 0.16), int(h * 0.20),
-                         int(w * 0.84), int(h * 0.88)), int(w * 0.34))
+    box = (int(w * 0.15), int(h * 0.15), int(w * 0.85), int(h * 0.85))
+    r = (box[2] - box[0]) / 2
+    img = _soft_glow(size, (box[0] - 6 * SS, box[1] - 4 * SS,
+                            box[2] + 6 * SS, box[3] + 10 * SS), r, 14 * SS)
+    img.alpha_composite(_drop_shadow(size, box, r, dy=int(h * 0.04), blur=10 * SS))
+    img.alpha_composite(_vgrad_rounded(size, box, r, ACCENT, ACCENT2))
     d = ImageDraw.Draw(img)
-    d.ellipse((int(w * 0.12), int(h * 0.12), int(w * 0.88), int(h * 0.88)),
-              fill=ACCENT)
-    _thumb_up(d, w * 0.28, h * 0.26, w * 0.0046)
+    d.ellipse(box, outline=(255, 255, 255, 46), width=max(1, SS))
+    _thumb_up(d, w * 0.30, h * 0.27, w * 0.0044, color=WHITE)
     return img
 
 
 def draw_comment(size: tuple[int, int]) -> Image.Image:
-    """Speech bubble with three dots (cta_comment icon)."""
+    """Тёмное скруглённое облачко с тремя акцентными точками (cta_comment)."""
     w, h = size
-    img = _shadow(size, (int(w * 0.12), int(h * 0.22),
-                         int(w * 0.88), int(h * 0.72)), int(w * 0.14))
+    rad = int(w * 0.18)
+    box = (int(w * 0.12), int(h * 0.16), int(w * 0.88), int(h * 0.64))
+    img = _drop_shadow(size, box, rad, dy=int(h * 0.045), blur=10 * SS)
+    img.alpha_composite(_vgrad_rounded(size, box, rad, PANEL_HI, PANEL))
+    # хвостик облачка (треугольник в тон нижней части подложки)
+    tail = Image.new("RGBA", size, (0, 0, 0, 0))
+    ImageDraw.Draw(tail).polygon(
+        [(int(w * 0.30), int(h * 0.60)), (int(w * 0.48), int(h * 0.60)),
+         (int(w * 0.28), int(h * 0.82))], fill=PANEL)
+    img.alpha_composite(tail)
     d = ImageDraw.Draw(img)
-    d.rounded_rectangle((int(w * 0.10), int(h * 0.16), int(w * 0.90),
-                         int(h * 0.66)), radius=int(w * 0.14), fill=BUBBLE_BG)
-    d.polygon([(int(w * 0.26), int(h * 0.64)), (int(w * 0.44), int(h * 0.64)),
-               (int(w * 0.24), int(h * 0.84))], fill=BUBBLE_BG)
-    r = int(w * 0.045)
-    for fx in (0.32, 0.50, 0.68):
-        cx, cy = int(w * fx), int(h * 0.41)
-        d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=INK)
+    _top_highlight(d, box, rad, max(1, SS))
+    # три акцентные точки
+    r = int(w * 0.052)
+    for fx, col in ((0.32, ACCENT), (0.50, ACCENT), (0.68, ACCENT)):
+        cx, cy = int(w * fx), int(h * 0.40)
+        d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=col)
     return img
 
 
 def draw_bell(size: tuple[int, int]) -> Image.Image:
-    """Notification bell (reserve asset)."""
+    """Колокольчик-уведомление на акцентном диске (лёгкое покачивание)."""
     w, h = size
-    img = _shadow(size, (int(w * 0.22), int(h * 0.24),
-                         int(w * 0.78), int(h * 0.82)), int(w * 0.20))
+    box = (int(w * 0.15), int(h * 0.15), int(w * 0.85), int(h * 0.85))
+    r = (box[2] - box[0]) / 2
+    img = _soft_glow(size, (box[0] - 6 * SS, box[1] - 4 * SS,
+                            box[2] + 6 * SS, box[3] + 10 * SS), r, 14 * SS)
+    img.alpha_composite(_drop_shadow(size, box, r, dy=int(h * 0.04),
+                                     blur=10 * SS))
+    img.alpha_composite(_vgrad_rounded(size, box, r, ACCENT, ACCENT2))
     d = ImageDraw.Draw(img)
-    d.ellipse((int(w * 0.45), int(h * 0.08), int(w * 0.55), int(h * 0.18)),
-              fill=ACCENT)                                       # knob
-    d.pieslice((int(w * 0.25), int(h * 0.13), int(w * 0.75), int(h * 0.73)),
-               180, 360, fill=ACCENT)                            # dome
-    d.rectangle((int(w * 0.25), int(h * 0.42), int(w * 0.75), int(h * 0.66)),
-                fill=ACCENT)                                     # body
-    d.rounded_rectangle((int(w * 0.17), int(h * 0.64), int(w * 0.83),
-                         int(h * 0.74)), radius=int(w * 0.04), fill=ACCENT)
-    d.ellipse((int(w * 0.44), int(h * 0.74), int(w * 0.56), int(h * 0.86)),
-              fill=INK)                                          # clapper
+    d.ellipse(box, outline=(255, 255, 255, 46), width=max(1, SS))
+    # колокол — белым на акцентном диске (зеркало стиля like-значка)
+    bell_img = Image.new("RGBA", size, (0, 0, 0, 0))
+    _bell(ImageDraw.Draw(bell_img), w, h, color=WHITE)
+    img.alpha_composite(bell_img)
     return img
 
 
@@ -220,7 +322,10 @@ def render_frames(art: Image.Image, out_size: tuple[int, int], frames_dir: Path,
 
 
 def encode_webm(ffmpeg: str, frames_dir: Path, out: Path) -> None:
-    """PNG sequence -> WebM VP9 yuva420p (R2 §3 verdict), reproducible."""
+    """PNG sequence -> WebM VP9 yuva420p (R2 §3 verdict), reproducible.
+
+    `-pix_fmt yuva420p` keeps the alpha plane; libvpx-vp9 stores it as a hidden
+    secondary stream (probe with `-c:v libvpx-vp9` to see `yuva420p`)."""
     cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
            "-framerate", str(FPS), "-i", str(frames_dir / "fr%02d.png"),
            "-frames:v", str(N_FRAMES),
@@ -296,6 +401,7 @@ def main(argv=None) -> int:
 
     tmp_root = (out_dir / "_frames" if args.keep_frames
                 else Path(tempfile.mkdtemp(prefix="enrich_cta_")))
+    ok = True
     try:
         for name, size, draw_fn, scale_fn, angle_fn, alpha_fn in ASSETS:
             art = draw_fn((size[0] * SS, size[1] * SS))
@@ -305,14 +411,15 @@ def main(argv=None) -> int:
             out = out_dir / name
             encode_webm(ffmpeg, frames, out)
             kb = out.stat().st_size / 1024.0
-            flag = "" if out.stat().st_size < MAX_WEBM_BYTES else \
-                "  !! БОЛЬШЕ 200 КБ — ужми (§7-P5 лимит)"
+            over = out.stat().st_size >= MAX_WEBM_BYTES
+            ok = ok and not over
+            flag = "" if not over else "  !! БОЛЬШЕ 200 КБ — ужми (§7-P5 лимит)"
             print(f"  {name}: {kb:.1f} КБ{flag}")
     finally:
         if not args.keep_frames:
             shutil.rmtree(tmp_root, ignore_errors=True)
     print(f"  {write_presets(out_dir).name}: пресеты анимаций записаны")
-    return 0
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

@@ -543,14 +543,110 @@ def save_enrich(plan: EnrichPlan, path: str | Path) -> None:
 
 
 # --- emoji asset (Tier 0 fallback, §4) -------------------------------------------
+# Растеризатор эмодзи — РЕШЕНИЕ P5 (задокументировано в docstring emoji_png_path):
+# в .venv этой машины НЕТ svg→png библиотеки (cairosvg/resvg-py проверены живьём —
+# отсутствуют), а Pillow SVG не парсит. План §4 предусматривает ровно этот фолбэк:
+# «рендер цветного глифа эмодзи системным шрифтом через Pillow ImageFont». Имя
+# Noto («u26a1», «u1f1fa_u1f1f8») — это и есть кодпойнт(ы): разворачиваем обратно
+# в символ и рисуем цветной глиф Segoe UI Emoji (COLR/CBDT, embedded_color=True) на
+# прозрачном 256-px холсте с тёмной скруглённой мини-подложкой (§4). SVG-файл из
+# vpipe/data/enrich/emoji/noto (его кладёт P5-АССЕТЫ) нам не требуется — глиф даёт
+# шрифт; наличие .svg лишь подтверждает, что эмодзи из вендоренного сабсета.
+_EMOJI_FONT_CANDIDATES = (
+    Path(r"C:\Windows\Fonts\seguiemj.ttf"),     # Segoe UI Emoji (цветной, Win10/11)
+)
+EMOJI_BACKPLATE_RGBA = (17, 24, 39, 220)        # #111827 ~86% — тёмная мини-подложка
+EMOJI_BACKPLATE_PAD = 10                        # отступ подложки от краёв 256-холста
+EMOJI_BACKPLATE_RADIUS = 40                     # скругление подложки
+EMOJI_GLYPH_FRAC = 0.74                         # кегль глифа ≈ 74% от 256 (≈190 pt)
+
+
+def _emoji_to_char(name: str) -> str:
+    """Имя Noto-svg -> символ(ы). «u26a1»->'⚡'; «u1f1fa_u1f1f8»->'🇺🇸'
+    (ZWJ/флаги = несколько кодпойнтов через «_»). Битый сегмент -> '' (вызов
+    отдаст None — рендер честно дропнет оверлей со status_note)."""
+    out: list[str] = []
+    for part in name.strip().lower().split("_"):
+        hexv = part.lstrip("u")
+        if not hexv:
+            continue
+        try:
+            out.append(chr(int(hexv, 16)))
+        except (ValueError, OverflowError):
+            return ""
+    return "".join(out)
+
+
+def _emoji_font_path() -> Optional[Path]:
+    for p in _EMOJI_FONT_CANDIDATES:
+        if p.is_file():
+            return p
+    return None
+
+
+def _rasterize_emoji(char: str, dst: Path) -> bool:
+    """Цветной глиф ``char`` -> 256-px PNG с прозрачным фоном на тёмной
+    мини-подложке (Pillow + Segoe UI Emoji). Пишем атомарно (.tmp -> replace),
+    идемпотентно. True при успехе и НЕпустом PNG, иначе False (нет шрифта /
+    глиф не отрисовался / ошибка Pillow)."""
+    font_path = _emoji_font_path()
+    if font_path is None:
+        return False
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except Exception:  # noqa: BLE001 — Pillow обязателен в проекте, но не валим
+        return False
+    size = EMOJI_PNG_SIZE
+    try:
+        font = ImageFont.truetype(str(font_path), int(size * EMOJI_GLYPH_FRAC))
+        # глиф на собственном слое -> центрируем по его bbox (эмодзи в шрифте
+        # не центрированы по метрикам) -> поверх тёмной подложки.
+        glyph = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        ImageDraw.Draw(glyph).text((size // 2, size // 2), char, font=font,
+                                   anchor="mm", embedded_color=True)
+        bbox = glyph.getbbox()
+        if not bbox:
+            return False                # глиф пуст (нет такого эмодзи в шрифте)
+        img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        ImageDraw.Draw(img).rounded_rectangle(
+            [EMOJI_BACKPLATE_PAD, EMOJI_BACKPLATE_PAD,
+             size - EMOJI_BACKPLATE_PAD, size - EMOJI_BACKPLATE_PAD],
+            radius=EMOJI_BACKPLATE_RADIUS, fill=EMOJI_BACKPLATE_RGBA)
+        gw, gh = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        ox = (size - gw) // 2 - bbox[0]
+        oy = (size - gh) // 2 - bbox[1]
+        img.alpha_composite(glyph, (ox, oy))
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dst.with_suffix(".png.tmp")
+        img.save(tmp, "PNG")
+        os.replace(tmp, dst)
+    except Exception:  # noqa: BLE001 — любой сбой растеризации = «ассета нет»
+        try:
+            dst.with_suffix(".png.tmp").unlink()
+        except OSError:
+            pass
+        return False
+    return dst.is_file() and dst.stat().st_size > 0
+
+
 def emoji_png_path(emoji: str, cache_dir: Optional[Path] = None) -> Optional[Path]:
     """Resolve a Noto emoji name (e.g. ``u26a1``) to a cached 256 px PNG.
 
-    P1 stub with the FINAL interface: returns the cached PNG when present in
-    ``cache/enrich_emoji/``; otherwise ``None`` (the caller drops the overlay
-    from the render with a status_note). The actual svg -> png rasterization
-    (Pillow over the vendored Noto subset in ``vpipe/data/enrich/emoji/noto``)
-    arrives in P5 — until then there is nothing to rasterize anyway.
+    РАСТЕРИЗАЦИЯ (выбор P5, проверен живьём на этой машине). В .venv нет
+    svg->png библиотеки (cairosvg/resvg-py отсутствуют — проверено), Pillow
+    SVG не парсит. План §4 даёт ровно этот фолбэк: рендер ЦВЕТНОГО глифа
+    эмодзи системным шрифтом через Pillow. Имя Noto — это кодпойнт(ы)
+    (``u26a1`` = U+26A1, ``u1f1fa_u1f1f8`` = флаг из двух кодпойнтов); код
+    разворачивает имя в символ и рисует цветной глиф Segoe UI Emoji
+    (``C:\\Windows\\Fonts\\seguiemj.ttf``, COLR/CBDT, ``embedded_color=True``)
+    на ПРОЗРАЧНОМ 256-px холсте с тёмной скруглённой мини-подложкой (§4:
+    «на тёмной мини-подложке»). Вендоренный SVG-сабсет не требуется — глиф
+    даёт шрифт.
+
+    Кэш: ``cache/enrich_emoji/<имя>_256.png``, идемпотентно (есть файл —
+    отдаём как есть; нет — растеризуем атомарно). Возврат — путь к НЕпустому
+    PNG либо ``None`` (пустое имя / битый кодпойнт / нет шрифта / глиф пуст);
+    на ``None`` рендер дропает оверлей со status_note.
     """
     emoji = _s(emoji)
     if not emoji:
@@ -558,12 +654,11 @@ def emoji_png_path(emoji: str, cache_dir: Optional[Path] = None) -> Optional[Pat
     cache = Path(cache_dir) if cache_dir is not None else EMOJI_CACHE_DIR
     png = cache / f"{emoji}_{EMOJI_PNG_SIZE}.png"
     if png.is_file():
-        return png
-    svg = EMOJI_SVG_DIR / f"{emoji}.svg"
-    if not svg.is_file():
-        return None
-    # P5: rasterize svg -> png 256 on a dark mini-backplate (Pillow), cache it.
-    return None
+        return png                      # идемпотентно: уже растеризовано
+    char = _emoji_to_char(emoji)
+    if not char:
+        return None                     # имя не разворачивается в кодпойнт(ы)
+    return png if _rasterize_emoji(char, png) else None
 
 
 # --- render-ready plan (§2.1) -----------------------------------------------------
@@ -918,7 +1013,8 @@ def plan_render(plan: EnrichPlan, timeline: Timeline,
             p = emoji_png_path(pl2.emoji, EMOJI_CACHE_DIR)
             if p is None:
                 it.status_note = (f"эмодзи-ассет {pl2.emoji or '(пусто)'} "
-                                  "недоступен (Noto-сабсет придёт в P5)")
+                                  "не растеризовался (битый кодпойнт / нет "
+                                  "шрифта эмодзи)")
                 lg(f"  enrich: {it.status_note} ({it.id})")
                 continue
             path = str(p)

@@ -359,25 +359,31 @@ def test_emoji_uses_cache_or_drops(tmp_path, monkeypatch):
     cache.mkdir()
     monkeypatch.setattr(enrich, "EMOJI_CACHE_DIR", cache)
     cached = cache / f"u26a1_{enrich.EMOJI_PNG_SIZE}.png"
-    cached.write_bytes(b"png")
+    cached.write_bytes(b"png")                                # уже в кэше
     tl = Timeline([], duration=300)
     ok = img("ok", 100.0, kind="emoji", emoji="u26a1")
-    miss = img("miss", 150.0, kind="emoji", emoji="u1f4a9")
+    # битый кодпойнт не разворачивается в символ -> дроп из рендера (P5: реальная
+    # растеризация; невалидное имя честно даёт status_note, item остаётся в плане)
+    miss = img("miss", 150.0, kind="emoji", emoji="zzz")
     plan, re = run([ok, miss], tl)
     assert len(re.stills) == 1
-    assert re.stills[0].path == str(cached)
-    assert "P5" in miss.status_note                           # заглушка честная
+    assert re.stills[0].path == str(cached)                   # из кэша как есть
+    assert "zzz" in miss.status_note                          # честная пометка
     assert miss.enabled is True
 
 
 def test_emoji_png_path_interface(tmp_path):
     cache = tmp_path / "c"
     cache.mkdir()
-    assert enrich.emoji_png_path("", cache) is None
-    assert enrich.emoji_png_path("u26a1", cache) is None      # нет svg и кэша
+    assert enrich.emoji_png_path("", cache) is None           # пустое имя
+    assert enrich.emoji_png_path("zzz", cache) is None        # битый кодпойнт
+    # уже закэшированный файл отдаётся как есть (идемпотентно)
     p = cache / f"u26a1_{enrich.EMOJI_PNG_SIZE}.png"
     p.write_bytes(b"png")
     assert enrich.emoji_png_path("u26a1", cache) == p
+    # валидный noto-кодпойнт без кэша -> растеризуется в НЕпустой PNG (P5)
+    p2 = enrich.emoji_png_path("u1f5c3", cache)
+    assert p2 is not None and p2.is_file() and p2.stat().st_size > 0
 
 
 def test_asset_kind_none_skipped_silently():

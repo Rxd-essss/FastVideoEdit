@@ -98,6 +98,9 @@ MAX_UPLOAD_BYTES = 30 * 1024**3   # 30 GB upload cap
 # видео (из видеоконтейнера ffmpeg возьмёт звуковую дорожку).
 AUDIO_EXT = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".wma"}
 MUSIC_EXT = AUDIO_EXT | VIDEO_EXT
+# Авто-обогащение (§4 Tier 1 / «заменить ассет»): белый список картинок-ассетов
+# для /api/browse?kind=image — ровно те форматы, что индексирует match_user_assets.
+IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp"}
 # Extensions /api/output is allowed to serve — exactly the artifacts the pipeline
 # produces (rendered video, sidecar subs, chapters/metadata txt, NLE projects).
 OUTPUT_EXT_ALLOWED = {".mp4", ".mov", ".mkv", ".webm", ".m4v",
@@ -1999,9 +2002,10 @@ def browse(dir: Optional[str] = None, kind: Optional[str] = None):
     base = base.resolve()
     if not base.exists() or not base.is_dir():
         raise HTTPException(404, "Folder not found")
-    # kind="music": файл-пикер фоновой музыки (C3) — показываем аудио и видео
-    # из MUSIC_EXT; любой другой kind — прежний список видеофайлов.
-    exts = MUSIC_EXT if kind == "music" else VIDEO_EXT
+    # kind="music": файл-пикер фоновой музыки (C3) — аудио+видео из MUSIC_EXT;
+    # kind="image": пикер «заменить ассет» обогащения (§4) — картинки IMAGE_EXT;
+    # любой другой kind (в т.ч. "folder"/"video"/None) — прежний список видео.
+    exts = {"music": MUSIC_EXT, "image": IMAGE_EXT}.get(kind, VIDEO_EXT)
     folders, files = [], []
     try:
         for e in sorted(base.iterdir(), key=lambda p: p.name.lower()):
@@ -3255,14 +3259,17 @@ def _enrich_state(s: Session) -> dict:
 
 def _run_enrich_detectors(s: Session, params: dict, log) -> list:
     """P3 (ENRICH_PLAN §7-P3): три LLM-детектора §3.1–3.3 (списки / CTA /
-    иллюстрации, vpipe/enrich_llm.py). ``s.llm`` уже есть (llm_off отсечён в
-    эндпоинте); ``params`` — полные настройки запуска, детекторам уходит их
-    whitelist-подмножество (sanitize_params). Прогресс задачи — по детекторам
-    (lists 45 / cta 15 / illustrations 30 / assets 10); сбойное окно/детектор
-    не валит задачу (warnings уходят в log)."""
+    иллюстрации, vpipe/enrich_llm.py) + этап ассетов §4 (P5). ``s.llm`` уже
+    есть (llm_off отсечён в эндпоинте); ``params`` — полные настройки запуска,
+    детекторам уходит их whitelist-подмножество (sanitize_params), а
+    ``user_folder`` (Tier 1, §4) — отдельным kwarg (в params-блок плана §1.2 он
+    не входит). Прогресс задачи — по детекторам (lists 45 / cta 15 /
+    illustrations 30 / assets 10); сбойное окно/детектор/этап не валит задачу
+    (warnings уходят в log)."""
     return enrich_llm.detect_all(
         s.transcript, s.cutlist, enrich_mod.sanitize_params(params), s.llm,
-        log=log, on_progress=s.set_progress)
+        log=log, on_progress=s.set_progress,
+        user_folder=(params or {}).get("user_folder", ""))
 
 
 def _merge_enrich_user_state(s: Session, items: list) -> list:

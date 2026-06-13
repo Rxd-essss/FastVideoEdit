@@ -206,9 +206,10 @@ def test_suggest_routes_to_detect_all_with_sanitized_params(client, monkeypatch,
     seen: dict = {}
 
     def fake_detect_all(transcript, cutlist, params, llm, log=None,
-                        on_progress=None):
+                        on_progress=None, *, user_folder=None):
         seen.update(transcript=transcript, cutlist=cutlist, params=params,
-                    llm=llm, log=log, on_progress=on_progress)
+                    llm=llm, log=log, on_progress=on_progress,
+                    user_folder=user_folder)
         return []
 
     monkeypatch.setattr(serve.enrich_llm, "detect_all", fake_detect_all)
@@ -221,6 +222,8 @@ def test_suggest_routes_to_detect_all_with_sanitized_params(client, monkeypatch,
     assert seen["cutlist"] is sess.cutlist
     assert seen["llm"] is sess.llm
     assert callable(seen["log"]) and callable(seen["on_progress"])
+    # user_folder (§4 Tier 1) уходит отдельным kwarg, НЕ в params-блоке плана
+    assert seen["user_folder"] == "D:/assets"
     # детекторам уходит ровно whitelist-подмножество (sanitize_params)
     assert seen["params"] == {
         "density": "min",

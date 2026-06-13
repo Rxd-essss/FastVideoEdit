@@ -1,0 +1,39 @@
+Third-party assets bundled with FastVideoEdit
+=============================================
+
+This file lists the third-party assets vendored into this repository and their
+licenses. (Python package dependencies declare their own licenses via their
+distribution metadata and are not duplicated here.)
+
+The default enrichment shipment ("auto-enrich", ENRICH_PLAN §4 Tier 0) keeps a
+deliberately small third-party footprint: exactly two upstream sources — the
+Noto Emoji SVG subset and the Inter font. The CTA animation pack
+(vpipe/data/enrich/cta/*.webm) is our own original artwork (no third-party
+emoji/CTA packs, no Lottie collections).
+
+
+1. Noto Emoji  (SVG subset)
+---------------------------
+Files   : vpipe/data/enrich/emoji/noto/u*.svg  (~97 thematic pictograms,
+          vendored unmodified from upstream svg/emoji_uXXXX.svg)
+Source  : https://github.com/googlefonts/noto-emoji
+License : Apache License, Version 2.0
+          (the Noto Emoji *image resources* — SVG/PNG — are Apache-2.0; the
+          emoji *font* under the upstream fonts/ subdirectory is OFL and is
+          NOT used here)
+Copyright 2013 Google, Inc. All Rights Reserved.
+Full text: vpipe/data/enrich/emoji/noto/LICENSE
+           https://www.apache.org/licenses/LICENSE-2.0
+
+Attribution in rendered videos is NOT required by Apache-2.0.
+
+
+2. Inter  (static TTF)
+----------------------
+Files   : vpipe/data/enrich/fonts/Inter-Medium.ttf
+          vpipe/data/enrich/fonts/Inter-SemiBold.ttf
+Source  : https://github.com/rsms/inter
+License : SIL Open Font License, Version 1.1 (OFL-1.1)
+Copyright (c) 2016 The Inter Project Authors
+          (https://github.com/rsms/inter)
+Full text: vpipe/data/enrich/fonts/LICENSE-OFL.txt
