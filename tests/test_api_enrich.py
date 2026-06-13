@@ -4,7 +4,8 @@ GET /api/enrich, /api/enrich/save, opts.enrich рендера и /api/state.
 TestClient + FakeSession (паттерн test_api_clips), без ffmpeg/whisper/Ollama.
 
 Покрывает §7-P2 целиком:
- 1. suggest happy с P3-заглушкой детекторов: задача ``enrich``, файл
+ 1. suggest happy (детекторы P3 деградируют на llm без chat_json): задача
+    ``enrich``, файл
     out/<stem>.enrich.json создан атомарно с правильными hash/cutlist_rev/
     model/params и ПУСТЫМИ items; настройки персистятся в cache/enrich_ui.json;
     повторный suggest НЕ теряет работу юзера (мерж: enabled/edited по id +
@@ -182,7 +183,8 @@ def test_suggest_happy_creates_plan_with_hash_and_rev(client, monkeypatch,
     assert data["params"]["types"] == {"image": False, "animation": True,
                                        "list_card": True, "cta": True}
     assert data["params"]["image_source"] == "emoji"
-    # P3-заглушка: детекторов нет → план честно пуст
+    # llm=object() без chat_json: каждый вызов детектора падает и честно
+    # пропускается (one-bad-window/детектор не валит пасс) → план пуст
     assert data["items"] == []
     assert sess.task["results"]["enrich"]["items"] == []
 
@@ -195,23 +197,42 @@ def test_suggest_happy_creates_plan_with_hash_and_rev(client, monkeypatch,
     assert saved["stocks"] == {"enabled": False}
 
 
-def test_suggest_stub_logs_p3_stage(client, monkeypatch, tmp_path):
+def test_suggest_routes_to_detect_all_with_sanitized_params(client, monkeypatch,
+                                                            tmp_path):
+    """P3: заглушка заменена на enrich_llm.detect_all — задача передаёт ему
+    транскрипт/катлист/whitelist-params/llm сессии и прогресс-хук."""
     sess = FakeSession(tmp_path, llm=object())
     _install(monkeypatch, sess)
-    stages: list[str] = []
-    real_stage = FakeSession.stage
-    monkeypatch.setattr(FakeSession, "stage",
-                        lambda self, m: (stages.append(m),
-                                         real_stage(self, m)))
-    client.post("/api/enrich/suggest", json={})
+    seen: dict = {}
+
+    def fake_detect_all(transcript, cutlist, params, llm, log=None,
+                        on_progress=None):
+        seen.update(transcript=transcript, cutlist=cutlist, params=params,
+                    llm=llm, log=log, on_progress=on_progress)
+        return []
+
+    monkeypatch.setattr(serve.enrich_llm, "detect_all", fake_detect_all)
+    client.post("/api/enrich/suggest",
+                json={"types": {"cta": False}, "density": "min",
+                      "user_folder": "D:/assets"})    # не-params ключ отсечён
     _wait_done(sess)
-    assert any("P3" in m for m in stages)        # заглушка честно объявилась
+    assert sess.task["error"] is None
+    assert seen["transcript"] is sess.transcript
+    assert seen["cutlist"] is sess.cutlist
+    assert seen["llm"] is sess.llm
+    assert callable(seen["log"]) and callable(seen["on_progress"])
+    # детекторам уходит ровно whitelist-подмножество (sanitize_params)
+    assert seen["params"] == {
+        "density": "min",
+        "types": {"image": True, "animation": True,
+                  "list_card": True, "cta": False},
+        "image_source": "auto"}
 
 
 def test_suggest_rerun_preserves_user_edits(client, monkeypatch, tmp_path):
     """CRITICAL код-ревью P2: повторный suggest НЕ уничтожает работу юзера —
     ручные предложения (source:"user") и правки enabled/edited переживают
-    новый анализ (детекторы-заглушка P2 возвращают [])."""
+    новый анализ (llm=object() — детекторы деградируют в [])."""
     sess = FakeSession(tmp_path, llm=object(), duration=120.0)
     _install(monkeypatch, sess)
     client.post("/api/enrich/suggest", json={})

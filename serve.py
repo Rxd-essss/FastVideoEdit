@@ -64,6 +64,7 @@ from vpipe import chapters as chapters_mod
 from vpipe import clips as clips_mod
 from vpipe import enrich as enrich_mod
 from vpipe import enrich_cards
+from vpipe import enrich_llm
 from vpipe import facecrop as facecrop_mod
 from vpipe import ffmpeg_utils
 from vpipe import metadata as metadata_mod
@@ -3253,12 +3254,15 @@ def _enrich_state(s: Session) -> dict:
 
 
 def _run_enrich_detectors(s: Session, params: dict, log) -> list:
-    """ЗАГЛУШКА-ХУК P3 (ENRICH_PLAN §7-P2): три LLM-детектора (§3.1–3.3 —
-    списки / CTA / иллюстрации, vpipe/enrich_llm.py) подключаются сюда в P3
-    с этой же сигнатурой; до тех пор suggest честно строит ПУСТОЙ план —
-    вся обвязка задачи/персиста/статусов уже боевая."""
-    log("enrich: LLM-детекторы появятся в P3 — пока пустой план")
-    return []
+    """P3 (ENRICH_PLAN §7-P3): три LLM-детектора §3.1–3.3 (списки / CTA /
+    иллюстрации, vpipe/enrich_llm.py). ``s.llm`` уже есть (llm_off отсечён в
+    эндпоинте); ``params`` — полные настройки запуска, детекторам уходит их
+    whitelist-подмножество (sanitize_params). Прогресс задачи — по детекторам
+    (lists 45 / cta 15 / illustrations 30 / assets 10); сбойное окно/детектор
+    не валит задачу (warnings уходят в log)."""
+    return enrich_llm.detect_all(
+        s.transcript, s.cutlist, enrich_mod.sanitize_params(params), s.llm,
+        log=log, on_progress=s.set_progress)
 
 
 def _merge_enrich_user_state(s: Session, items: list) -> list:
