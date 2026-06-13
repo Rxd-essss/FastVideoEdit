@@ -169,6 +169,16 @@ def _enum(v, allowed: tuple, default: str) -> str:
     return v if v in allowed else default
 
 
+def _abs_path(v) -> str:
+    """Только абсолютный путь к ассету (path-traversal guard, код-ревью P2):
+    относительные строки вроде «../../config.yaml» из правленного руками
+    enrich.json / тела /api/enrich/save не должны попадать во входы
+    ffmpeg-графа. Пустая строка = «ассета нет» (рендер честно дропнет item
+    со status_note «ассет не найден»)."""
+    s = _s(v)
+    return s if s and Path(s).is_absolute() else ""
+
+
 # --- payload models (§1.2) -----------------------------------------------------
 @dataclass
 class ImagePayload:
@@ -200,7 +210,7 @@ class ImagePayload:
                              ("photo", "diagram", "icon"), "photo"),
             asset_kind=_enum(d.get("asset_kind"),
                              ("emoji", "user", "none"), "none"),
-            asset_path=_s(d.get("asset_path")),
+            asset_path=_abs_path(d.get("asset_path")),
             emoji=_s(d.get("emoji")),
             position=_enum(d.get("position"),
                            ("top_right", "top_left"), "top_right"),
@@ -233,7 +243,7 @@ class AnimationPayload:
             preset=_enum(d.get("preset"), ("pop_in", "pulse"), "pop_in"),
             asset_kind=_enum(d.get("asset_kind"),
                              ("emoji", "user", "none"), "none"),
-            asset_path=_s(d.get("asset_path")),
+            asset_path=_abs_path(d.get("asset_path")),
             emoji=_s(d.get("emoji")),
             position=_enum(d.get("position"),
                            ("top_right", "top_left"), "top_right"),

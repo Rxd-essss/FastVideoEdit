@@ -62,6 +62,8 @@ import anyio
 
 from vpipe import chapters as chapters_mod
 from vpipe import clips as clips_mod
+from vpipe import enrich as enrich_mod
+from vpipe import enrich_cards
 from vpipe import facecrop as facecrop_mod
 from vpipe import ffmpeg_utils
 from vpipe import metadata as metadata_mod
@@ -542,6 +544,107 @@ def _write_detect_opts(opts: dict) -> None:
         pass
 
 
+# --- авто-обогащение: настройки запуска (ENRICH_PLAN §5, cache/enrich_ui.json) --
+_ENRICH_TYPE_KEYS = ("image", "animation", "list_card", "cta")
+_ENRICH_DENSITIES = ("min", "normal", "aggressive")
+_ENRICH_IMAGE_SOURCES = ("auto", "emoji", "user_folder")
+
+
+def _enrich_opts_path() -> Path:
+    """``cache_dir/enrich_ui.json`` — персист настроек «Предложить монтаж»."""
+    return Path(APP["cfg"].paths.cache_dir) / "enrich_ui.json"
+
+
+def _default_enrich_opts() -> dict:
+    return {"types": {k: True for k in _ENRICH_TYPE_KEYS},
+            "density": "normal", "image_source": "auto",
+            "user_folder": "", "stocks": {"enabled": False}}
+
+
+def _sanitize_enrich_opts(raw, *, strict: bool = True) -> dict:
+    """Whitelist-sanitize настроек обогащения в канонический вид (паттерн B5
+    _sanitize_detect_opts): ``strict=True`` (тело POST /api/enrich/suggest) —
+    неверный ТИП/значение вне белого списка → 400; ``strict=False`` (чтение
+    enrich_ui.json) — мусор молча заменяется дефолтом (битый файл не должен
+    ронять /api/state). Неизвестные ключи игнорируются в обоих режимах.
+
+    ``stocks.enabled`` принудительно False: стоки — Tier 2 (v1.1, строго
+    opt-in OFF); до их появления персист не имеет права хранить заранее
+    взведённый облачный тумблер (§4/§9 — приватность)."""
+    out = _default_enrich_opts()
+    if not isinstance(raw, dict):
+        if strict:
+            raise HTTPException(400, "Настройки обогащения: ожидается объект")
+        return out
+
+    t = raw.get("types")
+    if t is not None:
+        if not isinstance(t, dict):
+            if strict:
+                raise HTTPException(
+                    400, "types: ожидается объект {тип: true/false}")
+        else:
+            for k in _ENRICH_TYPE_KEYS:
+                if k not in t:
+                    continue
+                v = t[k]
+                if not isinstance(v, bool):
+                    if strict:
+                        raise HTTPException(400, f"types.{k}: ожидается "
+                                                 "true/false")
+                    continue
+                out["types"][k] = v
+
+    for key, allowed in (("density", _ENRICH_DENSITIES),
+                         ("image_source", _ENRICH_IMAGE_SOURCES)):
+        v = raw.get(key)
+        if v is None:
+            continue
+        if v in allowed:
+            out[key] = v
+        elif strict:
+            raise HTTPException(400, f"{key}: допустимы "
+                                     + ", ".join(allowed))
+
+    uf = raw.get("user_folder")
+    if uf is not None:
+        if isinstance(uf, str):
+            out["user_folder"] = uf.strip()
+        elif strict:
+            raise HTTPException(400, "user_folder: ожидается строка-путь")
+
+    st = raw.get("stocks")
+    if st is not None and not isinstance(st, dict) and strict:
+        raise HTTPException(400, "stocks: ожидается объект {enabled: false}")
+    # v1: стоков нет — что бы ни прислали/ни лежало в файле, enabled=False.
+    return out
+
+
+def _read_enrich_opts() -> Optional[dict]:
+    """Сохранённые настройки обогащения. ``None`` — не настраивали / битый файл
+    (= дефолты, паттерн detect_opts)."""
+    try:
+        data = json.loads(_enrich_opts_path().read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 — missing / unreadable / bad JSON
+        return None
+    if not isinstance(data, dict):
+        return None
+    return _sanitize_enrich_opts(data, strict=False)
+
+
+def _write_enrich_opts(opts: dict) -> None:
+    """Персист настроек атомарно (.tmp -> os.replace). Best-effort как
+    detect_ui.json: настройки уже применены к задаче, неудача записи — не 500."""
+    p = _enrich_opts_path()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(opts, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, p)
+    except OSError:
+        pass
+
+
 def _apply_detect_opts(cfg: Config, opts: Optional[dict]) -> Config:
     """Effective detection config = ``cfg`` + sanitized UI options.
 
@@ -942,6 +1045,24 @@ def _resolve_render_opts(s: Session, opts: dict):
     else:
         cfg.render.music.enabled = False
 
+    # --- авто-обогащение (ENRICH_PLAN §5) ------------------------------------
+    # Контракт как у music: без явного opts.enrich = {enabled:true} обогащение
+    # ВЫКЛЮЧЕНО — даже если config.yaml включил его в сессии. Любой мусор
+    # вместо объекта (строка/число/null) тоже честно выключает. min_score —
+    # служебная ручка Авто-пака (score>=70 поверх enabled, без ревью); мусор
+    # в ней игнорируется, значение клампится в 0..100.
+    en = opts.get("enrich")
+    if isinstance(en, dict) and en.get("enabled"):
+        cfg.render.enrich.enabled = True
+        ms = en.get("min_score")
+        if ms is not None and not isinstance(ms, bool):
+            try:                       # NaN → ValueError, ±inf → OverflowError
+                cfg.render.enrich.min_score = max(0, min(100, int(ms)))
+            except (TypeError, ValueError, OverflowError):
+                pass
+    else:
+        cfg.render.enrich.enabled = False
+
     # --- scale_h: None (source) or an int in [144, 4320] ---------------------
     # When vertical is on, the exact target scale is baked into the crop filter,
     # so the generic height resize is ignored (forced to None) to avoid a double
@@ -976,6 +1097,22 @@ def _resolve_render_opts(s: Session, opts: dict):
     stem = Path((opts.get("filename") or s.inp.stem).strip() or s.inp.stem).stem
     base = out_dir / stem
     return cfg, scale_h, fps, out_dir, base
+
+
+def _final_render_dims(s: Session, scale_h,
+                       vert_dims: Optional[tuple[int, int]]) -> tuple[int, int]:
+    """(W, H) финального кадра — для PlayRes ASS-файлов и планировщика enrich.
+
+    Ровно та логика, что исторически жила в ass-блоке _run_render_pipeline:
+    vertical → точная цель кропа; иначе высота = scale_h (или исходная),
+    ширина — пропорциональна источнику."""
+    if vert_dims is not None:
+        return vert_dims
+    out_h = int(scale_h) if scale_h else (s.media.height or 1080)
+    src_w = s.media.width or 1920
+    src_h = s.media.height or 1080
+    out_w = int(round(src_w * out_h / src_h)) if src_h else 1920
+    return out_w, out_h
 
 
 def _run_render_pipeline(s: Session, cfg, scale_h, fps, out_dir: Path,
@@ -1061,15 +1198,9 @@ def _run_render_pipeline(s: Session, cfg, scale_h, fps, out_dir: Path,
             cues_ass = subs_mod.build_cues(
                 words_final, s.matcher, cfg.subtitles, cfg.masking,
                 tl_ass.new_duration())
-            if vert_dims is not None:
-                # Vertical: PlayRes must match the cropped+scaled output so style
-                # sizes/margins are pixel-accurate against the 9:16 frame.
-                out_w, out_h = vert_dims
-            else:
-                out_h = int(scale_h) if scale_h else (s.media.height or 1080)
-                src_w = s.media.width or 1920
-                src_h = s.media.height or 1080
-                out_w = int(round(src_w * out_h / src_h)) if src_h else 1920
+            # Vertical: PlayRes must match the cropped+scaled output so style
+            # sizes/margins are pixel-accurate against the 9:16 frame.
+            out_w, out_h = _final_render_dims(s, scale_h, vert_dims)
             # Clip Maker (план §2.3.4): per-clip имя ASS, чтобы клипы цикла не
             # перетирали один burn.ass; обычный рендер — прежнее имя бит-в-бит.
             ass_name = ("burn.ass" if cutlist_override is None
@@ -1085,13 +1216,58 @@ def _run_render_pipeline(s: Session, cfg, scale_h, fps, out_dir: Path,
             on_stage(f"Вшитые субтитры: не удалось подготовить ({e}); рендер без них.")
             ass_path = None
 
+    # ENRICH (ENRICH_PLAN §5): оверлеи авто-обогащения — ТОЛЬКО основной рендер.
+    # Клипы Clip Maker и автопак-клипы идут по cutlist_override-пути и
+    # обогащение не получают (анти-скоуп §9). mp4 свят (паттерн burn-блока):
+    # нет плана / несвежий hash / любой сбой подготовки → лог-warning через
+    # on_stage и рендер БЕЗ обогащения, задача не падает.
+    render_enrich = None
+    if cfg.render.enrich.enabled and cutlist_override is None:
+        try:
+            plan = enrich_mod.load_enrich(_enrich_json_path(s))
+            if plan is None:
+                on_stage("Обогащение: план не найден (enrich.json) — "
+                         "рендер без обогащения.")
+            elif plan.hash != s.audio_hash:
+                on_stage("Обогащение: план от другого видео (hash не совпал) — "
+                         "рендер без обогащения.")
+            else:
+                ms = int(cfg.render.enrich.min_score or 0)
+                if ms > 0:           # автопак: score>=70 ПОВЕРХ enabled (§5)
+                    plan.items = [it for it in plan.items if it.score >= ms]
+                tl_enr = Timeline(removed, s.media.duration)
+                out_w, out_h = _final_render_dims(s, scale_h, vert_dims)
+                re_plan = enrich_mod.plan_render(
+                    plan, tl_enr, tr.all_words() if tr is not None else None,
+                    cfg, out_w, out_h,
+                    log=lambda m="": on_stage(str(m).strip() or "Обогащение…"))
+                if re_plan.cards or re_plan.cta_texts:
+                    # Карточки/вопрос CTA — отдельный ASS (идёт ПЕРВЫМ
+                    # subtitles-фильтром, burn.ass остаётся последним, §2.2).
+                    enr_ass = Path(s.work_dir) / f"enrich_{base.name}.ass"
+                    enrich_cards.write_enrich_ass(
+                        re_plan.cards, re_plan.cta_texts, out_w, out_h,
+                        enr_ass)
+                    re_plan.cards_ass = str(enr_ass)
+                if re_plan.stills or re_plan.anims or re_plan.cards_ass:
+                    render_enrich = re_plan
+                else:
+                    on_stage("Обогащение: в плане нет применимых предложений — "
+                             "рендер без оверлеев.")
+        except Exception as e:  # noqa: BLE001 — enrichment is best-effort
+            on_stage(f"Обогащение: не удалось подготовить ({e}); рендер без него.")
+            render_enrich = None
+
     on_stage("Рендер видео…")
+    # enrich передаётся kwarg-ом только когда он есть: пустой/выключенный план
+    # оставляет вызов render() бит-в-бит прежним (легаси-контракт).
+    enrich_kw = {"enrich": render_enrich} if render_enrich is not None else {}
     rr = render_mod.render(
         s.ff, s.media, cl, cfg, base.with_suffix(".mp4"), s.work_dir,
         on_progress=on_progress,
         log=lambda m="": on_stage(str(m).strip() or "Рендер видео…"),
         scale_h=scale_h, fps=fps, ass_path=ass_path, crop_filter=crop_filter,
-        edge_fade=edge_fade)
+        edge_fade=edge_fade, **enrich_kw)
 
     sr: dict = {}
     subtitles_ok = not cfg.subtitles.enabled
@@ -1737,7 +1913,9 @@ def state():
                 "queue_running": _queue_running,
                 "queue_pending": _queue_pending_count(),
                 # B5: saved detection options (null = never configured).
-                "detect_opts": _read_detect_opts()}
+                "detect_opts": _read_detect_opts(),
+                # ENRICH §5: настройки «Предложить монтаж» (null = дефолты).
+                "enrich_opts": _read_enrich_opts()}
     s = S()
     m = s.media
     return {
@@ -1792,6 +1970,10 @@ def state():
         # B5: saved detection options from cache/detect_ui.json (null = never
         # configured -> /api/detect runs with the untouched session cfg).
         "detect_opts": _read_detect_opts(),
+        # ENRICH §5: настройки «Предложить монтаж» (null = дефолты) + компактная
+        # сводка плана для бутстрапа 5-й вкладки (count/stale, как clips).
+        "enrich_opts": _read_enrich_opts(),
+        "enrich": _enrich_state(s),
         "queue_running": _queue_running,   # F3: editor can flag a busy queue
         # P2-#6: pending count (incl. a queue restored from queue.json with the
         # worker stopped) so the «📋 Очередь» badge lights up on first load.
@@ -3041,6 +3223,254 @@ def clips_save(body: dict = Body(default={})):
     return {"ok": True, "clip": clip}
 
 
+# --- ENRICH_PLAN §5: авто-обогащение — план, suggest, save ----------------------
+def _enrich_json_path(s: Session) -> Path:
+    """``out/<stem>.enrich.json`` — где живёт план обогащения (§1.2)."""
+    return s.out_dir / f"{s.inp.stem}.enrich.json"
+
+
+def _save_enrich_json(s: Session, plan: "enrich_mod.EnrichPlan") -> None:
+    """Persist плана из задачи suggest — best-effort (зеркало _save_clips_json):
+    результат задачи уже в ``task['results']``, файл лишь кормит GET /api/enrich
+    при повторном открытии; неудача записи не должна валить LLM-пасс. Строгая
+    запись (500 юзеру) — только в /api/enrich/save, где юзер ждёт подтверждение."""
+    try:
+        enrich_mod.save_enrich(plan, _enrich_json_path(s))
+    except OSError:
+        pass  # non-fatal: план уже в task['results']
+
+
+def _enrich_state(s: Session) -> dict:
+    """Компактная сводка для GET /api/state: {count, stale} (полные items —
+    GET /api/enrich). ``count`` — все предложения плана (счётчик вкладки),
+    ``stale`` — план от другого аудио (hash-инвалидация, как clips)."""
+    plan = enrich_mod.load_enrich(_enrich_json_path(s))
+    if plan is None:
+        return {"count": 0, "stale": False}
+    if plan.hash != s.audio_hash:
+        return {"count": 0, "stale": True}
+    return {"count": len(plan.items), "stale": False}
+
+
+def _run_enrich_detectors(s: Session, params: dict, log) -> list:
+    """ЗАГЛУШКА-ХУК P3 (ENRICH_PLAN §7-P2): три LLM-детектора (§3.1–3.3 —
+    списки / CTA / иллюстрации, vpipe/enrich_llm.py) подключаются сюда в P3
+    с этой же сигнатурой; до тех пор suggest честно строит ПУСТОЙ план —
+    вся обвязка задачи/персиста/статусов уже боевая."""
+    log("enrich: LLM-детекторы появятся в P3 — пока пустой план")
+    return []
+
+
+def _merge_enrich_user_state(s: Session, items: list) -> list:
+    """Повторный suggest НЕ уничтожает работу юзера (§1: «ИИ предлагает —
+    юзер решает»; CRITICAL код-ревью P2). Протокол мержа со старым планом:
+
+    - совпавший id → переносим ``enabled``-решение юзера, а при ``edited`` —
+      и правки целиком (payload + тайминги); свежие поля детектора
+      (score/quote/reason) остаются новыми;
+    - ручные предложения (``source:"user"``) переезжают в новый план целиком —
+      детекторы их не переоткроют;
+    - исчезнувшие LLM-предложения честно уходят (новый анализ);
+    - план от ДРУГОГО аудио не мержится — полная hash-инвалидация,
+      как в GET /api/enrich и save."""
+    old = enrich_mod.load_enrich(_enrich_json_path(s))
+    if old is None or old.hash != s.audio_hash:
+        return items
+    prev_by_id = {it.id: it for it in old.items}
+    carried: set[str] = set()
+    for it in items:
+        prev = prev_by_id.get(it.id)
+        if prev is None:
+            continue
+        carried.add(it.id)
+        it.enabled = prev.enabled            # решение юзера — закон
+        if prev.edited:                      # правки текста/таймингов — тоже
+            it.payload = prev.payload
+            it.t_start = prev.t_start
+            it.t_end = prev.t_end
+            it.edited = True
+    items.extend(p for p in old.items
+                 if p.source == "user" and p.id not in carried)
+    return items
+
+
+@app.post("/api/enrich/suggest")
+def enrich_suggest(body: dict = Body(default={})):
+    """Предложения авто-обогащения (§5) — фоновая задача ``enrich``.
+
+    Паттерн /api/clips/suggest: 409 без транскрипта/катлиста; без LLM —
+    мгновенный 200 ``{ok:false, reason:'llm_off'}`` БЕЗ задачи (и без персиста
+    настроек — нечего применять); занятая задача/очередь → 409. Тело — настройки
+    запуска (types/density/image_source/user_folder): strict-sanitize (B5),
+    персист в cache/enrich_ui.json, затем фоновая задача: детекторы (P3-хук) →
+    мерж с прошлым планом (_merge_enrich_user_state: повторный запуск не
+    теряет enabled/edited и ручные предложения юзера) → планировщик статусов →
+    out/<stem>.enrich.json (hash + cutlist_rev)."""
+    s = S()
+    if s.transcript is None or s.cutlist is None:
+        raise HTTPException(409, "Transcribe and detect first")
+    if s.llm is None:
+        return {"ok": False, "reason": "llm_off"}
+    _guard_no_task()
+
+    opts = _sanitize_enrich_opts(body if isinstance(body, dict) else {},
+                                 strict=True)
+    _write_enrich_opts(opts)
+    # Блок params плана (§1.2) — подмножество настроек (whitelist в enrich.py).
+    params = enrich_mod.sanitize_params(opts)
+
+    def run():
+        s.stage("Монтаж: анализ…")
+        items = _run_enrich_detectors(s, opts, log=s.stage)
+        # Повторный анализ не теряет ревью юзера: enabled/edited и ручные
+        # предложения переезжают из старого плана (CRITICAL код-ревью P2).
+        items = _merge_enrich_user_state(s, items)
+        plan = enrich_mod.EnrichPlan(
+            hash=s.audio_hash,
+            # cutlist_rev — снимок enabled-вырезов НА МОМЕНТ анализа (§1.2);
+            # катлист не сменится под задачей (PUT /api/cutlist держит
+            # _guard_no_task), но честнее снять его внутри задачи.
+            cutlist_rev=enrich_mod.compute_cutlist_rev(s.cutlist),
+            model=s.cfg.llm.model, params=params, items=items)
+        # Планировщик — для статусов/auto-disable, которые увидит UI (§5):
+        # координаты исходника (рендер пересчитает под свой выход).
+        s.stage("Монтаж: планировщик…")
+        removed_now, _ = resolve(s.cutlist)
+        enrich_mod.plan_render(
+            plan, Timeline(removed_now, s.media.duration),
+            s.transcript.all_words(), s.cfg,
+            s.media.width or 1920, s.media.height or 1080,
+            log=lambda *_: None)
+        _save_enrich_json(s, plan)
+        s.task["results"] = {"enrich": {
+            "items": [it.to_dict() for it in plan.items],
+            "params": params}}
+
+    s.start_task("enrich", run)
+    return {"ok": True}
+
+
+@app.get("/api/enrich")
+def get_enrich():
+    """Сохранённый план (§5): ``{items, params, stale, cutlist_changed}``.
+
+    Hash-валидация как у клипов: план от другого аудио → ``stale:true`` и
+    пустые items (полная инвалидация). Несовпавший cutlist_rev — лишь мягкий
+    баннер ``cutlist_changed:true`` (рендер всё равно корректен: ремап + дроп,
+    §1.3); items при этом отдаются."""
+    s = S()
+    plan = enrich_mod.load_enrich(_enrich_json_path(s))
+    if plan is None:
+        return {"items": [], "params": None, "stale": False,
+                "cutlist_changed": False}
+    if plan.hash != s.audio_hash:
+        return {"items": [], "params": None, "stale": True,
+                "cutlist_changed": False}
+    cur_rev = enrich_mod.compute_cutlist_rev(
+        s.cutlist if s.cutlist is not None else [])
+    return {"items": [it.to_dict() for it in plan.items],
+            # load_enrich уже прогнал params через whitelist sanitize_params —
+            # наружу всегда канонический вид, даже если файл правили руками.
+            "params": plan.params,
+            "stale": False,
+            "cutlist_changed": cur_rev != plan.cutlist_rev,
+            "generated_at": plan.generated_at,
+            "model": plan.model}
+
+
+@app.post("/api/enrich/save")
+def enrich_save(body: dict = Body(default={})):
+    """Мерж правок UI в план (§5): ``{items:[{id, enabled?, payload?,
+    t_start?, t_end?}]}``.
+
+    Существующий id — точечная правка: тоггл ``enabled`` (edited НЕ трогает),
+    правки payload/таймингов (NaN/Infinity → 400, клампы к ролику, лимиты
+    текстов §1.2 через санитайзеры enrich.py) ставят ``edited:true``. Новый id
+    с валидным ``type`` — ручное предложение, ``source:"user"`` (§5); новый id
+    БЕЗ type — честный 404 (опечатка, а не добавление). Нет плана → 409; план
+    от другого видео → 409. Запись атомарная (.tmp -> os.replace) со СТРОГИМ
+    500 — оригинальный файл при сбое остаётся целым."""
+    s = S()
+    _guard_no_task()
+    raw_items = body.get("items")
+    if not isinstance(raw_items, list) or not raw_items:
+        raise HTTPException(400, "items: ожидается непустой список правок")
+
+    plan = enrich_mod.load_enrich(_enrich_json_path(s))
+    if plan is None:
+        raise HTTPException(409, "План обогащения не найден — сначала "
+                                 "«Предложить монтаж»")
+    if plan.hash != s.audio_hash:
+        raise HTTPException(409, "enrich.json от другого видео — правка "
+                                 "отклонена")
+
+    duration = float(s.media.duration)
+    index_of = {it.id: i for i, it in enumerate(plan.items)}
+    updated: list[dict] = []
+    for k, e in enumerate(raw_items):
+        if not isinstance(e, dict):
+            raise HTTPException(400, f"items[{k}]: ожидается объект")
+        eid = e.get("id")
+        if not isinstance(eid, str) or not eid:
+            raise HTTPException(400, f"items[{k}]: id обязателен (строка)")
+        # NaN/±Infinity валидны для json.loads и пролезают сквозь клампы
+        # (паттерн /api/clips/save) — отсекаем ДО любых сравнений.
+        for key in ("t_start", "t_end"):
+            v = e.get(key)
+            if v is None:
+                continue
+            if (isinstance(v, bool) or not isinstance(v, (int, float))
+                    or not math.isfinite(float(v))):
+                raise HTTPException(400, f"items[{k}].{key}: ожидается "
+                                         "конечное число (секунды)")
+        if "enabled" in e and not isinstance(e["enabled"], bool):
+            raise HTTPException(400, f"items[{k}].enabled: ожидается "
+                                     "true/false")
+        if "payload" in e and e["payload"] is not None \
+                and not isinstance(e["payload"], dict):
+            raise HTTPException(400, f"items[{k}].payload: ожидается объект")
+
+        if eid in index_of:
+            idx = index_of[eid]
+            d = plan.items[idx].to_dict()
+            touched = False                  # правка payload/таймингов → edited
+            if isinstance(e.get("payload"), dict) and e["payload"]:
+                d["payload"] = {**d["payload"], **e["payload"]}
+                touched = True
+            for key in ("t_start", "t_end"):
+                if e.get(key) is not None:
+                    d[key] = min(duration, max(0.0, float(e[key])))
+                    touched = True
+            if "enabled" in e:
+                d["enabled"] = e["enabled"]   # тоггл — НЕ правка (edited не трогаем)
+            if touched:
+                d["edited"] = True
+            # item_from_dict — единый санитайзер: клампы длительностей по типу,
+            # лимиты текстов §1.2, NaN-гарды внутри payload. id/type из d —
+            # неизменны. Тип валиден (взят из существующего item) → не None.
+            it = enrich_mod.item_from_dict(d)
+            plan.items[idx] = it
+        else:
+            t = e.get("type")
+            if t not in enrich_mod.ENR_TYPES:
+                raise HTTPException(404, f"Предложение {eid} не найдено")
+            d = dict(e)
+            d["source"] = "user"             # ручное предложение (§5)
+            for key in ("t_start", "t_end"):
+                if e.get(key) is not None:
+                    d[key] = min(duration, max(0.0, float(e[key])))
+            it = enrich_mod.item_from_dict(d)
+            plan.items.append(it)
+            index_of[it.id] = len(plan.items) - 1
+        updated.append(it.to_dict())
+
+    try:
+        enrich_mod.save_enrich(plan, _enrich_json_path(s))
+    except OSError as e:
+        raise HTTPException(500, f"Не удалось сохранить enrich.json: {e}")
+    return {"ok": True, "items": updated}
+
+
 def _render_clip_job(s: Session, *, start: float, end: float, idx: int,
                      n: int, fname: str, render_opts: dict, set_pct) -> dict:
     """Рендер ОДНОГО клипа [start, end] — общий кирпич clips_render и Авто-пака.
@@ -3124,9 +3554,11 @@ def clips_render(body: dict = Body(default={})):
     # Сервер принудительно глушит главы/метаданные для клипов (план §2.4) —
     # независимо от того, что прислал клиент. music=None — клипы Shorts НИКОГДА
     # не получают фоновую подложку (C3): _resolve_render_opts при не-dict
-    # music принудительно выключает cfg.render.music.
+    # music принудительно выключает cfg.render.music. enrich=None — обогащение
+    # Shorts-клипов вне скоупа v1 (ENRICH_PLAN §9); cutlist_override-путь его
+    # и так не применяет, это второй (явный) предохранитель.
     render_opts = {**render_opts, "chapters": False, "metadata": False,
-                   "music": None}
+                   "music": None, "enrich": None}
 
     duration = float(s.media.duration)
     clips_in: list[dict] = []
@@ -3191,8 +3623,11 @@ def clips_render(body: dict = Body(default={})):
 # (/api/clips/render). Против 4 ручных облачных шагов CapCut — локально и
 # бесплатно. Веса стадий для общего percent (нормируются по активным стадиям,
 # чтобы пропущенная транскрипция не оставляла «дыру» в прогрессе):
-_AUTOPACK_WEIGHTS = {"transcribe": 0.35, "detect": 0.10, "main": 0.25,
-                     "suggest": 0.10, "clips": 0.20}
+_AUTOPACK_WEIGHTS = {"transcribe": 0.35, "detect": 0.10, "enrich": 0.12,
+                     "main": 0.25, "suggest": 0.10, "clips": 0.20}
+# ENRICH §5: в автопаке применяются ТОЛЬКО предложения со score >= 70 поверх
+# enabled — консервативный порог, автопак идёт без ревью-вкладки.
+AUTOPACK_ENRICH_MIN_SCORE = 70
 
 
 def _autopack_top_clips(cands: list, duration: float, top_k: int) -> list[dict]:
@@ -3231,12 +3666,17 @@ def autopack(body: dict = Body(default={})):
 
     Тело: ``{top_k: 1–10 (клампится, дефолт 3), formats: [...] для ОСНОВНОГО
     ролика (как у /api/render, дефолт ["source"]), clips: bool (дефолт true),
-    render_opts: {...} (как у /api/render)}``.
+    enrich: bool (дефолт false — ENRICH §5: применить СВЕЖИЙ план обогащения
+    к основному ролику со score >= 70 поверх enabled; плана нет/несвежий →
+    warning, детекторы автопак не зовёт), render_opts: {...} (как у
+    /api/render)}``.
 
     Стадии (каждая видна в SSE stage, percent — по весам _AUTOPACK_WEIGHTS):
       а) транскрипция, если её нет (кэш → стадия пропускается);
       б) детекция, если катлист ПУСТ — существующий НЕ передетекчивается
          (юзер мог править вырезы руками);
+      б2) enrich=true и свежий план: пометка «применяю план (score>=70)» —
+         сам план применит рендер основного ролика (opts.enrich);
       в) рендер основного ролика через _render_formats (C2, мультиформат);
       г) clips=true: suggest — но свежий clips.json (hash совпал)
          переиспользуется без LLM; LLM выключен → warning, основной остаётся;
@@ -3286,8 +3726,18 @@ def autopack(body: dict = Body(default={})):
     will_suggest = do_clips and not cached_fresh and s.llm is not None
     will_render_clips = do_clips and (cached_fresh or s.llm is not None)
 
+    # ENRICH §5: стадия выполняется ТОЛЬКО при body.enrich=true И существующем
+    # СВЕЖЕМ плане (hash совпал). Детекторы автопак НЕ зовёт — нет плана →
+    # warning и пропуск (запуск анализа из автопака решит P3).
+    do_enrich = bool(body.get("enrich", False))
+    enrich_plan = enrich_mod.load_enrich(_enrich_json_path(s)) \
+        if do_enrich else None
+    will_enrich = bool(enrich_plan is not None
+                       and enrich_plan.hash == s.audio_hash)
+
     plan = [k for k, on in (("transcribe", need_transcribe),
                             ("detect", need_detect),
+                            ("enrich", will_enrich),
                             ("main", True),
                             ("suggest", will_suggest),
                             ("clips", will_render_clips)) if on]
@@ -3306,9 +3756,17 @@ def autopack(body: dict = Body(default={})):
 
     # Сервер принудительно глушит главы/метаданные для клипов (паттерн
     # /api/clips/render) — иначе каждый клип гонял бы LLM и тёр metadata.txt.
-    # music=None — подложка (C3) только в ОСНОВНОМ ролике, клипы без музыки.
+    # music=None — подложка (C3) только в ОСНОВНОМ ролике, клипы без музыки;
+    # enrich=None — обогащение Shorts-клипов вне скоупа v1 (ENRICH_PLAN §9).
     clip_opts = {**render_opts, "chapters": False, "metadata": False,
-                 "music": None}
+                 "music": None, "enrich": None}
+    # Основной ролик: обогащение управляется автопаком, а не сырыми
+    # render_opts клиента — явный ключ в обе стороны (вкл со score-порогом /
+    # выкл, если стадия не запланирована).
+    main_opts = {**render_opts,
+                 "enrich": ({"enabled": True,
+                             "min_score": AUTOPACK_ENRICH_MIN_SCORE}
+                            if will_enrich else {"enabled": False})}
     cl_duration = float(s.media.duration)
 
     def run():
@@ -3350,10 +3808,36 @@ def autopack(body: dict = Body(default={})):
         else:
             skipped.append("Детекция: катлист уже есть — не передетекчиваем")
 
+        # --- (б2) обогащение основного ролика (ENRICH §5) ----------------------
+        # Стадия лишь фиксирует решение и счётчик: сам план применит
+        # _run_render_pipeline стадии «main» (opts.enrich в main_opts).
+        if do_enrich:
+            if will_enrich:
+                _chk()
+                n_apply = sum(
+                    1 for it in enrich_plan.items
+                    if it.enabled and it.score >= AUTOPACK_ENRICH_MIN_SCORE)
+                s.stage(f"Обогащение: применяю план "
+                        f"(score ≥ {AUTOPACK_ENRICH_MIN_SCORE}, "
+                        f"предложений: {n_apply})…")
+                results["enrich"] = {"applied": True,
+                                     "min_score": AUTOPACK_ENRICH_MIN_SCORE,
+                                     "count": n_apply}
+                sub("enrich")(1.0)
+            elif enrich_plan is not None:
+                warnings.append("Обогащение пропущено: план от другого видео "
+                                "(несвежий hash) — запустите «Предложить "
+                                "монтаж» заново")
+                results["enrich"] = {"applied": False}
+            else:
+                warnings.append("Обогащение пропущено: нет плана — сначала "
+                                "«Предложить монтаж»")
+                results["enrich"] = {"applied": False}
+
         # --- (в) основной ролик (мультиформат C2) ------------------------------
         _chk()
         res_main = _render_formats(
-            s, dict(render_opts), formats,
+            s, dict(main_opts), formats,
             on_progress=sub("main"),
             on_stage=lambda m: s.stage(f"Основной ролик: {m}"),
             is_cancelled=lambda: bool(s.task.get("cancelled")))

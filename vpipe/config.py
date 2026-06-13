@@ -254,6 +254,22 @@ class MusicCfg(_Base):
     release: float = 400.0        # ms — how fast it comes back in pauses
 
 
+class EnrichRenderCfg(_Base):
+    """Авто-обогащение при рендере (ENRICH_PLAN §5, render.enrich).
+
+    Контракт как у music: без явного ``opts.enrich`` в /api/render обогащение
+    ВЫКЛЮЧЕНО («нет ключа = выключено») — serve.py выставляет ``enabled`` из
+    запроса на deep copy конфига. Клипы Clip Maker и автопак-клипы
+    (cutlist_override-путь) обогащение не получают никогда (анти-скоуп §9).
+
+    ``min_score`` — порог отсечки предложений ПОВЕРХ пер-предложенческого
+    ``enabled``: Авто-пак шлёт 70 (консервативное применение без ревью-вкладки),
+    обычный рендер живёт с 0 («берём всё, что включил юзер»).
+    """
+    enabled: bool = False
+    min_score: int = 0                # 0..100; 0 = без отсечки по score
+
+
 class RenderCfg(_Base):
     encoder: str = "nvenc"
     nvenc: NvencCfg = Field(default_factory=NvencCfg)
@@ -263,6 +279,7 @@ class RenderCfg(_Base):
     vertical: VerticalCfg = Field(default_factory=VerticalCfg)
     denoise: DenoiseCfg = Field(default_factory=DenoiseCfg)
     music: MusicCfg = Field(default_factory=MusicCfg)
+    enrich: EnrichRenderCfg = Field(default_factory=EnrichRenderCfg)
     # Smoothing at every cut seam. Without it the kept audio segments are
     # hard-concatenated and each join is a waveform discontinuity → an audible
     # click and an overall "choppy" feel. A short equal-length fade-out/fade-in

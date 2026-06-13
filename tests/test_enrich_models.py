@@ -205,6 +205,23 @@ def test_cta_duration_clamped_and_t_end_derived():
     assert item_from_dict(d).t_end == pytest.approx(103.0)   # кламп 3 c
 
 
+def test_asset_path_relative_rejected():
+    """Path-traversal guard (код-ревью P2): относительный asset_path из
+    правленного руками JSON / тела save не должен попадать во входы
+    ffmpeg-графа — санитайзер оставляет только абсолютные пути."""
+    for evil in ("../../config.yaml", "..\\..\\secret.png",
+                 "work/sneaky.png", "   "):
+        d = raw_image()
+        d["payload"]["asset_path"] = evil
+        assert item_from_dict(d).payload.asset_path == ""
+        a = raw_animation()
+        a["payload"]["asset_path"] = evil
+        assert item_from_dict(a).payload.asset_path == ""
+    # абсолютный путь живёт как раньше (см. test_roundtrip_all_six_types)
+    assert item_from_dict(raw_image()).payload.asset_path == \
+        "D:/assets/registry.png"
+
+
 def test_nan_inf_guards():
     it = item_from_dict(raw_image(t_start=float("nan"), t_end=float("inf")))
     assert it.t_start == 0.0
