@@ -29,7 +29,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from vpipe.config import Config                                       # noqa: E402
 from vpipe.enrich import (MAX_ANIMS, MAX_STILLS, AnimOverlay,          # noqa: E402
-                          RenderEnrich, StillOverlay)
+                          RenderEnrich, StillOverlay, ZoomWindow)
+from vpipe.render import (_enrich_video_chain, _punch_dims,            # noqa: E402
+                          _punch_filter, _smoothstep_z_expr)
 from vpipe.models import (ACTION_REMOVE, TYPE_PAUSE,                   # noqa: E402
                           CutList, CutSegment)
 from vpipe.probe import MediaInfo                                      # noqa: E402
@@ -110,9 +112,10 @@ def _anim(**over) -> AnimOverlay:
 
 
 def _enrich(stills=(), anims=(), cards_ass=None,
-            fonts_dir="fonts") -> RenderEnrich:
+            fonts_dir="fonts", punches=(), card_windows=()) -> RenderEnrich:
     return RenderEnrich(stills=list(stills), anims=list(anims),
-                        cards_ass=cards_ass, fonts_dir=fonts_dir)
+                        cards_ass=cards_ass, fonts_dir=fonts_dir,
+                        punches=list(punches), card_windows=list(card_windows))
 
 
 def _run(cfg, cl, tmp_path, *, has_audio=True, ff=None, log=None, **kw):
@@ -398,3 +401,134 @@ def test_engine_caps_trim_extra_overlays_with_warning(tmp_path):
     assert f"p{MAX_STILLS}.png" not in args     # лишние отброшены с конца
     assert f"a{MAX_ANIMS}.webm" not in args
     assert sum("лимит движка" in m or "ВНИМАНИЕ" in m for m in logs) >= 2
+
+
+# === V11 §3 — blur-backplate (R2 trimdscale: split/даунскейл/trim/eof_action) ===
+def _zw(**over) -> ZoomWindow:
+    d = dict(t0=40.0, t1=43.0, z_max=1.08, cx=0.5, cy=0.5)
+    d.update(over)
+    return ZoomWindow(**d)
+
+
+def test_blur_backplate_only_forces_reencode_and_chain(tmp_path):
+    # карточек-окно без stills/anims/cards_ass: чистый эффект цепочки, без входов.
+    ff, info = _run(Config(), _cutlist(cut=True), tmp_path,
+                    enrich=_enrich(card_windows=[(100.0, 106.0)]))
+    g = _graph(ff.runs[-1])
+    assert info["encoder"] == "x264"
+    assert "libvpx-vp9" not in " ".join(ff.runs[-1])     # blur не добавляет входов
+    # split -> trim-В-ОКНО -> даунскейл-blur -> плоский bilinear upscale -> overlay.
+    assert "split=2[bbs0][bbk0]" in g
+    # blur-ветка целиком (КРИТ-ПОРЯДОК: trim ПЕРВЫМ, плоский scale=W:H, НЕ scale2ref):
+    assert ("[bbk0]trim=100.000:106.000,setpts=PTS-STARTPTS+100.000/TB,"
+            "scale=480:270,boxblur=4:2,eq=brightness=-0.16:saturation=0.85,"
+            "scale=1920:1080:flags=bilinear[bbb0]") in g
+    assert ("overlay=0:0:enable='between(t,100.000,106.000)'"
+            ":eof_action=pass[outv]") in g
+
+
+def test_blur_backplate_trim_gates_boxblur_before_compute(tmp_path):
+    # ПЕРФ-ИНВАРИАНТ (LAW §3/§4, R2 ловушка #1): дорогой boxblur ДОЛЖЕН считаться
+    # ТОЛЬКО в окне карточки. Это достигается ТОЛЬКО если trim стоит ДО boxblur на
+    # blur-ветке. scale2ref-форма тянула boxblur на ВЕСЬ клип (+537%) — запрещена.
+    ff, _ = _run(Config(), _cutlist(cut=True), tmp_path,
+                 enrich=_enrich(card_windows=[(100.0, 106.0)]))
+    g = _graph(ff.runs[-1])
+    # на blur-ветке trim предшествует boxblur (иначе boxblur на полном клипе).
+    branch = g[g.index("[bbk0]"):g.index("[bbb0]")]
+    assert branch.index("trim=") < branch.index("boxblur="), (
+        "trim ДОЛЖЕН стоять ДО boxblur, иначе blur считается на весь клип")
+    # scale2ref запрещён: он лок-степит blur-ветку к полнодлинной reference-ветке,
+    # из-за чего boxblur вычисляется на каждый кадр клипа независимо от trim-после.
+    assert "scale2ref" not in g
+    # upscale = плоский scale в финальные дименшены кадра с bilinear-флагом.
+    assert "scale=1920:1080:flags=bilinear" in g
+
+
+def test_blur_backplate_runs_before_subtitles_after_concat(tmp_path):
+    # blur-backplate стоит ПОСЛЕ concat([vc]) и ДО enrich.ass/burn.ass.
+    ff, _ = _run(Config(), _cutlist(cut=True), tmp_path,
+                 ass_path="burn.ass",
+                 enrich=_enrich(cards_ass="enrich_in.ass",
+                                card_windows=[(100.0, 106.0)]))
+    g = _graph(ff.runs[-1])
+    assert "concat=n=2:v=1:a=1[vc]" in g
+    order = [g.index("split=2[bbs0]"), g.index("eof_action=pass"),
+             g.index("subtitles='enrich_in.ass'"),
+             g.index("subtitles='burn.ass'")]
+    assert order == sorted(order)
+    # инвариант: enrich.ass ПЕРВЫМ, burn.ass ПОСЛЕДНИМ
+    assert g.endswith("subtitles='enrich_in.ass':fontsdir='fonts',"
+                      "subtitles='burn.ass'[outv]")
+
+
+def test_multiple_card_windows_chain_sequentially(tmp_path):
+    ff, _ = _run(Config(), _cutlist(cut=True), tmp_path,
+                 enrich=_enrich(card_windows=[(100.0, 104.0), (200.0, 205.0)]))
+    g = _graph(ff.runs[-1])
+    assert "split=2[bbs0][bbk0]" in g and "split=2[bbs1][bbk1]" in g
+    assert "trim=100.000:104.000" in g and "trim=200.000:205.000" in g
+    assert g.count("eof_action=pass") == 2
+
+
+# === V11 §4a — punch-zoom (crop+scale smoothstep, НЕ zoompan) ===================
+def test_punch_zoom_crop_scale_not_zoompan(tmp_path):
+    ff, info = _run(Config(), _cutlist(cut=True), tmp_path,
+                    enrich=_enrich(punches=[_zw(t0=40.0, t1=43.0, z_max=1.08)]))
+    g = _graph(ff.runs[-1])
+    assert info["encoder"] == "x264"
+    # crop=w='iw/Z':h='ih/Z':x:y центрированный + scale обратно в W:H.
+    assert "crop=w='iw/(" in g and ":h='ih/(" in g
+    assert ":x='(iw-iw/(" in g and ":y='(ih-ih/(" in g
+    assert "scale=1920:1080" in g
+    # НЕ zoompan (доказано дёрганей — R3).
+    assert "zoompan" not in g
+    # smoothstep p*p*(3-2p) в выражении Z(t).
+    assert "*(3-2*" in g
+    # окно/потолок зума: between(t,t0,t1) и пик 1.080 (z_max=1.08, ≤ потолка)
+    assert "between(t,40.000,43.000)" in g
+    assert "1.080" in g
+
+
+def test_punch_zoom_z_expr_smoothstep_envelope():
+    z = _smoothstep_z_expr(_zw(t0=10.0, t1=15.0, z_max=1.08))
+    # вне окна Z=1; рамп-ин/hold/рамп-аут (lt/gt по краям рамп)
+    assert z.startswith("if(between(t,10.000,15.000)")
+    assert z.endswith(",1)")                            # else 1.0 вне окна
+    assert "lt(t,10.700)" in z and "gt(t,14.300)" in z  # рампы 0.7 c
+    assert "1.080" in z                                 # пик
+
+
+def test_punch_zoom_runs_before_overlays_and_subs(tmp_path):
+    # порядок: vpre -> punch -> overlay(PiP) -> subtitles.
+    ff, _ = _run(Config(), _cutlist(cut=True), tmp_path, scale_h=720,
+                 ass_path="burn.ass",
+                 enrich=_enrich(stills=[_still(t0=80.0, t1=83.0)],
+                                punches=[_zw(t0=40.0, t1=43.0)]))
+    g = _graph(ff.runs[-1])
+    order = [g.index("scale=-2:720"), g.index("crop=w='iw/("),
+             g.index("[ov0]overlay"), g.index("subtitles='burn.ass'")]
+    assert order == sorted(order)
+
+
+def test_punch_dims_from_scale_h_and_crop_filter():
+    assert _punch_dims(_media(), 720, None) == (1280, 720)        # пропорция
+    assert _punch_dims(_media(), None, None) == (1920, 1080)      # исходная
+    # vertical: цель запечена в crop_filter (...,scale=W:H)
+    assert _punch_dims(_media(), None,
+                       "crop=600:1067:660:0,scale=1080:1920") == (1080, 1920)
+
+
+def test_punch_filter_empty_without_windows():
+    assert _punch_filter([], 1920, 1080) == ""
+    assert _punch_filter([_zw()], 0, 0) == ""           # без дименшенов — no-op
+
+
+def test_dynamics_keep_legacy_byte_for_byte_when_empty(tmp_path):
+    # пустые punches/card_windows -> граф БАЙТ-В-БАЙТ как без них.
+    base, _ = _run(Config(), _cutlist(cut=True), tmp_path,
+                   enrich=_enrich(stills=[_still()]))
+    dyn, _ = _run(Config(), _cutlist(cut=True), tmp_path,
+                  enrich=_enrich(stills=[_still()], punches=[],
+                                 card_windows=[]))
+    assert _graph(base.runs[-1]) == _graph(dyn.runs[-1])

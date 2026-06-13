@@ -83,6 +83,7 @@ const st = {
   enrichItems: [],         // [{id,type,enabled,score,t_start,t_end,quote,reason,status,status_note,payload,...}]
   enrichParams: null,      // params последнего анализа (для пере-сидинга модалки)
   enrichOpts: null,        // /api/state.enrich_opts — сохранённые настройки запуска
+  imagegenReady: false,    // /api/state.imagegen_ready — SD настроена (бинарь+модель)
   enrichFilter: 'all',     // активный фильтр-чип ('all' | image | animation | list_card | cta)
   enrichActive: null,      // id карточки под фокусом (j/k/e/Enter)
   enrichCutlistChanged: false,  // мягкий баннер «вырезы изменились»
@@ -214,6 +215,8 @@ async function init() {
   // P4: сохранённые настройки запуска «Предложить монтаж» (cache/enrich_ui.json);
   // тихий счётчик вкладки из компактной сводки (полный план — GET /api/enrich).
   st.enrichOpts = s.enrich_opts || null
+  // ТРЕК-2 §2: SD-генерация настроена? — гейт warning-баннера в модалке монтажа.
+  st.imagegenReady = s.imagegen_ready === true
   if (s.enrich && !s.enrich.stale) updateTabBadge('enrich', s.enrich.count || 0)
   // Cache-bust by session token so switching clips can never reuse a cached
   // /api/video (the bug where the new clip loaded but the OLD video played).
@@ -3666,7 +3669,7 @@ function seedEnrichModal() {
   $('#enType_list_card').checked = types.list_card !== false
   $('#enType_cta').checked = types.cta !== false
   $('#enDensity').value = ['min', 'normal', 'aggressive'].includes(o.density) ? o.density : 'normal'
-  const src = ['auto', 'emoji', 'user_folder'].includes(o.image_source) ? o.image_source : 'auto'
+  const src = ['auto', 'generate', 'emoji', 'user_folder'].includes(o.image_source) ? o.image_source : 'auto'
   $('#enImageSource').value = src
   $('#enUserFolder').value = o.user_folder || ''
   enrichToggleUserFolder()
@@ -3675,7 +3678,13 @@ function seedEnrichModal() {
   $('#btnEnrichRun').disabled = off
 }
 function enrichToggleUserFolder() {
-  $('#enUserFolderRow').classList.toggle('hidden', $('#enImageSource').value !== 'user_folder')
+  const src = $('#enImageSource').value
+  $('#enUserFolderRow').classList.toggle('hidden', src !== 'user_folder')
+  // ТРЕК-2 §2: источники с SD-генерацией (auto/generate) показывают инфо про
+  // ~4 ГБ модель и время; если SD не настроена — warning про эмодзи-фолбэк.
+  const usesGen = src === 'auto' || src === 'generate'
+  $('#enGenInfoRow').classList.toggle('hidden', !(usesGen && st.imagegenReady))
+  $('#enGenWarnRow').classList.toggle('hidden', !(usesGen && !st.imagegenReady))
 }
 function openEnrichModal() {
   if (!st.hasSession) return

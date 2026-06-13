@@ -404,8 +404,37 @@ def test_cta_subscribe_webm_overlay(cta_dir):
     assert an.path == str(f)
     assert an.x_expr == "48" and an.y_expr == "H-h-160"       # §2.3 низ-лево
     assert an.scale_w == round(W * enrich.CTA_WIDTH_FRAC) == 220
-    assert an.loop is True
+    # §5: subscribe_like.webm -> пресет cta_slide_in (loop=false в
+    # anim_presets.json) — финитный въезд играет ОДИН раз от t0, НЕ зациклен.
+    assert an.loop is False
     assert an.t0 == pytest.approx(100.0) and an.t1 == pytest.approx(104.0)
+
+
+def test_cta_finite_entrance_not_looped(cta_dir):
+    """V11 §5 (регрессия): финитный въезд CTA должен играть ОДИН раз от t0, НЕ
+    зацикливаться. Раньше enrich.py хардкодил loop=True для ВСЕХ CTA — въезд
+    (slide+отскок) повторялся ~3-4× за окно (кринж, гейт §8.3). Теперь loop
+    берётся из пресета ассета (anim_presets.json: subscribe_like.webm ->
+    cta_slide_in loop=false, like.webm -> pop_in loop=false). loop=False =>
+    render НЕ ставит -stream_loop -1 / shortest=1 (см. test_enrich_render_graph)."""
+    (cta_dir / "subscribe_like.webm").write_bytes(b"webm")
+    (cta_dir / "like.webm").write_bytes(b"webm")
+    tl = Timeline([], duration=300)
+    plan, re = run([cta_sub("s", 100.0), cta_like("l", 150.0)], tl)
+    by_path = {a.path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]: a
+               for a in re.anims}
+    assert by_path["subscribe_like.webm"].loop is False     # cta_slide_in
+    assert by_path["like.webm"].loop is False               # pop_in
+
+
+def test_asset_loop_defaults_true_for_unmapped(monkeypatch):
+    """_asset_loop: незамапленный (неизвестный) webm -> дефолт вызывающего
+    (True = старое looped-поведение, аддитивная обратная совместимость)."""
+    # реальный пресет читается из anim_presets.json (cta_slide_in -> False)
+    assert enrich._asset_loop("subscribe_like.webm", True) is False
+    # имя, которого нет в карте assets -> возвращается переданный дефолт
+    assert enrich._asset_loop("definitely_not_a_real_asset.webm", True) is True
+    assert enrich._asset_loop("definitely_not_a_real_asset.webm", False) is False
 
 
 def test_cta_comment_text_survives_missing_icon(cta_dir):
@@ -519,3 +548,96 @@ def test_card_tail_helper_matches_spec():
     assert enrich.card_tail_s(["х" * 26], 1.0) == pytest.approx(4.0)
     assert enrich.card_tail_s(["х" * 60, "у" * 60], 1.0) == \
         pytest.approx(enrich.CARD_TAIL_MAX_S)
+
+
+# === card_windows (§3, blur-backplate) ==========================================
+def test_card_windows_match_drawn_cards():
+    tl = Timeline([], duration=400)
+    c = card("crd", 120.0, [("Раз", -1, 121.0), ("Два", -1, 123.0)])
+    plan, re = run([c], tl)
+    assert len(re.cards) == 1
+    assert len(re.card_windows) == 1
+    cp = re.cards[0]
+    t0, t1 = re.card_windows[0]
+    # окно совпадает с CardPlan.t0/t1 (floor по той же формуле дочитывания)
+    expected_t1 = max(cp.t1, cp.items[-1].t
+                      + enrich.card_tail_s([i.text for i in cp.items], cp.hold_s))
+    assert t0 == pytest.approx(cp.t0)
+    assert t1 == pytest.approx(expected_t1)
+
+
+def test_card_windows_empty_without_cards():
+    tl = Timeline([], duration=300)
+    plan, re = run([cta_sub("s1", 100.0)], tl)
+    assert re.card_windows == []
+
+
+# === punch-zoom (§4a) — анти-кринж лимиты в КОДЕ ================================
+def test_punch_from_card_within_caps():
+    tl = Timeline([], duration=400)
+    c = card("crd", 120.0, [("Раз", -1, 121.0), ("Два", -1, 124.0)], score=90)
+    plan, re = run([c], tl)
+    assert len(re.punches) == 1
+    p = re.punches[0]
+    # длительность 2–3 c, центр в окне карточки, z в потолке
+    assert enrich.PUNCH_DUR_MIN - 1e-6 <= p.t1 - p.t0 <= enrich.PUNCH_DUR_MAX + 1e-6
+    assert p.z_max <= enrich.PUNCH_Z_CAP
+    cp = re.cards[0]
+    center = 0.5 * (cp.t0 + cp.t1)
+    assert p.t0 <= center <= p.t1
+    assert p.cx == pytest.approx(0.5) and p.cy == pytest.approx(0.5)  # v1 центр
+
+
+def test_punch_density_one_per_30_60s():
+    # три карточки впритык (зазор < 30 c) -> только один зум (не подряд).
+    tl = Timeline([], duration=400)
+    cards = [card(f"c{i}", 120.0 + 12.0 * i,
+                  [("Раз", -1, 121.0 + 12.0 * i), ("Два", -1, 123.0 + 12.0 * i)],
+                  score=90 - i)
+             for i in range(3)]
+    plan, re = run(cards, tl)
+    assert len(re.cards) >= 2                            # карточки прошли
+    assert len(re.punches) == 1                          # но зум один (плотность)
+
+
+def test_punch_two_when_far_apart():
+    # две карточки на расстоянии > 30 c -> два зума.
+    tl = Timeline([], duration=400)
+    c1 = card("c1", 100.0, [("Раз", -1, 101.0), ("Два", -1, 103.0)], score=90)
+    c2 = card("c2", 200.0, [("Раз", -1, 201.0), ("Два", -1, 203.0)], score=85)
+    plan, re = run([c1, c2], tl)
+    assert len(re.punches) == 2
+    centers = [0.5 * (p.t0 + p.t1) for p in re.punches]
+    assert abs(centers[0] - centers[1]) >= enrich.PUNCH_MIN_GAP_S
+
+
+def test_punch_skips_clean_zones():
+    # карточка в самом начале (после чистой головы 30 c) — зум не залезает в
+    # первые 30 c. Карточка целиком в зоне 30..end-20.
+    tl = Timeline([], duration=400)
+    c = card("crd", 31.0, [("Раз", -1, 32.0), ("Два", -1, 34.0)], score=90)
+    plan, re = run([c], tl)
+    for p in re.punches:
+        assert p.t0 >= enrich.CLEAN_HEAD_S
+        assert p.t1 <= 400 - enrich.CLEAN_TAIL_S
+
+
+def test_punch_does_not_overlap_other_overlay(cta_dir):
+    # CTA-like рядом с карточкой: зум карточки центрируется в её окне, но не
+    # должен пересечь СОСЕДНЕЕ оверлейное окно (CTA -> anim). Своё окно-источник
+    # пересекать можно (PiP живёт поверх зума).
+    (cta_dir / "like.webm").write_bytes(b"\x1aE\xdf\xa3 fake")
+    tl = Timeline([], duration=400)
+    c = card("crd", 120.0, [("Раз", -1, 121.0), ("Два", -1, 123.0)], score=90)
+    cta = cta_like("l1", 130.0, score=80, dur=3.0)      # после карточки, в зазоре
+    plan, re = run([c, cta], tl)
+    assert re.anims and re.punches                       # оба приняты
+    for p in re.punches:
+        for other in re.anims:                          # CTA-like -> anim-окно
+            assert not (p.t0 < other.t1 and p.t1 > other.t0)
+
+
+def test_punch_empty_without_emphasis():
+    tl = Timeline([], duration=300)
+    plan, re = run([img("i1", 100.0, kind="none")], tl)   # image без ассета
+    assert re.punches == []

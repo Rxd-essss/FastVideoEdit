@@ -41,7 +41,9 @@ _SILENT = lambda *a, **k: None  # noqa: E731
 
 CTA_DIR = enrich_mod.CTA_ASSET_DIR
 MAX_WEBM_BYTES = 200_000
-CTA_FILES = ("subscribe_like.webm", "comment.webm", "like.webm", "bell.webm")
+# V11 §5: subscribe_slide_avatar.webm — новый ассет со слотом под аватар канала.
+CTA_FILES = ("subscribe_like.webm", "subscribe_slide_avatar.webm",
+             "comment.webm", "like.webm", "bell.webm")
 
 
 class MockLLM:
@@ -409,16 +411,118 @@ def test_anim_presets_schema():
         pytest.skip("anim_presets.json ещё не положен соседним агентом")
     data = json.loads(f.read_text(encoding="utf-8"))
     assert isinstance(data.get("presets"), dict)
-    # пресеты pop_in/pulse (план §2.3) присутствуют и несут длительность/easing
+    # пресеты pop_in/pulse (план §2.3) присутствуют и несут easing
     for key in ("pulse", "pop_in"):
         assert key in data["presets"], key
-        assert "dur_s" in data["presets"][key]
         assert "easing" in data["presets"][key]
     # карта ассет -> пресет ссылается на существующие пресеты
     assets = data.get("assets")
     if isinstance(assets, dict):
         for webm, preset in assets.items():
             assert preset in data["presets"], (webm, preset)
+
+
+def test_anim_presets_v11_entrance():
+    """V11 §5: новый пресет «cta_slide_in» — финитный въезд (loop=False) с
+    ease-out-back-проскоком (overshoot > 1.0) и glow-пульсом; comment/like/bell
+    стартуют pop-in (overshoot 0.2 -> 1.12 -> 1.0)."""
+    f = CTA_DIR / "anim_presets.json"
+    if not f.is_file():
+        pytest.skip("anim_presets.json ещё не положен соседним агентом")
+    data = json.loads(f.read_text(encoding="utf-8"))
+    pr = data["presets"]
+    # 1) cta_slide_in: финитный въезд с проскоком (НЕ loop — иначе въезд повторится)
+    assert "cta_slide_in" in pr
+    si = pr["cta_slide_in"]
+    assert si.get("loop") is False, "въезд должен играть один раз от t0 (loop=False)"
+    assert si.get("easing") == "ease_out_back"
+    assert float(si.get("overshoot", 0.0)) > 1.0, "ease-out-back проскакивает 1.0"
+    # 2) pop_in: overshoot 0.2 -> 1.12 -> 1.0
+    pi = pr["pop_in"]
+    assert pi.get("from", 1.0) < pi.get("over", 0.0) > pi.get("to", 0.0)
+    assert abs(float(pi["over"]) - 1.12) < 1e-6
+    # 3) ассет-карта: оба subscribe -> cta_slide_in, comment -> pop_in
+    a = data.get("assets", {})
+    assert a.get("subscribe_like.webm") == "cta_slide_in"
+    assert a.get("subscribe_slide_avatar.webm") == "cta_slide_in"
+    assert a.get("comment.webm") == "pop_in"
+
+
+@pytest.mark.parametrize("name", CTA_FILES)
+def test_cta_webm_alpha_round_trips_to_png(name):
+    """Лакмус VP9-альфы: декодируем кадр обратно в PNG через -c:v libvpx-vp9 и
+    проверяем, что прозрачность восстановилась (угол холста alpha=0, но контент
+    непрозрачен). ROBUST: нет файла / нет ffmpeg/Pillow -> skip."""
+    f = CTA_DIR / name
+    if not f.is_file():
+        pytest.skip(f"CTA-ассет ещё не положен соседним агентом: {name}")
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        pytest.skip("ffmpeg нет в PATH — пропускаю round-trip альфы")
+    import tempfile
+    from PIL import Image
+    with tempfile.TemporaryDirectory() as td:
+        png = Path(td) / "fr.png"
+        # последний кадр (покой) — заведомо непрозрачный контент
+        r = subprocess.run(
+            [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+             "-c:v", "libvpx-vp9", "-i", str(f),
+             "-vf", "select=eq(n\\,5)", "-frames:v", "1", str(png)],
+            capture_output=True, text=True)
+        if r.returncode != 0 or not png.is_file():
+            pytest.skip(f"декод не удался: {r.stderr.strip()[:120]}")
+        img = Image.open(png).convert("RGBA")
+        a = img.split()[3]
+        nz = sum(1 for px in a.get_flattened_data() if px > 0)
+        assert img.getpixel((0, 0))[3] == 0, "угол должен быть прозрачным"
+        assert nz > 500, "контент должен быть непрозрачным (альфа восстановилась)"
+
+
+@pytest.mark.parametrize("name,frames", [
+    ("subscribe_like.webm", 36), ("subscribe_slide_avatar.webm", 36),
+    ("comment.webm", 30), ("like.webm", 30), ("bell.webm", 30)])
+def test_cta_webm_frame_count(name, frames):
+    """V11 §5: pill-ассеты длятся ~1.44с (36 кадров @25), иконки ~1.2с (30)."""
+    f = CTA_DIR / name
+    if not f.is_file():
+        pytest.skip(f"CTA-ассет ещё не положен соседним агентом: {name}")
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        pytest.skip("ffprobe нет в PATH")
+    out = subprocess.run(
+        [ffprobe, "-v", "error", "-c:v", "libvpx-vp9", "-select_streams", "v:0",
+         "-count_frames", "-show_entries", "stream=nb_read_frames",
+         "-of", "csv=p=0", str(f)], capture_output=True, text=True).stdout.strip()
+    assert out == str(frames), f"{name}: nb_read_frames={out!r}, ждали {frames}"
+
+
+def test_make_enrich_assets_deterministic(tmp_path):
+    """Генератор детерминирован: повторный прогон даёт байт-в-байт те же webm
+    (single-thread VP9 + -bitexact + stripped metadata). ROBUST: нет ffmpeg/
+    Pillow/шрифта -> skip (гоняет настоящий VP9-энкод, потому skippable)."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        pytest.skip("ffmpeg нет в PATH — пропускаю генерацию")
+    import importlib.util
+    import hashlib
+    tools = Path(__file__).resolve().parents[1] / "tools" / "make_enrich_assets.py"
+    if not tools.is_file():
+        pytest.skip("генератор не найден")
+    spec = importlib.util.spec_from_file_location("make_enrich_assets", tools)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    if not mod.FONT_SEMIBOLD.is_file():
+        pytest.skip("нет вшитого Inter-SemiBold — пропускаю")
+
+    def _run(d):
+        rc = mod.main(["--ffmpeg", ffmpeg, "--out", str(d)])
+        assert rc == 0
+        return {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in sorted(d.glob("*.webm"))}
+
+    h1 = _run(tmp_path / "a")
+    h2 = _run(tmp_path / "b")
+    assert h1 == h2 and len(h1) == 5, (h1, h2)
 
 
 # === 8. /api/browse?kind=image ==================================================

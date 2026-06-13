@@ -445,7 +445,11 @@ def test_ill_snap_to_segment_start_and_duration_clamp():
     assert it.t_end - it.t_start == pytest.approx(3.4)
     assert it.payload.style_hint == "diagram"
     assert it.payload.image_query_en == "windows registry diagram"
-    assert it.payload.asset_kind == "none"            # подбор ассетов — P5
+    # image_source=auto + diagram + валидный английский query → SD-генерация
+    # (ТРЕК-2 §2): помечен asset_kind="generate", промпт переписан в text-free.
+    assert it.payload.asset_kind == "generate"
+    assert it.payload.gen_prompt_en == (
+        "abstract conceptual illustration, no text, windows registry diagram")
     assert it.payload.position == "top_right"
     assert it.score == 70                             # 55 + 15 за валидный query
 
@@ -478,8 +482,55 @@ def test_ill_style_fallback_and_russian_query_means_no_asset():
     assert out[0].payload.style_hint == "photo"
     assert out[1].payload.image_query_en == ""
     assert out[2].payload.image_query_en == ""
-    assert all(it.payload.asset_kind == "none" for it in out)
+    # русский/пустой query → SD не зовём; без emoji_map → asset_kind="none".
+    assert out[1].payload.asset_kind == "none"
+    assert out[2].payload.asset_kind == "none"
+    # точка 0: photo + валидный английский query (дефолт _pt) → SD-генерация
+    # напрямую, query как есть (без diagram-переписывания).
+    assert out[0].payload.asset_kind == "generate"
+    assert out[0].payload.gen_prompt_en == "windows registry diagram"
     assert out[1].score == 55                         # без query — без бонуса
+
+
+def test_ill_icon_style_never_generates_falls_back_to_emoji_or_none():
+    """style=icon → SD НЕ зовём (логотип/значок SD не нарисует, §2). Без
+    emoji_map → asset_kind="none" (предложение без ассета)."""
+    tr = _build_tr(300)
+    llm = MockLLM([{"points": [_pt(15, 20, q="windows logo", style="icon")]}])
+    out = detect_all(tr, _cl(tr), _only("image"), llm, log=_SILENT)
+    assert len(out) == 1
+    assert out[0].payload.style_hint == "icon"
+    assert out[0].payload.asset_kind == "none"        # icon → не generate
+    assert out[0].payload.gen_prompt_en == ""
+
+
+def test_ill_emoji_source_skips_sd_routing(monkeypatch):
+    """image_source=emoji → SD-маршрут выключен даже для photo с валидным
+    английским query: точка уходит в эмодзи-фолбэк (тут emoji_map подменён)."""
+    tr = _build_tr(300)
+    monkeypatch.setattr(enrich_llm, "_load_emoji_map",
+                        lambda *_a, **_k: {"registry": "u1f4c1"})
+    llm = MockLLM([{"points": [_pt(15, 20, q="windows registry", style="photo",
+                                   concept="реестр registry")]}])
+    out = detect_all(tr, _cl(tr),
+                     {**_only("image"), "image_source": "emoji"},
+                     llm, log=_SILENT)
+    assert len(out) == 1
+    assert out[0].payload.asset_kind == "emoji"       # SD не звался
+    assert out[0].payload.emoji == "u1f4c1"
+
+
+def test_ill_generate_source_routes_photo_to_sd():
+    """image_source=generate → photo с английским query помечается на SD
+    (asset_kind="generate"), без папки юзера."""
+    tr = _build_tr(300)
+    llm = MockLLM([{"points": [_pt(15, 20, q="dell server", style="photo")]}])
+    out = detect_all(tr, _cl(tr),
+                     {**_only("image"), "image_source": "generate"},
+                     llm, log=_SILENT)
+    assert len(out) == 1
+    assert out[0].payload.asset_kind == "generate"
+    assert out[0].payload.gen_prompt_en == "dell server"
 
 
 def test_ill_window_limit_four_points():

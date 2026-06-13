@@ -20,7 +20,8 @@ from typing import Optional
 from .censor import build_censor_graph
 from .config import Config
 from .cutlist import resolve
-from .enrich import MAX_ANIMS, MAX_STILLS, AnimOverlay, RenderEnrich, StillOverlay
+from .enrich import (MAX_ANIMS, MAX_STILLS, AnimOverlay, RenderEnrich,
+                     StillOverlay, ZoomWindow)
 from .ffmpeg_utils import FFmpeg
 from .models import CutList
 from .probe import MediaInfo
@@ -621,19 +622,112 @@ def _ass_path_for_filter(p: str) -> str:
     return p
 
 
+# --- enrich dynamics: punch-zoom + blur-backplate (V11 §3, §4a) ---------------
+# Анти-кринж / перф-числа в КОДЕ (R3/R2 — qwen числа игнорирует). Окна (t0/t1) и
+# z_max приходят из плана (FINAL-секунды); здесь — техника фильтра.
+PUNCH_RAMP_S = 0.7            # рамп-ин/рамп-аут зума (smoothstep), §4a
+# Даунскейл-blur (R2 §4): blur на 1/16 пикселей + bilinear-upscale ≡ boxblur=20,
+# в 3.5× дешевле наивного полноэкранного boxblur. Числа доказаны кадрами спайка.
+BLUR_DS_W = 480              # даунскейл-ширина ветки blur
+BLUR_DS_H = 270              # даунскейл-высота
+BLUR_BOX = "boxblur=4:2"     # boxblur на даунскейле (≡ sigma≈20 после upscale)
+BLUR_EQ = "eq=brightness=-0.16:saturation=0.85"   # затемнение + десатурация фона
+
+
+def _smoothstep_z_expr(zw: "ZoomWindow", ramp: float = PUNCH_RAMP_S) -> str:
+    r"""Кусочная smoothstep-огибающая Z(t) для одного окна punch-zoom (§4a).
+
+    Z(t): 1.0 вне окна; рамп-ин ``ramp`` c (smoothstep 1->z_max), hold на пике,
+    рамп-аут ``ramp`` c (z_max->1). smoothstep ``p*p*(3-2p)`` — джиттер 0.082
+    против 0.153 у zoompan (R3: zoompan ~1.9× дёрганей, отвергнут). Рампы
+    клампятся, чтобы для короткого окна вход/выход не наложились.
+    """
+    t0, t1 = float(zw.t0), float(zw.t1)
+    zmax = float(zw.z_max)
+    rin = min(ramp, max(0.0, (t1 - t0) / 2.0))
+    rout = rin
+    ti0, ti1 = t0, t0 + rin              # рамп-ин
+    to0, to1 = t1 - rout, t1            # рамп-аут
+    one = "1"
+    if rin <= 0:                        # вырожденное окно -> без зума
+        return one
+    # p_in = (t-ti0)/rin; ss_in = p*p*(3-2p); z_in = 1 + (zmax-1)*ss_in
+    pin = f"((t-{_f(ti0)})/{_f(rin)})"
+    ssin = f"({pin}*{pin}*(3-2*{pin}))"
+    zin = f"(1+{_f(zmax - 1.0)}*{ssin})"
+    pout = f"((t-{_f(to0)})/{_f(rout)})"
+    ssout = f"({pout}*{pout}*(3-2*{pout}))"
+    zout = f"({_f(zmax)}-{_f(zmax - 1.0)}*{ssout})"
+    # if(in-window) { if(ramp-in) zin else if(ramp-out) zout else zmax } else 1
+    inwin = f"between(t,{_f(t0)},{_f(t1)})"
+    inramp = f"lt(t,{_f(ti1)})"
+    outramp = f"gt(t,{_f(to0)})"
+    body = (f"if({inramp},{zin},"
+            f"if({outramp},{zout},{_f(zmax)}))")
+    return f"if({inwin},{body},{one})"
+
+
+def _punch_dims(media: MediaInfo, scale_h: Optional[int],
+                crop_filter: Optional[str]) -> tuple[int, int]:
+    r"""Финальные дименшены кадра (W, H) для punch-zoom scale-back.
+
+    Зеркало ``serve._final_render_dims``: для вертикального рендера цель уже
+    запечена в ``crop_filter`` (``...,scale=W:H``) — берём её; иначе высота =
+    ``scale_h`` (или исходная), ширина пропорциональна источнику. Дименшены
+    нужны ТОЛЬКО когда есть punch-окна; при их отсутствии не используются.
+    """
+    if crop_filter:
+        m = re.search(r"scale=(\d+):(\d+)", crop_filter)
+        if m:
+            return int(m.group(1)), int(m.group(2))
+    out_h = int(scale_h) if scale_h else int(media.height or 1080)
+    src_w = int(media.width or 1920)
+    src_h = int(media.height or 1080)
+    out_w = int(round(src_w * out_h / src_h)) if src_h else 1920
+    return max(1, out_w), max(1, out_h)
+
+
+def _punch_filter(punches: list["ZoomWindow"], out_w: int, out_h: int) -> str:
+    r"""crop+scale punch-zoom (§4a, ПОБЕДИЛ zoompan): кадр кропится по Z(t) и
+    скейлится обратно в ``out_w``×``out_h`` — scale интерполирует субпиксельно
+    (crop целочисленно снапит top-left, но финальный scale это прячет).
+
+    Несколько окон складываются в ОДНУ Z(t) перемножением огибающих (окна
+    планировщик разносит зазором ≥30-60 c, так что перемножение = max — активна
+    максимум одна). Возвращает строку фильтра ``crop=...,scale=W:H`` (без
+    меток) для вставки в comma-chain. Пустой список окон -> "" (no-op).
+    """
+    if not punches or out_w <= 0 or out_h <= 0:
+        return ""
+    exprs = [_smoothstep_z_expr(zw) for zw in punches]
+    z = exprs[0] if len(exprs) == 1 else "*".join(f"({e})" for e in exprs)
+    # crop по Z(t), центрированный; scale обратно в фикс. финальные дименшены
+    # (НЕ iw:ih — после crop iw=cropped). \Z живёт в crop-выражениях.
+    return (f"crop=w='iw/({z})':h='ih/({z})'"
+            f":x='(iw-iw/({z}))/2':y='(ih-ih/({z}))/2',"
+            f"scale={int(out_w)}:{int(out_h)}")
+
+
 # --- enrich overlays (ENRICH_PLAN §2.1) ---------------------------------------
 def _enrich_video_chain(src_lbl: str, vpre: list[str],
                         stills: list[StillOverlay], anims: list[AnimOverlay],
-                        first_idx: int, vsubs: list[str]) -> str:
-    """Video sub-graph from ``src_lbl`` to ``[outv]`` with enrich overlays.
+                        first_idx: int, vsubs: list[str],
+                        *, card_windows: Optional[list[tuple[float, float]]] = None,
+                        punches: Optional[list["ZoomWindow"]] = None,
+                        out_w: int = 0, out_h: int = 0) -> str:
+    r"""Video sub-graph from ``src_lbl`` to ``[outv]`` with enrich overlays.
 
-    Statement order is the §2.1 contract: ``vpre`` (crop -> scale -> fps)
-    first, then one overlay node per still/anim — the input indices follow the
-    order the enrich ``-i`` entries were appended after the music input — and
-    finally the subtitles filters from ``vsubs`` (enrich.ass with fontsdir
-    FIRST, burn.ass LAST). All t0/t1 are FINAL (post-concat) seconds; the
-    fractions are formatted by :func:`_f` (f-strings — always a dot, the
-    filtergraph never sees a locale comma).
+    Statement order is the §2.1/§3/§4a contract: ``vpre`` (crop -> scale -> fps)
+    first, then — V11 — punch-zoom (whole-frame crop+scale, §4a) and per-card
+    blur-backplate (§3) BEFORE the overlay nodes (zoom the whole frame, then PiP
+    on top; the frosted panel floats over its own blurred backdrop), then one
+    overlay node per still/anim — the input indices follow the order the enrich
+    ``-i`` entries were appended after the music input — and finally the
+    subtitles filters from ``vsubs`` (enrich.ass with fontsdir FIRST, burn.ass
+    LAST). All t0/t1 are FINAL (post-concat) seconds; the fractions are formatted
+    by :func:`_f` (f-strings — always a dot, the filtergraph never sees a locale
+    comma). Empty ``card_windows``/``punches`` keep the graph byte-for-byte the
+    pre-V11 chain (purely additive).
 
     PNG stills get ``format=rgba`` + alpha fade in/out (R2 §1); WebM anims get
     ``setpts=PTS+t0/TB`` to shift their clock to the show window and — ONLY
@@ -642,6 +736,15 @@ def _enrich_video_chain(src_lbl: str, vpre: list[str],
     repeating the bed's last frame FOREVER and the render never ends (R2
     trap #2). A finite (non-looped) anim must NOT get ``shortest=1`` — that
     would truncate the whole program at the anim's end.
+
+    Blur-backplate (§3) is the R2 ``trimdscale`` technique: a ``split`` branch
+    is down-scaled (``480:270``) → ``boxblur`` → darkened → up-scaled bilinear
+    (≡ ``boxblur=20``, 3.5× cheaper, no blockiness) then ``trim``+``setpts``
+    into the card window and overlaid with ``eof_action=pass``. The TRAP (R2 §4):
+    ``enable=`` on the overlay does NOT gate the upstream blur — without ``trim``
+    the blur is computed on EVERY frame of the whole clip. ``trim``+``setpts``
+    confines the cost to the card seconds; ``eof_action=pass`` lets the main
+    stream continue past the trimmed branch's end.
     """
     stmts: list[str] = []
     cur = src_lbl
@@ -650,6 +753,40 @@ def _enrich_video_chain(src_lbl: str, vpre: list[str],
         stmts.append(f"{cur}{','.join(vpre)}[vb{nb}]")
         cur = f"[vb{nb}]"
         nb += 1
+    # V11 §4a — punch-zoom (whole-frame), BEFORE overlays/backplate.
+    punch_f = _punch_filter(list(punches or []), out_w, out_h)
+    if punch_f:
+        out = f"[vb{nb}]"
+        stmts.append(f"{cur}{punch_f}{out}")
+        cur, nb = out, nb + 1
+    # V11 §3 — blur-backplate per card window (R2 trimdscale), BEFORE overlays.
+    for ci, (c0, c1) in enumerate(card_windows or []):
+        c0 = max(0.0, float(c0))
+        c1 = max(c0, float(c1))
+        blur_lbl = f"[bbk{ci}]"
+        base_lbl = f"[bbs{ci}]"
+        trim_lbl = f"[bbb{ci}]"         # blur-ветка обрезана в окно карточки
+        out = f"[vb{nb}]"
+        # split: одна ветка — фон, вторая → blur-backplate в окно карточки.
+        stmts.append(f"{cur}split=2{base_lbl}{blur_lbl}")
+        # КРИТ-ПОРЯДОК (LAW §3/§4, R2 ловушка #1): trim ИДЁТ ПЕРВЫМ, ДО boxblur.
+        # Раньше тут стоял scale2ref+trim-после — scale2ref тянет кадры из
+        # ПОЛНОДЛИННОЙ reference-ветки в лок-степе, поэтому boxblur считался на
+        # ВЕСЬ клип (+537% перф), а trim лишь выбрасывал готовые кадры. Перенос
+        # trim перед даунскейл-blur ограничивает дорогой boxblur только секундами
+        # карточки (оконно-пропорциональная стоимость, +60% как в спайке), а
+        # плоский scale=W:H:flags=bilinear (вместо scale2ref) даёт тот же
+        # bilinear-upscale ≡ boxblur=20 без полнодлинной reference-привязки.
+        # setpts держит PTS в окне [c0,c1]; overlay eof_action=pass даёт main
+        # пройти за конец обрезанной ветки.
+        stmts.append(
+            f"{blur_lbl}trim={_f(c0)}:{_f(c1)},setpts=PTS-STARTPTS+{_f(c0)}/TB,"
+            f"scale={BLUR_DS_W}:{BLUR_DS_H},{BLUR_BOX},{BLUR_EQ},"
+            f"scale={int(out_w)}:{int(out_h)}:flags=bilinear{trim_lbl}")
+        stmts.append(
+            f"{base_lbl}{trim_lbl}overlay=0:0"
+            f":enable='between(t,{_f(c0)},{_f(c1)})':eof_action=pass{out}")
+        cur, nb = out, nb + 1
     idx = first_idx
     for k, st in enumerate(stills):
         # TODO(kenburns v1.1): st.kenburns renders as a plain PNG overlay for
@@ -810,10 +947,17 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
 
     # An all-empty enrich plan behaves exactly like None (byte-for-byte legacy
     # graphs); a non-empty one rides the non-empty-vpost re-encode mechanism.
+    # V11: punch-zoom (§4a) / card blur-backplate (§3) also make the plan
+    # non-empty even with no stills/anims/cards_ass (they are pure video-chain
+    # effects, no extra inputs).
     enr = (enrich if enrich is not None
-           and (enrich.stills or enrich.anims or enrich.cards_ass) else None)
+           and (enrich.stills or enrich.anims or enrich.cards_ass
+                or enrich.punches or enrich.card_windows) else None)
     enr_stills: list[StillOverlay] = list(enr.stills) if enr else []
     enr_anims: list[AnimOverlay] = list(enr.anims) if enr else []
+    enr_punches: list[ZoomWindow] = list(enr.punches) if enr else []
+    enr_card_windows: list[tuple[float, float]] = (
+        list(enr.card_windows) if enr else [])
     # Engine safety net (§2.1 п.5, duplicates the planner's score-trim): the
     # planner already trimmed by score and sorted by t0 — here we only cap the
     # input count so a hand-written plan cannot explode the filtergraph.
@@ -826,6 +970,13 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
             f"лимит движка {MAX_ANIMS}, лишние отброшены.")
         enr_anims = enr_anims[:MAX_ANIMS]
     has_overlays = bool(enr_stills or enr_anims)
+    # V11: chain is needed when there are overlays OR video-chain dynamics.
+    has_dynamics = bool(enr_punches or enr_card_windows)
+    use_chain = has_overlays or has_dynamics
+    # Финальные дименшены кадра — нужны punch-zoom (scale=W:H обратно после crop).
+    # Та же логика, что serve._final_render_dims: vertical crop -> baked scale в
+    # crop_filter; иначе высота = scale_h|исходная, ширина пропорциональна.
+    pz_w, pz_h = _punch_dims(media, scale_h, crop_filter)
 
     # vpost = vpre (crop -> scale -> fps) + vsubs (subtitles last). Without
     # enrich overlays it is one comma chain — byte-for-byte the legacy vpost.
@@ -924,11 +1075,11 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
     # stay byte-for-byte identical.
     efades = _edge_fade_filters(edge_fade, out_adur) if has_audio else []
 
-    if not removed and not vpost and not has_overlays:
+    if not removed and not vpost and not use_chain:
         # No cuts, no rescale: just mux (video copied — no quality loss). Denoise,
         # when on, forces the audio through filter_complex (video still copied).
-        # (has_overlays joins the non-empty-vpost gate: overlay-only enrich has
-        # an empty vpost string yet still demands a video re-encode.)
+        # (use_chain joins the non-empty-vpost gate: overlay/punch/blur-only
+        # enrich has an empty vpost string yet still demands a video re-encode.)
         if not has_audio:
             log("  no cuts — remuxing (video copied).")
             args = ["-i", media.path, "-map", "0:v",
@@ -976,8 +1127,11 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
         # ([0:v] -> vpre -> overlay nodes -> subtitles), byte-for-byte the
         # legacy single statement otherwise.
         vgraph = (_enrich_video_chain("[0:v]", vpre, enr_stills, enr_anims,
-                                      enrich_in_idx, vsubs)
-                  if has_overlays else f"[0:v]{vpost_s}[outv]")
+                                      enrich_in_idx, vsubs,
+                                      card_windows=enr_card_windows,
+                                      punches=enr_punches,
+                                      out_w=pz_w, out_h=pz_h)
+                  if use_chain else f"[0:v]{vpost_s}[outv]")
         if has_audio and (apost or efades or music_path):
             # Audio must enter the graph for the denoise/edge-fade/music filters.
             if music_path:
@@ -1028,11 +1182,15 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
         # _edge_fade_filters for why that order protects the de-click ramp.
         afinal = apost + efades
         a_lbl = "[outa_raw]" if (afinal or music_path) else "[outa]"
-        if has_overlays:
-            # §2.1: overlays live AFTER concat, on the FINAL timeline ([vc]).
+        if use_chain:
+            # §2.1/§3/§4a: overlays + punch-zoom + blur-backplate live AFTER
+            # concat, on the FINAL timeline ([vc]).
             graph = (base + f"concat=n={len(kept)}:v=1:a=1[vc]{a_lbl};"
                      + _enrich_video_chain("[vc]", vpre, enr_stills, enr_anims,
-                                           enrich_in_idx, vsubs))
+                                           enrich_in_idx, vsubs,
+                                           card_windows=enr_card_windows,
+                                           punches=enr_punches,
+                                           out_w=pz_w, out_h=pz_h))
         elif vpost:
             graph = base + f"concat=n={len(kept)}:v=1:a=1[vc]{a_lbl};[vc]{vpost_s}[outv]"
         else:
@@ -1053,10 +1211,13 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
             vparts.append(f"[0:v]trim=start={_f(a)}:end={_f(b)},setpts=PTS-STARTPTS[v{i}]")
             concat.append(f"[v{i}]")
         base = ";".join(vparts) + ";" + "".join(concat)
-        if has_overlays:
+        if use_chain:
             graph = (base + f"concat=n={len(kept)}:v=1:a=0[vc];"
                      + _enrich_video_chain("[vc]", vpre, enr_stills, enr_anims,
-                                           enrich_in_idx, vsubs))
+                                           enrich_in_idx, vsubs,
+                                           card_windows=enr_card_windows,
+                                           punches=enr_punches,
+                                           out_w=pz_w, out_h=pz_h))
         elif vpost:
             graph = base + f"concat=n={len(kept)}:v=1:a=0[vc];[vc]{vpost_s}[outv]"
         else:

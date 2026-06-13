@@ -1,24 +1,48 @@
 {
-  "version": 1,
+  "version": 2,
   "fps": 25,
-  "frames": 48,
+  "frames": {
+    "pill": 36,
+    "icon": 30
+  },
   "presets": {
-    "pulse": {
-      "dur_s": 1.92,
+    "cta_slide_in": {
+      "dur_s": 1.44,
+      "easing": "ease_out_back",
+      "overshoot": 1.045,
+      "slide_frac": 0.42,
+      "from_frac": -0.46,
+      "fade_frac": 0.4,
+      "loop": false
+    },
+    "ease_out_back": {
+      "easing": "ease_out_back",
+      "s": 1.70158,
+      "peak": 1.1
+    },
+    "glow": {
       "easing": "sine",
-      "amplitude": 0.06,
+      "amplitude": 1.0,
+      "cycles": 1.6,
       "loop": true
     },
     "pop_in": {
       "dur_s": 0.48,
-      "easing": "overshoot",
-      "from": 0.95,
-      "over": 1.02,
+      "easing": "ease_out_back",
+      "from": 0.2,
+      "over": 1.12,
       "to": 1.0,
+      "s": 2.2,
       "loop": false
     },
+    "pulse": {
+      "dur_s": 1.2,
+      "easing": "sine",
+      "amplitude": 0.06,
+      "loop": true
+    },
     "bell_wiggle": {
-      "dur_s": 1.92,
+      "dur_s": 1.2,
       "easing": "damped_sine",
       "amplitude_deg": 12.0,
       "cycles": 2.0,
@@ -26,9 +50,10 @@
     }
   },
   "assets": {
-    "subscribe_like.webm": "pulse",
+    "subscribe_like.webm": "cta_slide_in",
+    "subscribe_slide_avatar.webm": "cta_slide_in",
     "comment.webm": "pop_in",
-    "like.webm": "pulse",
-    "bell.webm": "bell_wiggle"
+    "like.webm": "pop_in",
+    "bell.webm": "pop_in"
   }
 }

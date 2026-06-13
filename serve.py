@@ -65,6 +65,7 @@ from vpipe import clips as clips_mod
 from vpipe import enrich as enrich_mod
 from vpipe import enrich_cards
 from vpipe import enrich_llm
+from vpipe import imagegen as imagegen_mod
 from vpipe import facecrop as facecrop_mod
 from vpipe import ffmpeg_utils
 from vpipe import metadata as metadata_mod
@@ -551,7 +552,9 @@ def _write_detect_opts(opts: dict) -> None:
 # --- авто-обогащение: настройки запуска (ENRICH_PLAN §5, cache/enrich_ui.json) --
 _ENRICH_TYPE_KEYS = ("image", "animation", "list_card", "cta")
 _ENRICH_DENSITIES = ("min", "normal", "aggressive")
-_ENRICH_IMAGE_SOURCES = ("auto", "emoji", "user_folder")
+# "generate" = локальная SD-генерация (ТРЕК-2 §2); "auto" тоже умеет SD (папка →
+# SD → эмодзи → none). Должен совпадать с whitelist'ом sanitize_params (enrich.py).
+_ENRICH_IMAGE_SOURCES = ("auto", "emoji", "user_folder", "generate")
 
 
 def _enrich_opts_path() -> Path:
@@ -1978,6 +1981,9 @@ def state():
         # сводка плана для бутстрапа 5-й вкладки (count/stale, как clips).
         "enrich_opts": _read_enrich_opts(),
         "enrich": _enrich_state(s),
+        # ТРЕК-2 §2: SD-генерация настроена? (тумблер+бинарь+модель) — UI красит
+        # warning-баннер «SD не настроен — эмодзи-фолбэк» под источником картинок.
+        "imagegen_ready": _sd_configured(s.cfg),
         "queue_running": _queue_running,   # F3: editor can flag a busy queue
         # P2-#6: pending count (incl. a queue restored from queue.json with the
         # worker stopped) so the «📋 Очередь» badge lights up on first load.
@@ -3272,6 +3278,72 @@ def _run_enrich_detectors(s: Session, params: dict, log) -> list:
         user_folder=(params or {}).get("user_folder", ""))
 
 
+def _sd_configured(cfg: Config) -> bool:
+    """SD-генерация реально доступна: тумблер включён И бинарь sd-cli И модель
+    .gguf резолвятся (паттерн opt-in DeepFilterNet). Решает, запускать ли этап
+    images и показывать ли warning-баннер «SD не настроен» (ТРЕК-2 §2)."""
+    ig = cfg.render.imagegen
+    if not ig.imagegen_enabled:
+        return False
+    return bool(imagegen_mod._resolve_sd_bin(ig.imagegen_bin)
+                and imagegen_mod._resolve_model(ig.imagegen_model))
+
+
+def _wait_ollama_unloaded(s: Session, log, *, tries: int = 20,
+                          delay: float = 0.5) -> None:
+    """VRAM-менеджер (§2): выгрузить qwen3 и дождаться пустого GET /api/ps перед
+    SD-этапом (8 ГБ карта не вместит LLM+SDXL). best-effort: нет Ollama / не
+    выгрузилась за tries опросов — всё равно идём дальше (--max-vram подстрахует),
+    задачу не валим."""
+    if s.llm is None:
+        return
+    s.llm.unload()
+    for _ in range(max(1, tries)):
+        if not s.llm.loaded_models():
+            return
+        time.sleep(delay)
+    log("  SD: Ollama не выгрузилась за отведённое время — "
+        "продолжаю (sd-cli с --max-vram).")
+
+
+def _run_enrich_images(s: Session, items: list, params: dict, log) -> int:
+    """Этап images (ТРЕК-2 §2): сгенерировать SD-картинки точкам, помеченным
+    маршрутизатором ``asset_kind="generate"``. Зовётся ПОСЛЕ детекторов и
+    ПЕРЕД планировщиком. Последовательность VRAM: unload Ollama -> ждём пустого
+    /api/ps -> пачка ``enrich_image_batch``. НЕ запускаем при image_source вне
+    {generate, auto} или если SD не настроен (точки с generate откатятся на
+    эмодзи в самом батче). Сбой этапа не валит задачу. Возврат — число
+    сгенерированных картинок."""
+    src = (params or {}).get("image_source", "auto")
+    if src not in ("generate", "auto"):
+        return 0
+    gen_pts = [it for it in items
+               if getattr(getattr(it, "payload", None), "asset_kind", None)
+               == "generate"]
+    if not gen_pts:
+        return 0
+    if not _sd_configured(s.cfg):
+        # Маршрутизатор пометил точки на генерацию, но SD не настроен — откат на
+        # эмодзи-фолбэк (батч сам это сделает по полю emoji), задача жива.
+        log("  SD не настроен (бинарь/модель) — эмодзи-фолбэк для "
+            f"{len(gen_pts)} картинок.")
+        imagegen_mod.enrich_image_batch(gen_pts, s.cfg.render.imagegen, log)
+        return 0
+    s.stage(f"Монтаж: генерация {len(gen_pts)} картинок (ИИ)…")
+    _wait_ollama_unloaded(s, log)
+    base = 1.0 - enrich_llm.PROGRESS_WEIGHTS["assets"]
+
+    def img_prog(frac: float) -> None:
+        s.set_progress(base + enrich_llm.PROGRESS_WEIGHTS["assets"] * frac)
+
+    try:
+        return imagegen_mod.enrich_image_batch(
+            gen_pts, s.cfg.render.imagegen, log, on_progress=img_prog)
+    except Exception as e:  # noqa: BLE001 — сбойный SD-этап не валит задачу
+        log(f"enrich: этап генерации картинок упал ({e}) — эмодзи-фолбэк")
+        return 0
+
+
 def _merge_enrich_user_state(s: Session, items: list) -> list:
     """Повторный suggest НЕ уничтожает работу юзера (§1: «ИИ предлагает —
     юзер решает»; CRITICAL код-ревью P2). Протокол мержа со старым планом:
@@ -3333,6 +3405,10 @@ def enrich_suggest(body: dict = Body(default={})):
     def run():
         s.stage("Монтаж: анализ…")
         items = _run_enrich_detectors(s, opts, log=s.stage)
+        # Этап images (ТРЕК-2 §2): SD-генерация для точек asset_kind="generate".
+        # ПОСЛЕ детекторов (VRAM-менеджер выгрузит Ollama), ДО мержа/планировщика:
+        # генерим только свежие точки детектора, мерж затем хранит ревью юзера.
+        _run_enrich_images(s, items, params, log=s.stage)
         # Повторный анализ не теряет ревью юзера: enabled/edited и ручные
         # предложения переезжают из старого плана (CRITICAL код-ревью P2).
         items = _merge_enrich_user_state(s, items)

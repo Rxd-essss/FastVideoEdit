@@ -312,6 +312,152 @@ def test_suggest_rerun_stale_plan_not_merged(client, monkeypatch, tmp_path):
     assert data["hash"] == HASH
 
 
+# === 1b. ТРЕК-2 §2: SD-этап images + unload-последовательность ===================
+class _FakeLLM:
+    """LLM с записью порядка вызовов unload/loaded_models (VRAM-менеджер §2)."""
+
+    def __init__(self, *, loaded_after_unload=False):
+        self.events: list[str] = []
+        self._loaded = loaded_after_unload
+
+    def unload(self, model=None):
+        self.events.append("unload")
+        self._loaded = False
+        return True
+
+    def loaded_models(self):
+        self.events.append("ps")
+        return ["qwen3:8b"] if self._loaded else []
+
+
+def _enable_sd(sess):
+    """Включить SD-тумблер и заставить _sd_configured вернуть True (бинарь+модель
+    резолвятся) — без реального файла модели подменяем резолверы в тесте."""
+    sess.cfg.render.imagegen.imagegen_enabled = True
+    sess.cfg.render.imagegen.imagegen_model = "x.gguf"
+
+
+def test_suggest_generate_runs_images_stage_with_unload_order(client,
+                                                              monkeypatch,
+                                                              tmp_path):
+    """image_source=generate + SD настроена → этап images: unload Ollama →
+    ждём пустого /api/ps → enrich_image_batch. Порядок строгий (§2)."""
+    llm = _FakeLLM()
+    sess = FakeSession(tmp_path, llm=llm, duration=120.0)
+    _enable_sd(sess)
+    _install(monkeypatch, sess)
+    monkeypatch.setattr(serve, "_sd_configured", lambda cfg: True)
+
+    # детекторы вернули одну точку, помеченную на генерацию
+    def fake_detect(s, params, log):
+        return [_img("enr_g1", t=60.0, score=80, kind="generate")]
+    monkeypatch.setattr(serve, "_run_enrich_detectors", fake_detect)
+
+    seen = {"batch": 0, "items": None}
+
+    def fake_batch(points, cfg, log, on_progress=None):
+        seen["batch"] += 1
+        seen["items"] = list(points)
+        # эмулируем VRAM-проверку через события llm к моменту запуска батча
+        seen["events_at_batch"] = list(llm.events)
+        for p in points:
+            p.payload.asset_kind = "user"
+            p.payload.asset_path = str(tmp_path / "gen.png")
+        return len(points)
+    monkeypatch.setattr(serve.imagegen_mod, "enrich_image_batch", fake_batch)
+
+    client.post("/api/enrich/suggest", json={"image_source": "generate"})
+    _wait_done(sess)
+    assert sess.task["error"] is None
+    assert seen["batch"] == 1
+    # unload вызван ДО батча, и /api/ps опрошен (пустой) до запуска генерации
+    assert "unload" in seen["events_at_batch"]
+    assert "ps" in seen["events_at_batch"]
+    assert seen["events_at_batch"].index("unload") < \
+        seen["events_at_batch"].index("ps")
+    # точка ушла в user-ассет
+    data = _plan_file(sess)
+    assert data["items"][0]["payload"]["asset_kind"] == "user"
+
+
+def test_suggest_generate_sd_not_configured_warns_emoji_fallback(client,
+                                                                 monkeypatch,
+                                                                 tmp_path):
+    """SD не настроена → warning в stage, задача НЕ падает, точка-generate
+    откатывается на эмодзи-фолбэк (батч зовётся для отката, unload — нет)."""
+    llm = _FakeLLM()
+    sess = FakeSession(tmp_path, llm=llm, duration=120.0)
+    _install(monkeypatch, sess)
+    monkeypatch.setattr(serve, "_sd_configured", lambda cfg: False)
+    stages: list[str] = []
+    monkeypatch.setattr(sess, "stage", stages.append)
+
+    def fake_detect(s, params, log):
+        return [_img("enr_g1", t=60.0, kind="generate")]
+    monkeypatch.setattr(serve, "_run_enrich_detectors", fake_detect)
+
+    fired = {"batch": 0}
+
+    def fake_batch(points, cfg, log, on_progress=None):
+        fired["batch"] += 1
+        for p in points:                 # откат: emoji подобран ранее
+            p.payload.asset_kind = "emoji" if p.payload.emoji else "none"
+        return 0
+    monkeypatch.setattr(serve.imagegen_mod, "enrich_image_batch", fake_batch)
+
+    client.post("/api/enrich/suggest", json={"image_source": "generate"})
+    _wait_done(sess)
+    assert sess.task["error"] is None       # задача НЕ упала
+    assert fired["batch"] == 1              # батч позван для эмодзи-отката
+    assert llm.events == []                 # SD не настроена → unload не звался
+    assert any("SD не настроен" in m for m in stages)
+
+
+def test_suggest_emoji_source_skips_images_stage(client, monkeypatch, tmp_path):
+    """image_source=emoji → этап images вообще не запускается (нет SD)."""
+    llm = _FakeLLM()
+    sess = FakeSession(tmp_path, llm=llm, duration=120.0)
+    _install(monkeypatch, sess)
+
+    def fake_detect(s, params, log):
+        return [_img("enr_e1", t=60.0, kind="emoji")]
+    monkeypatch.setattr(serve, "_run_enrich_detectors", fake_detect)
+    fired = {"batch": 0}
+    monkeypatch.setattr(serve.imagegen_mod, "enrich_image_batch",
+                        lambda *a, **k: fired.__setitem__("batch",
+                                                          fired["batch"] + 1))
+    client.post("/api/enrich/suggest", json={"image_source": "emoji"})
+    _wait_done(sess)
+    assert sess.task["error"] is None
+    assert fired["batch"] == 0              # SD-этап пропущен
+    assert llm.events == []
+
+
+def test_state_includes_imagegen_ready(client, monkeypatch, tmp_path):
+    sess = FakeSession(tmp_path)
+    _install(monkeypatch, sess)
+    monkeypatch.setattr(serve, "_sd_configured", lambda cfg: True)
+    assert client.get("/api/state").json()["imagegen_ready"] is True
+    monkeypatch.setattr(serve, "_sd_configured", lambda cfg: False)
+    assert client.get("/api/state").json()["imagegen_ready"] is False
+
+
+def test_sd_configured_gates_on_toggle_bin_model(tmp_path, monkeypatch):
+    sess = FakeSession(tmp_path)
+    ig = sess.cfg.render.imagegen
+    ig.imagegen_enabled = False
+    assert serve._sd_configured(sess.cfg) is False        # тумблер выкл
+    ig.imagegen_enabled = True
+    ig.imagegen_model = ""
+    monkeypatch.setattr(serve.imagegen_mod, "_resolve_sd_bin",
+                        lambda c: "sd.exe")
+    monkeypatch.setattr(serve.imagegen_mod, "_resolve_model", lambda c: None)
+    assert serve._sd_configured(sess.cfg) is False        # модели нет
+    monkeypatch.setattr(serve.imagegen_mod, "_resolve_model",
+                        lambda c: "m.gguf")
+    assert serve._sd_configured(sess.cfg) is True
+
+
 # === 2. llm_off → мгновенный 200 без задачи =====================================
 def test_suggest_llm_off_no_task_no_files(client, monkeypatch, tmp_path):
     sess = FakeSession(tmp_path, llm=None)

@@ -71,6 +71,14 @@ MIN_WINDOW_S = 1.0            # окно, схлопнувшееся у швов
 MAX_STILLS = 6                # engine-лимит §2.1 п.5: PNG-входов на рендер
 MAX_ANIMS = 3                 # engine-лимит §2.1 п.5: WebM-входов на рендер
 
+# --- punch-zoom (§4a) — анти-кринж лимиты в КОДЕ (R3, qwen числа игнорирует) ---
+PUNCH_Z_MAX = 1.08            # пик зума (НЕ выше PUNCH_Z_CAP = «зум-мем»)
+PUNCH_Z_CAP = 1.10            # жёсткий потолок зума
+PUNCH_DUR_MIN = 2.0          # длительность окна зума 2–3 c
+PUNCH_DUR_MAX = 3.0
+PUNCH_MIN_GAP_S = 30.0        # не чаще 1 раза в 30–60 c (не подряд)
+PUNCH_LEAD_S = 0.2           # отступ окна зума от краёв окна-источника (швы)
+
 # --- schema clamps — R5-дефолты, не выносить в промпт -------------------------
 IMAGE_DUR_MIN, IMAGE_DUR_DEF, IMAGE_DUR_MAX = 2.5, 3.0, 4.0      # §3.3
 ANIM_DUR_MIN, ANIM_DUR_DEF, ANIM_DUR_MAX = 1.5, 2.5, 4.0
@@ -108,6 +116,41 @@ EMOJI_PNG_SIZE = 256
 # Имя файла CTA-пака по варианту (§2.3); никакого play-логотипа и слова YouTube.
 _CTA_FILES = {"sub_like": "subscribe_like.webm", "like": "like.webm",
               "comment": "comment.webm", "bell": "bell.webm"}
+# Карта анимаций CTA/PiP-ассетов (§5): какой пресет играет какой webm и
+# зациклен ли он. anim_presets.json — единый источник правды (assets: webm ->
+# preset; presets[preset].loop). Финитный въезд (cta_slide_in/pop_in, loop=false)
+# играет ОДИН раз от t0 (PLAN §5: «оверлей должен играть один раз, НЕ loop»),
+# чистый pulse/glow (loop=true) — циклится. Кэш читаем лениво и один раз.
+_ANIM_PRESETS_PATH = CTA_ASSET_DIR / "anim_presets.json"
+_ANIM_LOOP_CACHE: Optional[dict[str, bool]] = None
+
+
+def _anim_loop_map() -> dict[str, bool]:
+    """webm-имя -> loop (из anim_presets.json). Сбой чтения/парса → {} (тогда
+    дефолт-loop у вызывающего). Кэшируется на процесс."""
+    global _ANIM_LOOP_CACHE
+    if _ANIM_LOOP_CACHE is not None:
+        return _ANIM_LOOP_CACHE
+    out: dict[str, bool] = {}
+    try:
+        data = json.loads(_ANIM_PRESETS_PATH.read_text(encoding="utf-8"))
+        presets = data.get("presets") or {}
+        assets = data.get("assets") or {}
+        if isinstance(presets, dict) and isinstance(assets, dict):
+            for webm, preset in assets.items():
+                pr = presets.get(preset)
+                if isinstance(pr, dict) and isinstance(pr.get("loop"), bool):
+                    out[str(webm)] = pr["loop"]
+    except (OSError, ValueError, TypeError):
+        out = {}
+    _ANIM_LOOP_CACHE = out
+    return out
+
+
+def _asset_loop(webm_name: str, default: bool) -> bool:
+    """loop-флаг для CTA/anim-webm по имени файла (anim_presets.json). Нет в
+    карте (неизвестный ассет) → ``default`` (безопасный фолбэк вызывающего)."""
+    return _anim_loop_map().get(webm_name, default)
 
 _POS_XY = {"top_right": ("W-w-{pad}", "{pad}"),
            "top_left": ("{pad}", "{pad}")}
@@ -185,13 +228,15 @@ class ImagePayload:
     concept: str = ""
     image_query_en: str = ""
     style_hint: str = "photo"          # photo | diagram | icon
-    asset_kind: str = "none"           # emoji | user | none
+    asset_kind: str = "none"           # emoji | user | generate | none
     asset_path: str = ""
     emoji: str = ""
     position: str = "top_right"        # top_right | top_left
     width_frac: float = IMG_WIDTH_DEF
     kenburns: bool = False
     fade_ms: int = 220
+    gen_seed: int = -1                  # детерм. сид SD (-1 = хэш query_en, §2)
+    gen_prompt_en: str = ""            # фактический промпт после diagram→concept
 
     def to_dict(self) -> dict:
         return {"concept": self.concept, "image_query_en": self.image_query_en,
@@ -199,7 +244,8 @@ class ImagePayload:
                 "asset_path": self.asset_path, "emoji": self.emoji,
                 "position": self.position,
                 "width_frac": round(self.width_frac, 3),
-                "kenburns": self.kenburns, "fade_ms": self.fade_ms}
+                "kenburns": self.kenburns, "fade_ms": self.fade_ms,
+                "gen_seed": self.gen_seed, "gen_prompt_en": self.gen_prompt_en}
 
     @staticmethod
     def sanitize(d: dict) -> "ImagePayload":
@@ -209,7 +255,7 @@ class ImagePayload:
             style_hint=_enum(d.get("style_hint"),
                              ("photo", "diagram", "icon"), "photo"),
             asset_kind=_enum(d.get("asset_kind"),
-                             ("emoji", "user", "none"), "none"),
+                             ("emoji", "user", "generate", "none"), "none"),
             asset_path=_abs_path(d.get("asset_path")),
             emoji=_s(d.get("emoji")),
             position=_enum(d.get("position"),
@@ -217,7 +263,9 @@ class ImagePayload:
             width_frac=_f(d.get("width_frac"), IMG_WIDTH_DEF,
                           IMG_WIDTH_MIN, IMG_WIDTH_MAX),
             kenburns=bool(d.get("kenburns", False)),
-            fade_ms=_i(d.get("fade_ms"), 220, 0, FADE_MS_MAX))
+            fade_ms=_i(d.get("fade_ms"), 220, 0, FADE_MS_MAX),
+            gen_seed=_i(d.get("gen_seed"), -1, -1),
+            gen_prompt_en=_s(d.get("gen_prompt_en")))
 
 
 @dataclass
@@ -266,7 +314,8 @@ class CardItem:
 @dataclass
 class ListCardPayload:
     title: str = ""
-    mode: str = "scrim"                # scrim (дефолт A из R5) | panel (v1.1)
+    mode: str = "panel"                # panel (стиль A «панель», дефолт V11/§3) |
+                                       # scrim (плоский градиент-скрим, фолбэк)
     items: list[CardItem] = field(default_factory=list)
     hold_s: float = CARD_HOLD_DEF
 
@@ -293,7 +342,7 @@ class ListCardPayload:
         items.sort(key=lambda it: it.t_word)
         return ListCardPayload(
             title=_trim_text(d.get("title"), CARD_TITLE_MAX),
-            mode=_enum(d.get("mode"), ("scrim", "panel"), "scrim"),
+            mode=_enum(d.get("mode"), ("scrim", "panel"), "panel"),
             items=items[:CARD_ITEMS_MAX],      # items <=6 ЖЁСТКО (§1.2)
             hold_s=_f(d.get("hold_s"), CARD_HOLD_DEF,
                       CARD_HOLD_MIN, CARD_HOLD_MAX))
@@ -457,8 +506,13 @@ def sanitize_params(d) -> dict:
                            ("min", "normal", "aggressive"), "normal")
     t = d.get("types") if isinstance(d.get("types"), dict) else {}
     out["types"] = {k: bool(t.get(k, True)) for k in out["types"]}
+    # image_source (§4, обратная совместимость): auto семантику НЕ ломаем —
+    # auto = папка юзера → SD-генерация → эмодзи → none (SD-ступень добавляет
+    # трек P_SD2; для старых планов без SD-конфига auto = как было, эмодзи/none).
+    # "generate" = сразу SD без папки юзера. "emoji"/"user_folder" — без изменений.
     out["image_source"] = _enum(d.get("image_source"),
-                                ("auto", "emoji", "user_folder"), "auto")
+                                ("auto", "emoji", "user_folder", "generate"),
+                                "auto")
     return out
 
 
@@ -710,16 +764,39 @@ class CtaTextPlan:
 
 
 @dataclass
+class ZoomWindow:
+    """Окно punch-zoom на видеодорожке (§4a, ФИНАЛЬНЫЕ секунды). Это эффект
+    кадра (crop+scale c Z(t)-smoothstep в render._enrich_video_chain), НЕ
+    оверлей — отдельный список в RenderEnrich. Заполняет планировщик (трек
+    динамики, идёт ПОСЛЕ этой фазы); здесь только контракт-датакласс.
+    ``z_max`` — пик зума (анти-кринж потолок 1.10 живёт в КОДЕ трека, не здесь);
+    ``cx``/``cy`` — центр crop в долях кадра (v1 = центр; зарезервировано под
+    bbox лица в v1.1)."""
+    t0: float                          # ФИНАЛЬНЫЕ (после-concat) секунды
+    t1: float
+    z_max: float = 1.08
+    cx: float = 0.5
+    cy: float = 0.5
+
+
+@dataclass
 class RenderEnrich:
     """Render-ready план (§2.1): render.py (P1.3) ест stills/anims/cards_ass/
     fonts_dir; ``cards``/``cta_texts`` — вход ASS-генератора enrich_cards.py,
-    из которого serve-слой строит enrich_{base}.ass и заполняет cards_ass."""
+    из которого serve-слой строит enrich_{base}.ass и заполняет cards_ass.
+
+    V11 (§3, §4a) добавляет два render-only списка, которые заполняет трек
+    карточек/динамики (идёт ПОСЛЕ фазы схемы): ``punches`` — окна punch-zoom
+    (эффект кадра), ``card_windows`` — окна карточек (t0,t1) для blur-backplate
+    в ``_enrich_video_chain``. Оба пустые по умолчанию = старое поведение."""
     stills: list[StillOverlay] = field(default_factory=list)
     anims: list[AnimOverlay] = field(default_factory=list)
     cards_ass: Optional[str] = None
     fonts_dir: str = str(FONTS_DIR)
     cards: list[CardPlan] = field(default_factory=list)
     cta_texts: list[CtaTextPlan] = field(default_factory=list)
+    punches: list[ZoomWindow] = field(default_factory=list)
+    card_windows: list[tuple[float, float]] = field(default_factory=list)
 
 
 # --- planner internals --------------------------------------------------------
@@ -994,10 +1071,15 @@ def plan_render(plan: EnrichPlan, timeline: Timeline,
                 lg(f"  enrich: {it.status_note} ({it.id})")
                 continue                # дроп из рендера, item остаётся в плане
             x, y = _cta_xy(H)
+            # loop по пресету ассета (§5): финитный въезд cta_slide_in/pop_in
+            # (loop=false в anim_presets.json) играет ОДИН раз от t0 — без
+            # -stream_loop -1 / shortest=1; чистый pulse-ассет циклится.
+            # Дефолт True = старое looped-поведение для незамапленных ассетов.
             anims.append((it.score, AnimOverlay(
                 path=str(f), x_expr=x, y_expr=y,
                 scale_w=max(1, round(W * CTA_WIDTH_FRAC)),
-                t0=c.f0, t1=c.f1, loop=True), it))
+                t0=c.f0, t1=c.f1,
+                loop=_asset_loop(f.name, True)), it))
             continue
         # image / animation (PiP в верхнем углу)
         pl2 = it.payload
@@ -1054,4 +1136,57 @@ def plan_render(plan: EnrichPlan, timeline: Timeline,
                                                  key=lambda sp: sp[1].t0)]
     re_plan.anims = [p for _s2, p, _o in sorted(anims,
                                                 key=lambda sp: sp[1].t0)]
+
+    # 7) карточки -> card_windows (§3, blur-backplate) — окна реально нарисованных
+    #    карточек (t1 по той же формуле, что ASS-генератор: единый источник).
+    re_plan.card_windows = [
+        (cp.t0, max(cp.t1, cp.items[-1].t
+                    + card_tail_s([ci.text for ci in cp.items], cp.hold_s)))
+        for cp in re_plan.cards if cp.items
+    ]
+
+    # 8) punch-zoom (§4a) — эффект кадра на emphasis. Источник (анти-расход, R3):
+    #    НЕ зовём LLM — переиспользуем уже принятые «сильные моменты» (карточки/
+    #    CTA: детектор их уже отметил). Окно зума центрируем на старте точки,
+    #    кламп 2–3 c, анти-кринж лимиты (≤1/30-60 c, не подряд, не в чистых
+    #    зонах, не пересекать оверлейные окна) — все числа в КОДЕ.
+    re_plan.punches = _plan_punches(accepted, dur)
     return re_plan
+
+
+def _plan_punches(accepted: list["_Cand"], dur: float) -> list[ZoomWindow]:
+    r"""Окна punch-zoom из принятых emphasis-точек с анти-кринж лимитами (§4a).
+
+    Источник (анти-расход, R3): НЕ зовём LLM — берём принятые «сильные моменты»
+    (карточки/CTA: детектор их уже отметил), по убыванию score. Окно ``PUNCH_DUR``
+    (~2.5 c) центрируется на середине окна-источника, клампится в ролик с
+    отступом ``PUNCH_LEAD_S`` от краёв. Отбрасываем окно если: в чистой
+    голове/хвосте; пересекает ЧУЖОЕ оверлейное окно (зум фона под СВОИМ
+    источником ОК — карточка/CTA это PiP, зум живёт под ним; но соседний
+    оверлей пересекать нельзя); ближе ``PUNCH_MIN_GAP_S`` к уже взятому зуму
+    (≤1 зум / 30-60 c, не подряд). ``z_max`` клампится потолком ``PUNCH_Z_CAP``.
+    """
+    half = (PUNCH_DUR_MIN + (PUNCH_DUR_MAX - PUNCH_DUR_MIN) * 0.5) * 0.5  # 2.5/2
+    cands = sorted((c for c in accepted
+                    if c.item.type == ENR_LIST_CARD or _is_cta(c.item.type)),
+                   key=lambda c: (-c.item.score, c.f0, c.item.id))
+    out: list[ZoomWindow] = []
+    z = min(PUNCH_Z_MAX, PUNCH_Z_CAP)
+    for c in cands:
+        center = 0.5 * (c.f0 + c.f1)
+        t0 = max(PUNCH_LEAD_S, center - half)
+        t1 = min(dur - PUNCH_LEAD_S, center + half)
+        if t1 - t0 < PUNCH_DUR_MIN - 1e-9:
+            continue                                # схлопнулось у краёв
+        if t0 < CLEAN_HEAD_S or t1 > dur - CLEAN_TAIL_S:
+            continue                                # чистые зоны без эффектов
+        # пересечение с ЧУЖИМ оверлейным окном (не своим источником) — отказ.
+        if any(other is not c and t0 < other.f1 and t1 > other.f0
+               for other in accepted):
+            continue
+        if any(abs(0.5 * (w.t0 + w.t1) - center) < PUNCH_MIN_GAP_S
+               for w in out):
+            continue                                # ≤1 зум / 30-60 c, не подряд
+        out.append(ZoomWindow(t0=t0, t1=t1, z_max=z))
+    out.sort(key=lambda w: w.t0)
+    return out

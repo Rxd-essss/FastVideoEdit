@@ -43,3 +43,6 @@ Thumbs.db
 
 # Large optional binaries — downloaded by the user (see README → Third-party)
 /tools/*.exe
+/tools/*.dll
+/tools/*.gguf
+/tools/*.safetensors

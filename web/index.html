@@ -926,7 +926,8 @@
         </label>
         <label>Источник картинок
           <select id="enImageSource" class="select">
-            <option value="auto" selected>Авто (папка → эмодзи)</option>
+            <option value="auto" selected>Авто (папка → ИИ → эмодзи)</option>
+            <option value="generate">Генерировать (локально, ИИ)</option>
             <option value="emoji">Только эмодзи</option>
             <option value="user_folder">Папка с ассетами</option>
           </select>
@@ -939,6 +940,9 @@
         </div>
         <div class="hint muted">ИИ подберёт картинки из этой папки по контексту (по именам файлов / descriptions.txt). Не найдёт подходящую — предложит выбрать вручную.</div>
       </div>
+      <!-- ТРЕК-2 §2: предупреждения для генерации (показываем при auto/generate) -->
+      <div id="enGenInfoRow" class="hint muted hidden">Картинки рисует локальная модель SDXL-Turbo (~4 ГБ, скачивается отдельно). Первая генерация может занять время; всё считается на вашем GPU, в сеть ничего не уходит.</div>
+      <div id="enGenWarnRow" class="hint hidden" style="color:var(--warn,#d08700)">Локальная генерация (ИИ) не настроена — нужны бинарь sd-cli и модель .gguf. Пока картинки заменит эмодзи-фолбэк.</div>
       <div id="enrichModalLlm" class="hint muted hidden">ИИ выключен (Ollama не найдена) — анализ недоступен. Включите Ollama (модель qwen3:8b).</div>
       <div class="ractions">
         <button class="btn" id="btnEnrichCancel">Отмена</button>

@@ -11,9 +11,9 @@ import math
 import pytest
 
 from vpipe import enrich
-from vpipe.enrich import (EnrichItem, EnrichPlan, ImagePayload,
-                          compute_cutlist_rev, item_from_dict, load_enrich,
-                          save_enrich)
+from vpipe.enrich import (EnrichItem, EnrichPlan, ImagePayload, ListCardPayload,
+                          RenderEnrich, ZoomWindow, compute_cutlist_rev,
+                          item_from_dict, load_enrich, save_enrich)
 from vpipe.models import (ACTION_CENSOR, ACTION_REMOVE, CutList, CutSegment,
                           TYPE_PAUSE)
 
@@ -256,7 +256,7 @@ def test_payload_whitelists():
     assert p.width_frac == pytest.approx(enrich.ANIM_WIDTH_MIN)
     d = raw_card()
     d["payload"]["mode"] = "fullscreen"
-    assert item_from_dict(d).payload.mode == "scrim"
+    assert item_from_dict(d).payload.mode == "panel"   # V11: дефолт A «панель»
     d = raw_cta("cta_subscribe")
     d["payload"].update({"variant": "youtube_logo", "position": "top_right"})
     p = item_from_dict(d).payload
@@ -359,3 +359,106 @@ def test_cutlist_rev_stable_and_canonical():
 def test_cutlist_rev_rounding():
     assert compute_cutlist_rev([(10.0001, 12.0004)]) == \
         compute_cutlist_rev([(10.0, 12.0)])
+
+
+# --- V11 §6: аддитивные поля схемы (обратная совместимость с P1-P5) ---------------
+def test_image_gen_fields_roundtrip():
+    """ImagePayload: asset_kind=generate + gen_seed/gen_prompt_en (round-trip)."""
+    d = raw_image()
+    d["payload"].update({"asset_kind": "generate", "gen_seed": 12345,
+                         "gen_prompt_en": "a clean photo of a server room"})
+    p = item_from_dict(d).payload
+    assert p.asset_kind == "generate"
+    assert p.gen_seed == 12345
+    assert p.gen_prompt_en == "a clean photo of a server room"
+    # to_dict экспонирует новые поля -> re-sanitize идемпотентен
+    back = ImagePayload.sanitize(p.to_dict())
+    assert back == p
+    assert "gen_seed" in p.to_dict() and "gen_prompt_en" in p.to_dict()
+
+
+def test_image_gen_defaults_and_back_compat():
+    """Старый payload без новых полей санитайзится в дефолты = старое поведение."""
+    p = ImagePayload.sanitize({})
+    assert p.gen_seed == -1                     # дефолт = хэш query_en на рендере
+    assert p.gen_prompt_en == ""
+    assert p.asset_kind == "none"               # без generate в enum-фолбэке
+    # raw_image() (как пишет детектор P1-P5) не знает новых полей — не падает
+    old = item_from_dict(raw_image()).payload
+    assert old.gen_seed == -1 and old.gen_prompt_en == ""
+    assert old.asset_kind == "user"             # старое значение цело
+
+
+def test_image_gen_seed_guards():
+    """gen_seed: bool/мусор -> -1; нижняя граница -1 (отрицательные сиды = авто)."""
+    d = raw_image()
+    d["payload"]["gen_seed"] = True             # bool — не число
+    assert item_from_dict(d).payload.gen_seed == -1
+    d["payload"]["gen_seed"] = "мусор"
+    assert item_from_dict(d).payload.gen_seed == -1
+    d["payload"]["gen_seed"] = -99              # клампится к -1
+    assert item_from_dict(d).payload.gen_seed == -1
+    d["payload"]["gen_seed"] = 7
+    assert item_from_dict(d).payload.gen_seed == 7
+
+
+def test_card_mode_default_panel():
+    """V11 §3: дефолт карточки -> panel; scrim остаётся валидным."""
+    assert ListCardPayload().mode == "panel"
+    assert ListCardPayload.sanitize({}).mode == "panel"
+    assert ListCardPayload.sanitize({"mode": "scrim"}).mode == "scrim"
+    assert ListCardPayload.sanitize({"mode": "panel"}).mode == "panel"
+    assert ListCardPayload.sanitize({"mode": "fullscreen"}).mode == "panel"
+    # старый план с явным scrim читается без изменений (back-compat)
+    d = raw_card()                              # payload mode=scrim
+    assert item_from_dict(d).payload.mode == "scrim"
+
+
+def test_image_source_generate_accepted():
+    """V11 §4: image_source += generate; auto/emoji/user_folder без изменений."""
+    assert enrich.sanitize_params(
+        {"image_source": "generate"})["image_source"] == "generate"
+    for src in ("auto", "emoji", "user_folder"):
+        assert enrich.sanitize_params(
+            {"image_source": src})["image_source"] == src
+    # незнакомый источник -> auto (семантика auto не сломана)
+    assert enrich.sanitize_params(
+        {"image_source": "google"})["image_source"] == "auto"
+    assert enrich.default_params()["image_source"] == "auto"
+
+
+def test_zoom_window_dataclass_defaults():
+    """V11 §3/§4a: ZoomWindow — чистый датакласс с дефолтами для трека динамики."""
+    z = ZoomWindow(t0=10.0, t1=12.5)
+    assert (z.t0, z.t1) == (10.0, 12.5)
+    assert z.z_max == 1.08 and z.cx == 0.5 and z.cy == 0.5
+    z2 = ZoomWindow(t0=1.0, t1=2.0, z_max=1.05, cx=0.4, cy=0.6)
+    assert z2.z_max == 1.05 and z2.cx == 0.4 and z2.cy == 0.6
+
+
+def test_render_enrich_new_fields_default_empty():
+    """V11 §3: punches/card_windows — пустые по умолчанию = старое поведение."""
+    re = RenderEnrich()
+    assert re.punches == [] and re.card_windows == []
+    # заполняет трек динамики/карточек (фаза ПОСЛЕ схемы) — контракт держим
+    re.punches.append(ZoomWindow(t0=5.0, t1=7.0))
+    re.card_windows.append((20.0, 24.0))
+    assert isinstance(re.punches[0], ZoomWindow)
+    assert re.card_windows[0] == (20.0, 24.0)
+    # старые поля не сломаны
+    assert re.stills == [] and re.anims == [] and re.cards == []
+    assert re.cta_texts == [] and re.cards_ass is None
+
+
+def test_plan_roundtrip_preserves_gen_fields():
+    """Полный план с generate-картинкой переживает save/load round-trip."""
+    d = full_plan_dict()
+    d["items"][0]["payload"].update(
+        {"asset_kind": "generate", "gen_seed": 99,
+         "gen_prompt_en": "abstract conceptual illustration, no text"})
+    plan = EnrichPlan.from_dict(d)
+    again = EnrichPlan.from_dict(plan.to_dict()).to_dict()
+    assert again == plan.to_dict()              # идемпотентность с новыми полями
+    img = again["items"][0]["payload"]
+    assert img["asset_kind"] == "generate" and img["gen_seed"] == 99
+    assert img["gen_prompt_en"].startswith("abstract")

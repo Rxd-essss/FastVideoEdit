@@ -260,8 +260,79 @@ def _ass_text_escape(text: str) -> str:
     return text
 
 
+# --- Feature B (V11 §4b): kinetic keyword pop inside karaoke -------------------
+# Stop-list of NON-content words that must never "pop": the line-tail function
+# words (prepositions/conjunctions/particles — exactly the §4b «не-ключевые»
+# set) plus a few common pronouns/forms that carry no emphasis. Anything NOT in
+# here AND long enough is a content-word candidate (noun/verb «носитель смысла»).
+_KINETIC_STOP = _BAD_LINE_TAIL | {
+    "это", "этот", "эта", "эти", "вот", "так", "там", "тут", "уже", "ещё",
+    "его", "её", "их", "мы", "вы", "он", "она", "они", "я", "ты", "оно",
+    "был", "была", "было", "были", "есть", "над", "без", "про", "там",
+    "тоже", "только", "очень", "когда", "если", "чтобы", "потому",
+}
+KINETIC_MIN_LEN = 4           # слово короче 4 букв не «носитель смысла» -> не поп
+KINETIC_MAX_PER_CUE = 2       # 1–2 слова на реплику (§4b), НЕ каждую реплику
+KINETIC_SCALE = 120           # вспухание до 120% (≤1.2×, §4b анти-кринж)
+KINETIC_POP_IN_MS = 120       # рост за 120 мс (R3)
+KINETIC_POP_HOLD_MS = 260     # держит 260 мс
+KINETIC_POP_OUT_MS = 160      # возврат за 160 мс
+_KINETIC_DEFAULT_ACCENT = "&H000B9EF5"   # #f59e0b BGR — акцент проекта (не кислота)
+
+
+def _is_content_word(disp: str) -> bool:
+    r"""Слово — «носитель смысла» (кандидат на кинетический поп, §4b)?
+
+    Чистим пунктуацию/кавычки, нижний регистр; отсекаем стоп-лист (предлоги/
+    союзы/частицы/местоимения) и короткие слова. Длинное содержательное слово
+    (существительное/глагол), число с цифрами — годится.
+    """
+    core = disp.strip(".,!?…:;\"'»«()-—").lower()
+    if not core:
+        return False
+    if any(ch.isdigit() for ch in core):     # числа/названия — всегда содержательны
+        return True
+    return len(core) >= KINETIC_MIN_LEN and core not in _KINETIC_STOP
+
+
+def _kinetic_keywords(disp_words: list[str], *,
+                      max_n: int = KINETIC_MAX_PER_CUE) -> set[int]:
+    r"""Индексы 1–2 ключевых слов реплики для кинетического попа (§4b).
+
+    Эвристика «носитель смысла, не стоп-лист»: из content-слов берём самые
+    длинные (длина ≈ значимость), не больше ``max_n``. НЕ каждую реплику — если
+    content-слов нет, set пуст (поп не ставится). Стабильно: при равной длине
+    выигрывает более ранний индекс."""
+    cands = [(len(disp_words[i]), -i, i)
+             for i in range(len(disp_words))
+             if _is_content_word(disp_words[i])]
+    if not cands:
+        return set()
+    cands.sort(reverse=True)
+    return {i for _l, _ni, i in cands[:max(0, max_n)]}
+
+
+def _kinetic_pop_tag(start_ms: int, accent: str) -> str:
+    r"""``\t``-поп ключевого слова: вспухание ``KINETIC_SCALE``% + акцент за
+    ``POP_IN``, держит ``POP_HOLD``, возврат к 100% за ``POP_OUT`` (§4b, R3).
+
+    Времена line-relative (libass ``\t`` от начала события): ``start_ms`` =
+    смещение до произнесения слова (=Σ предыдущих ``\k`` ×10). Караоке-``\k``
+    остального текста не трогаем — поп лишь добавляет ``\t`` в тот же блок.
+    """
+    t0 = max(0, int(start_ms))
+    t1 = t0 + KINETIC_POP_IN_MS
+    t2 = t1 + KINETIC_POP_HOLD_MS
+    t3 = t2 + KINETIC_POP_OUT_MS
+    return (f"\\t({t0},{t1},\\fscx{KINETIC_SCALE}\\fscy{KINETIC_SCALE}"
+            f"\\1c{accent}\\3c{accent})"
+            f"\\t({t2},{t3},\\fscx100\\fscy100)")
+
+
 def _karaoke_text(cue: Cue, words: list[Word], matcher: ProfanityMatcher,
-                  mask: MaskingCfg, eps: float = 0.02) -> str:
+                  mask: MaskingCfg, eps: float = 0.02, *,
+                  kinetic: bool = True,
+                  accent: str = _KINETIC_DEFAULT_ACCENT) -> str:
     r"""Render one cue's text as a karaoke line: ``{\kNN}word`` per word.
 
     ``NN`` is the word's duration in centiseconds (ASS ``\k`` unit). Words are
@@ -273,6 +344,14 @@ def _karaoke_text(cue: Cue, words: list[Word], matcher: ProfanityMatcher,
     Line breaks in ``cue.text`` are preserved: we keep the wrapped plain text as
     the layout reference and only attach ``\k`` tags to whitespace-separated
     tokens, mapping them positionally onto the in-cue words.
+
+    V11 §4b — kinetic keyword pop: when ``kinetic`` is on, 1–2 content words of
+    the cue additionally get a ``\t`` transform that swells them to
+    ``KINETIC_SCALE``% + accent colour exactly when spoken, then returns to
+    100%. The pop only ADDS a ``\t`` inside the word's own ``{...}`` block — the
+    per-word ``\kNN`` karaoke fill (count and centisecond sum) is untouched
+    (proven byte-compatible with the existing karaoke contract). Profane
+    (masked) words never pop (no extra attention on a bleeped word).
     """
     in_cue = [w for w in words
               if w.start >= cue.start - eps and w.end <= cue.end + eps]
@@ -300,10 +379,24 @@ def _karaoke_text(cue: Cue, words: list[Word], matcher: ProfanityMatcher,
     drift = total_cs - sum(spans)
     spans[-1] = max(1, spans[-1] + drift)
 
+    disps = [_display(w, matcher, mask) for w in in_cue]
+    # Kinetic keywords: only NON-profane content words are eligible to pop.
+    key_idx: set[int] = set()
+    if kinetic:
+        eligible = [d if not matcher.is_profane(w.word.strip()) else ""
+                    for w, d in zip(in_cue, disps)]
+        key_idx = _kinetic_keywords(eligible)
+
     out_parts: list[str] = []
-    for w, cs in zip(in_cue, spans):
-        disp = _ass_text_escape(_display(w, matcher, mask))
-        out_parts.append(f"{{\\k{cs}}}{disp}")
+    elapsed_cs = 0                          # Σ предыдущих \k -> офсет слова в мс
+    for i, (disp, cs) in enumerate(zip(disps, spans)):
+        esc = _ass_text_escape(disp)
+        if i in key_idx:
+            pop = _kinetic_pop_tag(elapsed_cs * 10, accent)
+            out_parts.append(f"{{\\k{cs}{pop}}}{esc}")
+        else:
+            out_parts.append(f"{{\\k{cs}}}{esc}")
+        elapsed_cs += cs
     return " ".join(out_parts)
 
 
@@ -366,7 +459,11 @@ def write_ass(cues: list[Cue], path: str | Path, style: "AssStyleCfg", *,
     lines = list(header)
     for c in cues:
         if use_kara:
-            text = _karaoke_text(c, words or [], kmatcher, kmask)
+            # V11 §4b: kinetic keyword pop uses the project accent (distinct from
+            # the karaoke fill so the swelling word reads as an emphasis, not
+            # just the sung colour). Karaoke \k fill stays untouched.
+            text = _karaoke_text(c, words or [], kmatcher, kmask,
+                                 accent=_KINETIC_DEFAULT_ACCENT)
         else:
             text = _ass_text_escape(c.text)
         lines.append(

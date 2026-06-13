@@ -77,6 +77,38 @@ class OllamaClient:
         names = [m.get("name", "") for m in tags.get("models", [])]
         return [n for n in names if n]
 
+    def unload(self, model: Optional[str] = None) -> bool:
+        """Принудительно выгрузить модель из VRAM (POST /api/generate с
+        ``keep_alive=0`` и пустым промптом — официальный приём Ollama).
+
+        VRAM-менеджер ТРЕК-2 (§2): детекторы качают qwen3 в VRAM; перед SD-этапом
+        её надо освободить (8 ГБ карта не вместит и LLM, и SDXL). Зовётся в
+        задаче обогащения ПОСЛЕ детекторов, ПЕРЕД генерацией картинок; вызывающий
+        затем ждёт пустого ``GET /api/ps``. НИКОГДА не бросает — недоступная
+        Ollama / таймаут просто вернут False (генерация всё равно попробует
+        стартовать; --max-vram у sd-cli подстрахует). Возврат — True при успешном
+        ответе сервера."""
+        payload = {"model": model or self.cfg.model, "keep_alive": 0,
+                   "prompt": "", "stream": False}
+        try:
+            self._post("/api/generate", payload)
+            return True
+        except Exception:  # noqa: BLE001 — Ollama off / таймаут: выгрузка best-effort
+            return False
+
+    def loaded_models(self) -> list[str]:
+        """Имена моделей, СЕЙЧАС держащих VRAM (``GET /api/ps`` -> models[].name).
+
+        VRAM-менеджер (§2) опрашивает этот список после ``unload`` — пустой =
+        путь к SD свободен. Сеть/Ollama off -> ``[]`` (как «ничего не загружено»),
+        никогда не бросает."""
+        try:
+            data = self._get("/api/ps")
+        except Exception:  # noqa: BLE001 — Ollama off / unreachable
+            return []
+        return [m.get("name", "") for m in data.get("models", [])
+                if m.get("name")]
+
     def _build_payload(self, system: str, user: str, schema: dict,
                        temperature: float, keep_alive=None) -> dict:
         # qwen3 (and other reasoning models) otherwise emit a <think>...</think>

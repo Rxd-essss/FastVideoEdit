@@ -270,6 +270,32 @@ class EnrichRenderCfg(_Base):
     min_score: int = 0                # 0..100; 0 = без отсечки по score
 
 
+class ImageGenCfg(_Base):
+    """Локальная SD-генерация контекстных картинок для авто-обогащения
+    (PLAN_V11 §2, render.enrich.imagegen).
+
+    Бэкенд — внешний бинарь stable-diffusion.cpp CUDA (паттерн
+    ``denoise.deepfilter_bin``: ``sd-cli.exe`` + DLL рядом), модель SDXL-Turbo
+    Q4_0 GGUF (~3.94 ГБ) скачивает ПОЛЬЗОВАТЕЛЬ — в репо не кладём. Полностью
+    оффлайн (zero-upload), torch НЕ нужен.
+
+    Дефолт ``imagegen_enabled=False`` — честный opt-in (тяжёлая модель). Если
+    выключено / бинарь / модель не найдены → graceful degrade на эмодзи-фолбэк,
+    задача НЕ падает (как ``engine="deepfilter"`` при отсутствии бинаря).
+
+    ``imagegen_model`` — путь к .gguf, ОБЯЗАТЕЛЕН для работы (пусто = SD не
+    настроен). ``imagegen_size`` — сторона кадра (768 — дефолт, VRAM-пик ~5.3 ГБ
+    < 8 ГБ; 1024 только при выделенном GPU). ``imagegen_steps`` — шаги сэмплера
+    (4 для Turbo). ``imagegen_vae_on_cpu`` — аварийный путь при дефиците VRAM
+    (GPU-пик 2.7 ГБ, но ~10× медленнее) — НЕ дефолт."""
+    imagegen_enabled: bool = False
+    imagegen_bin: str = "tools/sd-cli.exe"   # abs / repo-root-rel / PATH
+    imagegen_model: str = ""                 # путь к .gguf (обязателен для работы)
+    imagegen_size: int = 768                 # сторона кадра, px
+    imagegen_steps: int = 4                  # шаги сэмплера (Turbo = 4)
+    imagegen_vae_on_cpu: bool = False        # аварийный VRAM-путь (медленно)
+
+
 class RenderCfg(_Base):
     encoder: str = "nvenc"
     nvenc: NvencCfg = Field(default_factory=NvencCfg)
@@ -280,6 +306,7 @@ class RenderCfg(_Base):
     denoise: DenoiseCfg = Field(default_factory=DenoiseCfg)
     music: MusicCfg = Field(default_factory=MusicCfg)
     enrich: EnrichRenderCfg = Field(default_factory=EnrichRenderCfg)
+    imagegen: ImageGenCfg = Field(default_factory=ImageGenCfg)
     # Smoothing at every cut seam. Without it the kept audio segments are
     # hard-concatenated and each join is a waveform discontinuity → an audible
     # click and an overall "choppy" feel. A short equal-length fade-out/fade-in
