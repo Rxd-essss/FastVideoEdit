@@ -147,7 +147,11 @@ def generate_image(query_en: str, style_suffix: str, seed: int, W: int, H: int,
     real_seed = _seed_for(query_en, seed)
     prompt = query_en + suffix
 
-    cache = Path(cache_dir) if cache_dir is not None else CACHE_DIR
+    # АБСОЛЮТНЫЙ путь обязателен: enrich.ImagePayload._abs_path (P2 path-traversal
+    # guard) обнуляет любой ОТНОСИТЕЛЬНЫЙ asset_path при перезагрузке/санитайзе
+    # плана — иначе сгенерированная картинка «отвязывается» от карточки (asset_kind
+    # =user, но asset_path пустой → blank-превью, рендер дропает). resolve() здесь.
+    cache = (Path(cache_dir) if cache_dir is not None else CACHE_DIR).resolve()
     key = _cache_key(query_en, suffix, NEGATIVE_PROMPT, real_seed, W, H,
                      steps, _model_hash(model))
     out_png = cache / f"{key}.png"

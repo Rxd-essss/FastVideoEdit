@@ -291,13 +291,16 @@ def test_emoji_map_loader_unwraps_envelope_synthetic(tmp_path):
     assert enrich_llm._load_emoji_map(flat) == {"гром": "u26a1"}
 
 
-def test_emoji_for_concept_exact_before_partial():
-    # точное совпадение СЛОВА приоритетнее частичной подстроки: «облако» —
-    # отдельное слово -> u2601, хотя «лак» тоже подстрока «облако».
-    m = {"облако": "u2601", "лак": "uLAK", "сервер": "u1f5a5"}
+def test_emoji_for_concept_whole_word_only():
+    # ТОЛЬКО точное совпадение по ЦЕЛОМУ слову; подстрочный матч убран —
+    # на русской морфологии он давал абсурд (регрессия ниже).
+    m = {"облако": "u2601", "лак": "uLAK", "сервер": "u1f5a5", "ключ": "u1f511"}
     assert enrich_llm._emoji_for_concept("облако маркетинга", m) == "u2601"
-    # частичное: нет точного слова, ключ-подстрока (длинный ключ — точнее)
-    assert enrich_llm._emoji_for_concept("серверная стойка", m) == "u1f5a5"
+    assert enrich_llm._emoji_for_concept("лак для ногтей", m) == "uLAK"
+    # подстрока больше НЕ матчится: «серверная» не равно слову «сервер».
+    assert enrich_llm._emoji_for_concept("серверная стойка", m) == ""
+    # РЕГРЕССИЯ (баг ключа 🔑): «ключ» — подстрока «отКЛЮЧение», но не слово.
+    assert enrich_llm._emoji_for_concept("отключение моделей fable 5", m) == ""
     assert enrich_llm._emoji_for_concept("ничего похожего", m) == ""
 
 

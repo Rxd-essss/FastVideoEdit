@@ -999,13 +999,13 @@ def _emoji_for_concept(concept: str, emoji_map: dict) -> str:
         return ""
     c = concept.lower()
     words = set(re.findall(r"\w+", c, re.UNICODE))
-    # 1) точное: ключ целиком — одно из слов concept.
+    # ТОЛЬКО точное совпадение по ЦЕЛОМУ слову. Подстрочный матч убран намеренно:
+    # на русской морфологии он даёт абсурд («ключ» ⊂ «отКЛЮЧение» → 🔑 для
+    # «отключения моделей»). Нет точного слова — "" (точка уйдёт в SD или none,
+    # лучше без картинки, чем нелепый эмодзи).
     for kw, name in emoji_map.items():
         if kw in words:
             return name
-    # 2) частичное: ключ — подстрока concept (длинные ключи раньше — точнее).
-    for kw in sorted((k for k in emoji_map if k in c), key=len, reverse=True):
-        return emoji_map[kw]
     return ""
 
 
