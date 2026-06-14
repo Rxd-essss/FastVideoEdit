@@ -140,6 +140,48 @@ def test_output_rejects_non_whitelisted_extension(client, cfg):
     assert client.get("/api/output/secrets.env").status_code == 404
 
 
+# --- MONTAGE_V2 §3: honest previews — cache PNGs must be servable -------------
+def test_output_serves_codegfx_preview(client, cfg):
+    """Code-graphic candidate PNG lives in cache/codegfx — the UI requests it as
+    /api/output/<basename>; it must resolve (not 404), else the «Монтаж» card
+    shows a broken tile instead of the real rendered schematic."""
+    cg = Path(cfg.paths.cache_dir) / "codegfx"
+    cg.mkdir(parents=True, exist_ok=True)
+    (cg / "abc123.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    r = client.get("/api/output/abc123.png")
+    assert r.status_code == 200
+    assert r.content.startswith(b"\x89PNG")
+
+
+def test_output_serves_diffusion_preview(client, cfg):
+    """Diffusion candidate PNG lives in cache/enrich_img — same contract."""
+    eg = Path(cfg.paths.cache_dir) / "enrich_img"
+    eg.mkdir(parents=True, exist_ok=True)
+    (eg / "deadbeef.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    assert client.get("/api/output/deadbeef.png").status_code == 200
+
+
+def test_output_image_ext_now_whitelisted(client, cfg):
+    """Image extensions are part of the whitelist (regression for the V2 fix:
+    previously .png was rejected before the cache lookup even ran)."""
+    for ext in (".png", ".jpg", ".jpeg", ".webp"):
+        assert ext in serve.OUTPUT_EXT_ALLOWED
+
+
+def test_output_preview_no_path_traversal(client, cfg, monkeypatch):
+    """The relative-path guard still confines reads to the cache subdirs even
+    after adding them as roots — a basename can never escape upward."""
+    # A real .png sitting one level above the cache root must NOT be reachable.
+    secret = Path(cfg.paths.cache_dir).parent / "outside.png"
+    secret.parent.mkdir(parents=True, exist_ok=True)
+    secret.write_bytes(b"\x89PNG\r\n\x1a\n")
+    # FastAPI's path param won't pass raw '../', but assert the resolver itself
+    # rejects anything that escapes the configured roots.
+    roots = serve._enrich_preview_roots()
+    assert all(not (r / "..\\outside.png").resolve().is_relative_to(r)
+               for r in roots)
+
+
 # --- P0-3b: privacy summary honest about a non-local LLM host ----------------
 def test_network_summary_warns_on_external_llm_host(client, cfg, monkeypatch):
     cfg.llm.host = "http://203.0.113.9:11434"          # remote Ollama

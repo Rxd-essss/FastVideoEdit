@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<style>
+/* ============================================================================
+   FastVideoEdit — CODE-GRAPHICS engine (single data-driven template).
+   One file renders EVERY intent type from window.PAYLOAD (injected by render.py).
+   4 themes via [data-theme] on <html>. Colors only via CSS vars => restyle = 1 attr.
+   Target canvas 1920x1080 (16:9). Background transparent by default
+   (PNG alpha cut-out over the talking-head video; card biased to the right).
+   Ported from the proven prototype D:/tmp/montage2/code/engine.html — extended
+   with the `map` intent and a CSS auto-shrink hook so all 10 taxonomy intents
+   render. Data is injected ALREADY ESCAPED/validated by render.py; this file
+   additionally escapes every text node via esc()/textContent (defence in depth
+   for user/LLM text — XSS-safe).
+   ========================================================================== */
+:root{
+  /* ----- THEME: minimal (project default, dark premium) -------------------- */
+  --bg:        transparent;          /* page bg (alpha cut-out over video)     */
+  --panel:     #11161f;              /* card body                              */
+  --panel2:    #0c1118;              /* nested / sunken                        */
+  --stroke:    #232b38;              /* hairline borders                       */
+  --accent:    #f59e0b;             /* brand amber                            */
+  --accent-d:  #b8740a;
+  --ink:       #f4f6fb;              /* primary text                           */
+  --ink-2:     #aeb6c4;             /* secondary                              */
+  --ink-3:     #6c7686;             /* tertiary / labels                      */
+  --good:      #34d399;
+  --bad:       #f87171;
+  --font:      'Inter','Segoe UI',system-ui,sans-serif;
+  --mono:      'JetBrains Mono','Cascadia Code','Consolas',monospace;
+  --radius:    28px;
+  --shadow:    0 30px 80px rgba(0,0,0,.55), 0 4px 14px rgba(0,0,0,.4);
+  --panel-grad: linear-gradient(160deg,#141a24 0%,#0d121b 100%);
+  --pill-ink:  #0b0f17;             /* text on accent                         */
+}
+html[data-theme="neon"]{
+  --panel:#0d0b1a; --panel2:#08060f; --stroke:#2a2150;
+  --accent:#22d3ee; --accent-d:#0e7490; --ink:#f0f4ff; --ink-2:#a6b0d8; --ink-3:#6b6f9e;
+  --good:#4ade80; --bad:#fb7185; --pill-ink:#04121a;
+  --panel-grad:linear-gradient(160deg,#15102e 0%,#0a0717 100%);
+  --shadow:0 0 0 1px rgba(34,211,238,.10),0 30px 80px rgba(8,4,20,.7),0 0 60px rgba(34,211,238,.12);
+}
+html[data-theme="business"]{
+  --bg:transparent; --panel:#ffffff; --panel2:#f1f4f9; --stroke:#dce2ec;
+  --accent:#2563eb; --accent-d:#1d4ed8; --ink:#0f1b2d; --ink-2:#475569; --ink-3:#94a3b8;
+  --good:#16a34a; --bad:#dc2626; --pill-ink:#ffffff;
+  --panel-grad:linear-gradient(160deg,#ffffff 0%,#f4f7fb 100%);
+  --shadow:0 24px 60px rgba(30,50,90,.18),0 2px 8px rgba(30,50,90,.10);
+}
+html[data-theme="whiteboard"]{
+  --panel:#fbf7ec; --panel2:#f3ecd8; --stroke:#d9cba6; --accent:#e0612d; --accent-d:#b8430f;
+  --ink:#2a2620; --ink-2:#5e564a; --ink-3:#9a8f7a; --good:#3f8f4f; --bad:#c0392b; --pill-ink:#fbf7ec;
+  --font:'Comic Sans MS','Segoe Print','Bradley Hand',cursive;
+  --panel-grad:#fbf7ec;
+  --shadow:0 10px 0 rgba(0,0,0,.07);
+  --radius:18px;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{background:var(--bg)}
+body{font-family:var(--font);color:var(--ink);-webkit-font-smoothing:antialiased;
+  text-rendering:optimizeLegibility;font-feature-settings:"tnum" 1,"ss01" 1}
+#stage{width:1920px;height:1080px;position:relative;overflow:hidden}
+/* card lives right ~52% of frame (talking head on the left) by default;
+   .full uses the whole frame (process/timeline). renderer sets stage class.   */
+.card{position:absolute;background:var(--panel-grad);border:1px solid var(--stroke);
+  border-radius:var(--radius);box-shadow:var(--shadow);overflow:hidden}
+.card::before{content:'';position:absolute;inset:0 auto auto 0;width:6px;height:100%;
+  background:linear-gradient(var(--accent),var(--accent-d))}
+.pad{padding:64px 72px}
+.eyebrow{font-size:24px;letter-spacing:.18em;text-transform:uppercase;color:var(--accent);
+  font-weight:700;margin-bottom:10px;display:flex;gap:14px;align-items:center}
+.eyebrow .ico{width:30px;height:30px;flex:0 0 auto}
+.title{font-size:54px;font-weight:700;line-height:1.08;letter-spacing:-.01em;margin-bottom:8px}
+.sub{font-size:28px;color:var(--ink-2);line-height:1.35;margin-top:14px}
+.src{font-size:20px;color:var(--ink-3);margin-top:auto;padding-top:26px;display:flex;
+  gap:10px;align-items:center}
+.src b{color:var(--accent);font-weight:700}
+
+/* auto-shrink: render.py adds [data-shrink="1|2|3"] on #stage when content
+   overflows the card (measured via scrollHeight). Steps down the base size. */
+#stage[data-shrink="1"] .pad{font-size:92%}
+#stage[data-shrink="2"] .pad{font-size:82%}
+#stage[data-shrink="3"] .pad{font-size:72%}
+#stage[data-shrink] .title{font-size:48px}
+
+/* ---------- STAT ---------- */
+.stats{display:flex;gap:56px;margin-top:34px;flex-wrap:wrap}
+.stat{display:flex;flex-direction:column}
+.stat .num{font-size:118px;font-weight:800;line-height:.92;letter-spacing:-.03em;
+  background:linear-gradient(180deg,var(--accent),var(--accent-d));
+  -webkit-background-clip:text;background-clip:text;color:transparent}
+.stat .unit{font-size:46px;font-weight:700;color:var(--ink);margin-left:6px}
+.stat .lab{font-size:26px;color:var(--ink-2);margin-top:10px}
+.bar{height:14px;border-radius:8px;background:var(--panel2);margin-top:30px;overflow:hidden}
+.bar>i{display:block;height:100%;background:linear-gradient(90deg,var(--accent),var(--accent-d));border-radius:8px}
+
+/* ---------- LIST / CALLOUT ---------- */
+.list{margin-top:28px;display:flex;flex-direction:column;gap:20px}
+.li{display:flex;gap:22px;align-items:flex-start;font-size:34px;line-height:1.25}
+.li .pill{flex:0 0 auto;width:46px;height:46px;border-radius:12px;
+  background:var(--accent);color:var(--pill-ink);font-weight:800;font-size:26px;
+  display:flex;align-items:center;justify-content:center}
+.li .tick{flex:0 0 auto;width:40px;height:40px;color:var(--accent);font-size:38px;line-height:1}
+.li .txt{padding-top:4px}
+.li .txt small{display:block;font-size:24px;color:var(--ink-3);margin-top:4px;font-weight:400}
+.callout{margin-top:24px;background:var(--panel2);border:1px solid var(--stroke);
+  border-left:6px solid var(--accent);border-radius:18px;padding:36px 40px}
+.callout .term{font-size:46px;font-weight:800;color:var(--accent)}
+.callout .def{font-size:30px;color:var(--ink-2);margin-top:12px;line-height:1.4}
+
+/* ---------- TREE ---------- */
+.tree{margin-top:28px;font-family:var(--mono);font-size:30px}
+.node{background:var(--panel2);border:1px solid var(--stroke);border-radius:14px;
+  padding:16px 24px;display:inline-flex;align-items:center;gap:14px;color:var(--ink);font-weight:600}
+.node.root{background:linear-gradient(90deg,rgba(245,158,11,.16),transparent);
+  border-color:var(--accent);font-size:34px}
+.node .dot{width:12px;height:12px;border-radius:50%;background:var(--accent);flex:0 0 auto}
+.children{margin:18px 0 0 46px;display:flex;flex-direction:column;gap:16px;
+  border-left:2px solid var(--stroke);padding-left:34px;position:relative}
+.children>.row{position:relative}
+.children>.row::before{content:'';position:absolute;left:-34px;top:50%;width:26px;height:2px;background:var(--stroke)}
+.node .desc{font-family:var(--font);font-weight:400;font-size:24px;color:var(--ink-3);margin-left:8px}
+
+/* ---------- COMPARE ---------- */
+.cmp{margin-top:30px;border-radius:18px;overflow:hidden;border:1px solid var(--stroke)}
+.cmp .hrow{display:grid;background:var(--panel2)}
+.cmp .row{display:grid;border-top:1px solid var(--stroke)}
+.cmp .c{padding:24px 28px;font-size:30px;display:flex;align-items:center;min-height:88px}
+.cmp .c.feat{color:var(--ink-2);font-weight:600}
+.cmp .head{font-size:34px;font-weight:800;justify-content:center;gap:14px}
+.cmp .head.a{color:var(--accent)} .cmp .head.b{color:var(--ink)}
+.cmp .row .c+.c{border-left:1px solid var(--stroke)}
+.cmp .v{justify-content:center;font-weight:600}
+.cmp .v.win{color:var(--good)} .cmp .v.lose{color:var(--ink-3)}
+.cmp .row:nth-child(even){background:rgba(255,255,255,.015)}
+
+/* ---------- TIMELINE / PROCESS ---------- */
+.flow{display:flex;align-items:stretch;gap:0;margin-top:40px}
+.step{flex:1;background:var(--panel2);border:1px solid var(--stroke);border-radius:18px;
+  padding:34px 30px;position:relative;display:flex;flex-direction:column;gap:14px}
+.step .n{width:54px;height:54px;border-radius:50%;background:var(--accent);color:var(--pill-ink);
+  font-weight:800;font-size:28px;display:flex;align-items:center;justify-content:center}
+.step .st{font-size:32px;font-weight:700}
+.step .sd{font-size:24px;color:var(--ink-2);line-height:1.3}
+.arrow{flex:0 0 56px;display:flex;align-items:center;justify-content:center;color:var(--accent);font-size:44px}
+.tl{margin-top:46px;position:relative;padding-left:8px}
+.tl::before{content:'';position:absolute;left:30px;top:10px;bottom:10px;width:3px;background:var(--stroke)}
+.tev{display:flex;gap:34px;align-items:flex-start;padding:18px 0;position:relative}
+.tev .dot{width:60px;height:60px;flex:0 0 auto;border-radius:50%;background:var(--panel);
+  border:3px solid var(--accent);color:var(--accent);font-weight:800;font-size:24px;
+  display:flex;align-items:center;justify-content:center;z-index:1}
+.tev .body .when{font-size:28px;font-weight:800;color:var(--accent)}
+.tev .body .what{font-size:30px;color:var(--ink);margin-top:4px}
+
+/* ---------- QUOTE ---------- */
+.quote{font-size:56px;font-weight:700;line-height:1.25;letter-spacing:-.01em;margin-top:24px}
+.quote::before{content:'\201C';color:var(--accent);font-size:120px;line-height:0;
+  display:block;height:60px;font-family:Georgia,serif}
+.qby{font-size:28px;color:var(--ink-2);margin-top:30px}
+.qby b{color:var(--accent)}
+
+/* ---------- CODE / TERMINAL ---------- */
+.term{margin-top:30px;background:#06080d;border:1px solid var(--stroke);border-radius:16px;overflow:hidden}
+html[data-theme="business"] .term{background:#0f1b2d}
+.term .bar{display:flex;gap:10px;padding:18px 22px;background:rgba(255,255,255,.03);height:auto}
+.term .bar i{width:16px;height:16px;border-radius:50%;background:#3a4150}
+.term .bar i:nth-child(1){background:#ff5f57}.term .bar i:nth-child(2){background:#febc2e}.term .bar i:nth-child(3){background:#28c840}
+.term pre{font-family:var(--mono);font-size:30px;line-height:1.6;padding:30px 34px;color:#d7e0ee;white-space:pre-wrap}
+.term .pr{color:var(--good)} .term .cm{color:var(--ink-3)} .term .hl{color:var(--accent);font-weight:700}
+
+/* ---------- MAP (region + labelled points, text-only — no real geography) --- */
+.map{margin-top:30px;display:flex;flex-direction:column;gap:18px}
+.map .region{font-size:34px;font-weight:800;color:var(--accent);display:flex;
+  align-items:center;gap:14px}
+.map .region .pin{width:18px;height:18px;border-radius:50% 50% 50% 0;
+  transform:rotate(-45deg);background:var(--accent);flex:0 0 auto}
+.map .pts{display:flex;flex-direction:column;gap:14px;margin-top:6px}
+.map .pt{display:flex;gap:18px;align-items:flex-start;font-size:30px;line-height:1.25}
+.map .pt .mk{flex:0 0 auto;width:40px;height:40px;border-radius:50%;
+  background:var(--panel2);border:2px solid var(--accent);color:var(--accent);
+  font-weight:800;font-size:22px;display:flex;align-items:center;justify-content:center}
+.map .pt .lab small{display:block;font-size:23px;color:var(--ink-3);margin-top:3px}
+</style></head>
+<body>
+<div id="stage"></div>
+<script>
+/* ---- tiny DOM helper -------------------------------------------------------*/
+function h(tag,attrs,kids){var e=document.createElement(tag);attrs=attrs||{};
+  for(var k in attrs){if(k==='class')e.className=attrs[k];else if(k==='html')e.innerHTML=attrs[k];else e.setAttribute(k,attrs[k]);}
+  (kids||[]).forEach(function(c){if(c==null)return;e.appendChild(typeof c==='string'?document.createTextNode(c):c);});return e;}
+function esc(s){return (s==null?'':String(s)).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+
+/* ---- intent renderers (taxonomy: 10 intents) ------------------------------*/
+var R={};
+R.stat=function(p){
+  var stats=(p.stats||[]).map(function(s){
+    return h('div',{class:'stat'},[
+      h('div',{html:'<span class="num">'+esc(s.value)+'</span>'+(s.unit?'<span class="unit">'+esc(s.unit)+'</span>':'')}),
+      h('div',{class:'lab'},[s.label||''])]);});
+  var kids=[head(p),h('div',{class:'stats'},stats)];
+  if(p.bar!=null)kids.push(h('div',{class:'bar'},[h('i',{style:'width:'+Math.max(2,Math.min(100,p.bar))+'%'})]));
+  if(p.source)kids.push(src(p));
+  return kids;
+};
+R.list=function(p){
+  var rows=(p.items||[]).map(function(it,i){
+    var lead=p.ordered? h('div',{class:'pill'},[String(i+1)]) : h('div',{class:'tick'},['✓']);
+    var note=(it&&it.note)?h('small',{},[it.note]):null;
+    var txt=h('div',{class:'txt'},[ (it&&it.text!=null)?it.text:String(it), note ]);
+    return h('div',{class:'li'},[lead,txt]);});
+  return [head(p),h('div',{class:'list'},rows),p.source?src(p):null];
+};
+R.callout=function(p){
+  return [head(p),h('div',{class:'callout'},[h('div',{class:'term'},[p.term]),h('div',{class:'def'},[p.definition])]),p.source?src(p):null];
+};
+R.tree=function(p){
+  function node(n,root){
+    var r=h('div',{class:'node'+(root?' root':'')},[h('span',{class:'dot'}),
+      document.createTextNode(n.label==null?'':String(n.label)),n.desc?h('span',{class:'desc'},['— '+n.desc]):null]);
+    var wrap=h('div',{},[h('div',{},[r])]);
+    if(n.children&&n.children.length){
+      var ch=h('div',{class:'children'},n.children.map(function(c){return h('div',{class:'row'},[node(c,false)]);}));
+      wrap.appendChild(ch);}
+    return wrap;}
+  return [head(p),h('div',{class:'tree'},[node(p.root||{label:''},true)]),p.source?src(p):null];
+};
+R.compare=function(p){
+  var grid='grid-template-columns:1.3fr'+Array((p.columns||[]).length+1).join(' 1fr');
+  var hrow=h('div',{class:'hrow',style:grid},[h('div',{class:'c feat'},[''])].concat(
+    (p.columns||[]).map(function(c,i){return h('div',{class:'c head '+(i===0?'a':'b')},[c]);})));
+  var rows=(p.rows||[]).map(function(r){
+    var cells=[h('div',{class:'c feat'},[r.feature])];
+    (r.values||[]).forEach(function(v){
+      var cls='c v';if(v&&v.win)cls+=' win';if(v&&v.lose)cls+=' lose';
+      var txt=(v&&v.text!=null)?v.text:v;
+      cells.push(h('div',{class:cls},[String(txt==null?'':txt)]));});
+    return h('div',{class:'row',style:grid},cells);});
+  return [head(p),h('div',{class:'cmp'},[hrow].concat(rows)),p.source?src(p):null];
+};
+R.process=function(p){
+  var els=[];var steps=p.steps||[];steps.forEach(function(s,i){
+    els.push(h('div',{class:'step'},[h('div',{class:'n'},[String(i+1)]),
+      h('div',{class:'st'},[s.title]),s.desc?h('div',{class:'sd'},[s.desc]):null]));
+    if(i<steps.length-1)els.push(h('div',{class:'arrow'},['→']));});
+  return [head(p),h('div',{class:'flow'},els),p.source?src(p):null];
+};
+R.timeline=function(p){
+  var evs=(p.events||[]).map(function(e,i){
+    return h('div',{class:'tev'},[h('div',{class:'dot'},[e.mark||String(i+1)]),
+      h('div',{class:'body'},[h('div',{class:'when'},[e.when]),h('div',{class:'what'},[e.what])])]);});
+  return [head(p),h('div',{class:'tl'},evs),p.source?src(p):null];
+};
+R.quote=function(p){
+  return [h('div',{class:'quote'},[p.text]),h('div',{class:'qby',html:p.by?'— <b>'+esc(p.by)+'</b>':''}),p.source?src(p):null];
+};
+R.code=function(p){
+  return [head(p),h('div',{class:'term'},[
+    h('div',{class:'bar'},[h('i'),h('i'),h('i')]),
+    h('pre',{html:p.code_html||esc(p.code)})]),p.source?src(p):null];
+};
+R.map=function(p){
+  var pts=(p.points||[]).map(function(pt,i){
+    var note=(pt&&pt.note)?h('small',{},[pt.note]):null;
+    var lab=h('div',{class:'lab'},[ (pt&&pt.label!=null)?pt.label:String(pt), note ]);
+    return h('div',{class:'pt'},[h('div',{class:'mk'},[String(i+1)]),lab]);});
+  var region=p.region?h('div',{class:'region'},[h('span',{class:'pin'}),p.region]):null;
+  return [head(p),h('div',{class:'map'},[region,h('div',{class:'pts'},pts)]),p.source?src(p):null];
+};
+function head(p){
+  var eb=p.eyebrow?h('div',{class:'eyebrow'},[p.eyebrow]):null;
+  var t=p.title?h('div',{class:'title'},[p.title]):null;
+  var s=p.subtitle?h('div',{class:'sub'},[p.subtitle]):null;
+  return h('div',{},[eb,t,s].filter(Boolean));
+}
+function src(p){return h('div',{class:'src',html:'◉ '+esc(p.source)});}
+
+/* ---- mount ---------------------------------------------------------------- */
+(function(){
+  var p=window.PAYLOAD||{type:'stat',stats:[]};
+  document.documentElement.setAttribute('data-theme',p.theme||'minimal');
+  var stage=document.getElementById('stage');
+  // layout: most intents = right card; full-frame for process/timeline.
+  var full=p.layout==='full'||['process','timeline'].indexOf(p.type)>=0;
+  var card=h('div',{class:'card'});
+  if(full){card.style.cssText='left:120px;right:120px;top:90px;bottom:90px;';}
+  else    {card.style.cssText='right:96px;top:120px;width:920px;'+(p.tall?'bottom:120px;':'');}
+  var pad=h('div',{class:'pad'});pad.style.cssText='height:100%;display:flex;flex-direction:column';
+  var build=R[p.type]||R.stat;
+  (build(p)||[]).forEach(function(n){if(n)pad.appendChild(n);});
+  card.appendChild(pad);stage.appendChild(card);
+  // ---- auto-shrink: if the card content overflows its box, step font down.
+  // Only meaningful for the bounded (.tall / full) layouts; for the default
+  // unbounded right card the card grows with content so overflow is rare.
+  try{
+    for(var lvl=1;lvl<=3;lvl++){
+      if(pad.scrollHeight<=card.clientHeight+2)break;
+      stage.setAttribute('data-shrink',String(lvl));
+    }
+  }catch(e){}
+  document.title='ready';
+})();
+</script>
+</body></html>

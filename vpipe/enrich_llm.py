@@ -36,11 +36,13 @@ from typing import Callable, Optional
 
 from .clips import _norm_token, _valid_int
 from .cutlist import resolve
-from .enrich import (CARD_ITEM_TEXT_MAX, CARD_ITEMS_MAX, CARD_TITLE_MAX,
-                     CTA_QUESTION_MAX, EMOJI_SVG_DIR, ENR_ANIMATION,
-                     ENR_CTA_COMMENT, ENR_CTA_SUBSCRIBE, ENR_IMAGE,
-                     ENR_LIST_CARD, IMAGE_DUR_DEF, IMAGE_DUR_MAX,
-                     IMAGE_DUR_MIN, EnrichItem, _trim_text, item_from_dict)
+from .enrich import (CANDIDATES_MAX, CARD_ITEM_TEXT_MAX, CARD_ITEMS_MAX,
+                     CARD_TITLE_MAX, CTA_QUESTION_MAX, EMOJI_SVG_DIR,
+                     ENR_ANIMATION, ENR_CTA_COMMENT, ENR_CTA_SUBSCRIBE,
+                     ENR_IMAGE, ENR_LIST_CARD, IMAGE_DUR_DEF, IMAGE_DUR_MAX,
+                     IMAGE_DUR_MIN, SCHEMATIC_INTENTS, SCHEMATIC_STYLE_DEF,
+                     SCHEMATIC_STYLES, VISUAL_SOURCES, EnrichItem, _trim_text,
+                     item_from_dict, sanitize_candidate)
 from .llm import segment_windows
 from .models import CutList, Transcript, Word
 from .timeline import Timeline
@@ -252,39 +254,59 @@ _CTA_SCHEMA = {
     "required": ["ctas"],
 }
 
-# §3.3 — детектор иллюстраций (probe3_illustrations.py + анти-кринж строка
-# R5 §5 дословно из плана).
+# §3.3 — детектор-КЛАССИФИКАТОР иллюстраций (MONTAGE_V2 §1, codegfx a_code.md §2.1).
+# Диспетчер: на каждую сильную точку — ОДИН источник + intent (для schematic).
+# Узкий экстрактор по intent (заполнение fields с quote-снапом) — отдельный
+# вызов на стадии кандидатов (ниже). Анти-кринж строка R5 §5 — дословно.
 _ILL_SYSTEM = (
     "Ты — монтажёр обучающих видео. Тебе дают фрагмент расшифровки "
     "(человек говорит в камеру). Маркеры вида [N|м:сс] — номер СЛЕДУЮЩЕГО "
     "слова и время его произнесения; слова между маркерами нумеруются "
     "подряд.\n\n"
-    "Найди моменты, где на экран уместно вывести картинку-иллюстрацию:\n"
-    "- названа конкретная сущность: продукт, компания, технология, программа;\n"
-    "- объясняется концепция, которую проще показать схемой;\n"
-    "- звучит яркое число или статистика.\n\n"
+    "Найди моменты, где на экран уместно что-то вывести, и реши, ЧТО именно "
+    "монтажёр поставил бы в каждом — выбери ОДИН источник:\n"
+    "- schematic — КОД-СХЕМА с настоящим текстом из речи: данные, структура, "
+    "сравнение, числа/статистика, список/шаги, термин, код/команда. Это "
+    "главный источник объясняющего ролика (его НЕ нарисовать фото);\n"
+    "- photo — РЕАЛЬНАЯ физическая сцена/объект/место (дата-центр, макро "
+    "клавиатуры, человек за ноутбуком) — фотореалистичный кадр;\n"
+    "- icon — бренд/логотип/значок (только когда явно назван логотип);\n"
+    "- none — абстракция/лозунг без данных и без конкретного предмета "
+    "(«успех», «удобство») — иллюстрировать нечего.\n\n"
+    "Для schematic дополнительно выбери intent (тип схемы):\n"
+    "- stat — звучит число/статистика («11 тысяч разработчиков», «96% серверов»);\n"
+    "- compare — «A против B», таблица свойств («Linux vs Windows»);\n"
+    "- tree — иерархия/структура (реестр, дерево каталогов, оргструктура);\n"
+    "- list — перечисление подряд («во-первых… во-вторых», философия Unix);\n"
+    "- process — шаги-инструкция («открыть PowerShell → wsl --install → …»);\n"
+    "- timeline — даты/этапы во времени («в 1991 Торвальдс…»);\n"
+    "- callout — определение термина («Ядро (kernel) — это…»);\n"
+    "- code — терминал/конфиг/команда (`ls /etc`, `wsl --install`);\n"
+    "- quote — дословная цитата/тезис, который надо выделить.\n"
+    "Для photo/icon/none поле intent — пустая строка \"\".\n\n"
     "Для каждой точки верни:\n"
     "- word_start, word_end — номера первого и последнего слова отрезка, пока "
-    "картинка видна (отрезок 5-20 слов, начинается там, где сущность "
+    "визуал виден (отрезок 5-20 слов, начинается там, где сущность "
     "произносится);\n"
     "- concept — что показать, коротко по-русски;\n"
-    "- image_query_en — поисковый запрос для картинки, АНГЛИЙСКИЙ, 2-6 слов;\n"
-    "- style — одно из: photo (фото предмета/места), diagram (схема/график), "
-    "icon (логотип/значок).\n\n"
-    "ВАЖНО про плотность: НЕ ЧАЩЕ одной картинки на 60-90 секунд речи. "
+    "- source — schematic | photo | icon | none;\n"
+    "- intent — тип схемы из списка выше (или \"\" для не-schematic);\n"
+    "- image_query_en — для photo: АНГЛИЙСКИЙ запрос про КОНКРЕТНЫЙ объект "
+    "сцены, 2-6 слов; для остальных — пустая строка \"\".\n\n"
+    "ВАЖНО про плотность: НЕ ЧАЩЕ одного визуала на 60-90 секунд речи. "
     "Во фрагменте около 4 минут — значит, не больше 3-4 точек. Выбирай только "
     "самые сильные моменты, остальные пропусти. Если сильных нет — верни "
     "пустой список.\n\n"
-    "Запрос — про КОНКРЕТНЫЙ объект из речи («сервер Dell»), а не про "
-    "абстракцию («успех», «бизнес»). Нет конкретного объекта — пропусти "
-    "точку. Никаких людей, рукопожатий и офисов."
+    "Запрос photo — про КОНКРЕТНЫЙ объект из речи («сервер Dell»), а не про "
+    "абстракцию («успех», «бизнес»). Нет конкретного объекта — source=none. "
+    "Никаких людей, рукопожатий и офисов."
 )
 
 _ILL_USER_TMPL = (
     "Расшифровка с маркерами:\n{text}\n\n"
     "Верни JSON: {{\"points\": [{{\"word_start\": N, \"word_end\": N, "
-    "\"concept\": \"…\", \"image_query_en\": \"…\", \"style\": "
-    "\"photo|diagram|icon\"}}]}}"
+    "\"concept\": \"…\", \"source\": \"schematic|photo|icon|none\", "
+    "\"intent\": \"…\", \"image_query_en\": \"…\"}}]}}"
 )
 
 _ILL_SCHEMA = {
@@ -298,15 +320,230 @@ _ILL_SCHEMA = {
                     "word_start": {"type": "integer"},
                     "word_end": {"type": "integer"},
                     "concept": {"type": "string"},
+                    "source": {"type": "string"},
+                    "intent": {"type": "string"},
                     "image_query_en": {"type": "string"},
-                    "style": {"type": "string"},
                 },
                 "required": ["word_start", "word_end", "concept",
-                             "image_query_en", "style"],
+                             "source", "intent", "image_query_en"],
             },
         }
     },
     "required": ["points"],
+}
+
+
+# === РОУТЕР источника визуала (MONTAGE_V2 §1) ====================================
+# Взаимоисключающий: каждая точка получает РОВНО один источник. Решение модели
+# (source/intent) — основа; КОД страхует дешёвыми эвристиками поверх (политика
+# репо: модель ошибается типом — числа/структуру детектим регэкспом).
+#
+# Сигналы «это данные/схема, НЕ фото» (форс schematic, даже если модель сказала
+# photo): числа/%, слова структуры/сравнения/списка/шагов/термина/кода. Это
+# ровно те Prod9-концепты, что диффузия превращала в кракозябры (§0, c_diff §3).
+# \b перед цифрой: «96%»/«11 тысяч» считаем, «ток100»/«fable5» (буква+цифра) — нет.
+_NUM_RE = re.compile(r"\b\d")
+_PCT_RE = re.compile(r"%|процент", re.IGNORECASE)
+# keyword → intent, в которую форсим точку (первое совпадение по concept/quote).
+_INTENT_SIGNALS: tuple[tuple[re.Pattern, str], ...] = (
+    (re.compile(r"\bvs\b|против|сравн|или\b.*\bили\b", re.IGNORECASE), "compare"),
+    (re.compile(r"дерев|структур|иерарх|ветк|каталог|реестр|оргструктур",
+                re.IGNORECASE), "tree"),
+    (re.compile(r"шаг|инструкц|сначала|потом|установ|команд", re.IGNORECASE),
+     "process"),
+    (re.compile(r"философи|принцип|во-первых|перечисл|список", re.IGNORECASE),
+     "list"),
+    (re.compile(r"\b1991\b|истори|хронолог|\bэтап", re.IGNORECASE), "timeline"),
+    (re.compile(r"термин|определени|\bядро\b|\bkernel\b", re.IGNORECASE),
+     "callout"),
+    (re.compile(r"`|\bls\b|\.exe|/etc|конфиг|терминал|синтаксис", re.IGNORECASE),
+     "code"),
+    (re.compile(r"статистик|процент|%|тысяч|миллион", re.IGNORECASE), "stat"),
+)
+# Сигналы «явный бренд/значок» (узко — только когда назван логотип). НЕ как
+# фолбэк иллюстрации (§1: эмодзи под нож).
+_ICON_RE = re.compile(r"логотип|значок|иконк|\bbrand\b|бренд", re.IGNORECASE)
+
+
+# Детектор-словарь источника (что вернула модель в _ILL_SCHEMA.source). Внутренне
+# photo == diffusion-кандидат; роутер работает в этом словаре, _build_candidates
+# материализует (photo→diffusion). schematic/icon/none — как в VISUAL_SOURCES.
+_DETECT_SOURCES = ("schematic", "photo", "icon", "none")
+
+
+def _route_source(source: str, intent: str, concept: str, quote: str,
+                  query_en: str) -> tuple[str, str]:
+    """Решить (source, intent) для точки по сигналам речи (взаимоисключающий §1).
+
+    Работает в ДЕТЕКТОР-словаре ``_DETECT_SOURCES`` (schematic/photo/icon/none);
+    ``_build_candidates`` материализует photo→diffusion-кандидат.
+
+    1. Модельный source/intent — основа (валидируем по множествам).
+    2. КОД-страховка: числа/%/структурные слова → форс schematic + intent даже
+       если модель сказала photo (модель путает данные с фото — c_diff §3).
+    3. photo требует НЕпустой английский query (без предмета SD не зовём — §5);
+       нет query → none (лучше пусто, чем слоп).
+    4. icon — только при явном слове-значке; иначе схлоп в schematic/none.
+    Возврат: (source ∈ _DETECT_SOURCES, intent ∈ SCHEMATIC_INTENTS|"")."""
+    src = source if source in _DETECT_SOURCES else ""
+    it = intent if intent in SCHEMATIC_INTENTS else ""
+    blob = f"{concept} {quote}"
+
+    # (2) числа/структура → данные, не фото. Форсим schematic + подбираем intent.
+    has_data = bool(_NUM_RE.search(blob) or _PCT_RE.search(blob))
+    forced_intent = ""
+    for rx, name in _INTENT_SIGNALS:
+        if rx.search(blob):
+            forced_intent = name
+            break
+    if (has_data or forced_intent) and src in ("photo", "", "none"):
+        src = "schematic"
+        if not it:
+            it = forced_intent or "stat"      # число без явного типа → stat
+
+    # (4) icon только при явном слове-значке; иначе не icon.
+    if src == "icon" and not _ICON_RE.search(blob):
+        src = "schematic" if (has_data or forced_intent) else "none"
+        it = it or forced_intent
+
+    # (1/3) schematic без intent — добираем по сигналу, иначе callout (термин —
+    # самый безопасный «текст на экране»). photo без английского query → none.
+    if src == "schematic" and not it:
+        it = forced_intent or "callout"
+    if src == "photo":
+        q = " ".join((query_en or "").split())
+        if not q or _CYRILLIC.search(q):
+            src, it = "none", ""
+        else:
+            it = ""
+    if src not in _DETECT_SOURCES:
+        src = "none"
+    if src != "schematic":
+        it = ""
+    return src, it
+
+
+# === узкие экстракторы schematic-fields (codegfx a_code.md §2.2) =================
+# ОДИН прицельный LLM-вызов на schematic-точку: плоская схема ИМЕННО этого intent,
+# ВСЕ поля required (R4: optional молча выкидывается), числа/значения с quote-
+# якорем. КОД снапит quote к транскрипту (_snap) и валидирует числа — модель
+# данные НЕ выдумывает. <2 валидных значения → точка дропается (§8 анти-слоп).
+SCHEMATIC_VALUES_MIN = 2          # <2 снапнутых значений на schematic → дроп точки
+_SCHEMATIC_INTRO_QUOTE = (
+    "Для КАЖДОГО значения дай поле quote — ДОСЛОВНЫЕ 3-6 слов из речи, где это "
+    "произнесено (точно как в тексте). Не выдумывай: бери только реально "
+    "сказанные числа/слова.")
+
+_EXTRACT_SYSTEM = {
+    "stat": (
+        "Ты — монтажёр. Тебе дают фрагмент речи. Извлеки числа/статистику для "
+        "карточки-инфографики. " + _SCHEMATIC_INTRO_QUOTE + "\n"
+        "Верни eyebrow (подводка 2-4 слова) и stats — список значений: value "
+        "(само число, как в речи), unit (единица: «%», «ГБ», пусто), label "
+        "(что это число, 1-3 слова), quote (якорь)."),
+    "compare": (
+        "Ты — монтажёр. Тебе дают фрагмент речи со сравнением A против B. "
+        "Извлеки таблицу. " + _SCHEMATIC_INTRO_QUOTE + "\n"
+        "Верни title (например «Linux vs Windows»), col_a, col_b (заголовки "
+        "колонок) и rows — строки: feature (свойство), a (значение слева), b "
+        "(значение справа), winner («a»/«b»/«»), quote (якорь)."),
+    "tree": (
+        "Ты — монтажёр. Тебе дают фрагмент речи об иерархии/структуре. Извлеки "
+        "дерево ПЛОСКИМ списком. " + _SCHEMATIC_INTRO_QUOTE + "\n"
+        "Верни title, root_label (корень дерева) и nodes — узлы: label (имя), "
+        "desc (пояснение 1-3 слова), parent (имя родителя или \"\" для верхних), "
+        "quote (якорь)."),
+    "list": (
+        "Ты — монтажёр. Тебе дают фрагмент речи с перечислением. " +
+        _SCHEMATIC_INTRO_QUOTE + "\n"
+        "Верни title (заголовок 2-4 слова), ordered (true если порядок важен) и "
+        "items — пункты: text (суть 2-5 слов), note (короткое пояснение или "
+        "\"\"), quote (якорь)."),
+    "process": (
+        "Ты — монтажёр. Тебе дают фрагмент речи с инструкцией-шагами. " +
+        _SCHEMATIC_INTRO_QUOTE + "\n"
+        "Верни title и steps — шаги по порядку: title (что сделать 2-4 слова), "
+        "desc (детали), quote (якорь)."),
+    "timeline": (
+        "Ты — монтажёр. Тебе дают фрагмент речи с датами/этапами. " +
+        _SCHEMATIC_INTRO_QUOTE + "\n"
+        "Верни title и events — события по порядку: when (дата/этап), what "
+        "(что произошло), quote (якорь)."),
+    "callout": (
+        "Ты — монтажёр. Тебе дают фрагмент речи с определением термина. " +
+        _SCHEMATIC_INTRO_QUOTE + "\n"
+        "Верни term (термин), definition (определение одной фразой) и quote "
+        "(якорь, где термин определён)."),
+    "code": (
+        "Ты — монтажёр. Тебе дают фрагмент речи о команде/конфиге/терминале. " +
+        _SCHEMATIC_INTRO_QUOTE + "\n"
+        "Верни title, lang (язык/оболочка: bash, powershell, …), code "
+        "(САМ текст команды/конфига, как в речи) и quote (якорь)."),
+    "quote": (
+        "Ты — монтажёр. Тебе дают фрагмент речи с ярким тезисом. " +
+        _SCHEMATIC_INTRO_QUOTE + "\n"
+        "Верни text (сам тезис ДОСЛОВНО), by (автор/источник или \"\") и quote "
+        "(якорь — те же слова тезиса в тексте)."),
+}
+
+# Плоские required-схемы по intent (ВСЕ поля required — R4). Числа/значения
+# несут quote; КОД снапит и валидирует. Список-полей собирает движок (codegfx).
+def _row_schema(*fields: str) -> dict:
+    return {"type": "object",
+            "properties": {f: {"type": "string"} for f in fields},
+            "required": list(fields)}
+
+
+_EXTRACT_SCHEMA = {
+    "stat": {"type": "object", "properties": {
+        "eyebrow": {"type": "string"},
+        "stats": {"type": "array",
+                  "items": _row_schema("value", "unit", "label", "quote")}},
+        "required": ["eyebrow", "stats"]},
+    "compare": {"type": "object", "properties": {
+        "title": {"type": "string"}, "col_a": {"type": "string"},
+        "col_b": {"type": "string"},
+        "rows": {"type": "array",
+                 "items": _row_schema("feature", "a", "b", "winner", "quote")}},
+        "required": ["title", "col_a", "col_b", "rows"]},
+    "tree": {"type": "object", "properties": {
+        "title": {"type": "string"}, "root_label": {"type": "string"},
+        "nodes": {"type": "array",
+                  "items": _row_schema("label", "desc", "parent", "quote")}},
+        "required": ["title", "root_label", "nodes"]},
+    "list": {"type": "object", "properties": {
+        "title": {"type": "string"}, "ordered": {"type": "boolean"},
+        "items": {"type": "array",
+                  "items": _row_schema("text", "note", "quote")}},
+        "required": ["title", "ordered", "items"]},
+    "process": {"type": "object", "properties": {
+        "title": {"type": "string"},
+        "steps": {"type": "array",
+                  "items": _row_schema("title", "desc", "quote")}},
+        "required": ["title", "steps"]},
+    "timeline": {"type": "object", "properties": {
+        "title": {"type": "string"},
+        "events": {"type": "array",
+                   "items": _row_schema("when", "what", "quote")}},
+        "required": ["title", "events"]},
+    "callout": {"type": "object", "properties": {
+        "term": {"type": "string"}, "definition": {"type": "string"},
+        "quote": {"type": "string"}},
+        "required": ["term", "definition", "quote"]},
+    "code": {"type": "object", "properties": {
+        "title": {"type": "string"}, "lang": {"type": "string"},
+        "code": {"type": "string"}, "quote": {"type": "string"}},
+        "required": ["title", "lang", "code", "quote"]},
+    "quote": {"type": "object", "properties": {
+        "text": {"type": "string"}, "by": {"type": "string"},
+        "quote": {"type": "string"}},
+        "required": ["text", "by", "quote"]},
+}
+# intent → (имя списка строк, ключ-якорь quote в каждой строке). Для intent без
+# списка (callout/code/quote) — список пуст, якорь — в самом объекте.
+_EXTRACT_LIST_FIELD = {
+    "stat": "stats", "compare": "rows", "tree": "nodes",
+    "list": "items", "process": "steps", "timeline": "events",
 }
 
 
@@ -766,7 +1003,169 @@ def _fallback_cta(typ: str, eff: _EffStream, transcript: Transcript,
     return None
 
 
-# === §3.3 детектор иллюстраций ===================================================
+# === валидация чисел schematic-значений (codegfx a_code.md §2.3) =================
+# КОД, не модель (политика репо): значение-число обязано РЕАЛЬНО встречаться в
+# окне транскрипта (нормализовано: «11 тысяч»→11000, «96 процентов»→96). Не нашли
+# → значение-число дроп. Нечисловые значения (слова) проходят (их страхует снап).
+_NUM_TOKEN_RE = re.compile(r"\d[\d\s.,]*")
+_RU_SCALE = {"тысяч": 1_000, "тыс": 1_000, "миллион": 1_000_000,
+             "млн": 1_000_000, "миллиард": 1_000_000_000, "млрд": 1_000_000_000}
+
+
+def _nums_in(text: str) -> set[int]:
+    """Множество целых чисел, встречающихся в тексте (с учётом «11 тысяч» →
+    11000, «96 процентов» → 96). Дробную часть отбрасываем (для сверки величин).
+    Пробелы/точки/запятые внутри числа схлопываются («11 000»→11000)."""
+    out: set[int] = set()
+    low = text.lower()
+    for m in _NUM_TOKEN_RE.finditer(low):
+        digits = re.sub(r"[\s.,]", "", m.group())
+        if not digits:
+            continue
+        try:
+            base = int(digits)
+        except ValueError:
+            continue
+        out.add(base)
+        # «11 тысяч» — масштаб в следующем слове
+        tail = low[m.end():m.end() + 16].lstrip()
+        for kw, mult in _RU_SCALE.items():
+            if tail.startswith(kw):
+                out.add(base * mult)
+                break
+    return out
+
+
+def _value_in_window(value: str, eff: _EffStream, lo: int, hi: int) -> bool:
+    """Значение schematic-строки валидно для окна (a_code §2.3). Нечисловое →
+    True (текст страхует quote-снап). Числовое → его целое обязано встречаться
+    среди чисел окна (нормализовано) — иначе выдумка модели, дроп."""
+    nums = _nums_in(value)
+    if not nums:
+        return True
+    window_text = " ".join(w.word for w in eff.words[lo:hi])
+    win_nums = _nums_in(window_text)
+    return bool(nums & win_nums)
+
+
+def _clean_extracted_fields(intent: str, data: dict, eff: _EffStream,
+                            lo: int, hi: int) -> tuple[dict, int]:
+    """Сырой ответ узкого экстрактора → (плоские fields, число валидных значений).
+
+    КОД-валидация (a_code §2.3): для каждой строки списка снапим её quote к окну
+    (_snap, промах → строка дроп) И сверяем числа (выдуманное число → строка
+    дроп). intent без списка (callout/code/quote) — валидируем один quote-якорь.
+    Возврат fields БЕЗ служебного quote (его в payload не кладём — он лишь для
+    валидации); n_valid — сколько значений прошло (порог SCHEMATIC_VALUES_MIN)."""
+    if not isinstance(data, dict):
+        return {}, 0
+    list_field = _EXTRACT_LIST_FIELD.get(intent)
+    fields: dict = {}
+    n_valid = 0
+    anchor: Optional[int] = None
+    if list_field is None:
+        # callout/code/quote: один объект с якорем-quote.
+        quote = data.get("quote")
+        if _snap(quote, eff, lo, hi, None) is None:
+            return {}, 0                       # якорь не снапнулся → выдумка, дроп
+        for k, v in data.items():
+            if k == "quote":
+                continue
+            if isinstance(v, str) and v.strip():
+                fields[k] = _trim_text(v, CARD_ITEM_TEXT_MAX * 4)
+        # значимость: есть ли непустое смысловое поле
+        n_valid = sum(1 for k, v in fields.items() if v)
+        return fields, (1 if n_valid else 0)
+
+    # scalar-поля верхнего уровня (eyebrow/title/col_a/col_b/ordered/…)
+    for k, v in data.items():
+        if k == list_field:
+            continue
+        if isinstance(v, bool):
+            fields[k] = v
+        elif isinstance(v, str) and v.strip():
+            fields[k] = _trim_text(v, CARD_ITEM_TEXT_MAX * 2)
+
+    rows_in = data.get(list_field)
+    rows_out: list[dict] = []
+    for r in (rows_in if isinstance(rows_in, list) else []):
+        if not isinstance(r, dict):
+            continue
+        quote = r.get("quote")
+        hit = _snap(quote, eff, lo, hi, anchor)
+        if hit is None:
+            continue                           # quote не снапнулся → строка дроп
+        anchor = hit[0]
+        # числовые значения строки обязаны встречаться в окне (анти-выдумка)
+        bad_num = False
+        row: dict = {}
+        for k, v in r.items():
+            if k == "quote":
+                continue
+            if isinstance(v, bool):
+                row[k] = v
+            elif isinstance(v, str) and v.strip():
+                sv = _trim_text(v, CARD_ITEM_TEXT_MAX)
+                if not _value_in_window(sv, eff, lo, hi):
+                    bad_num = True
+                    break
+                row[k] = sv
+        if bad_num or not row:
+            continue
+        rows_out.append(row)
+        n_valid += 1
+        if len(rows_out) >= CARD_ITEMS_MAX:
+            break
+    fields[list_field] = rows_out
+    return fields, n_valid
+
+
+def _extract_schematic(intent: str, eff: _EffStream, lo: int, hi: int, llm,
+                       keep_alive: int, log: LogFn) -> Optional[dict]:
+    """Узкий экстрактор fields для одной schematic-точки (a_code §2.2). Один
+    прицельный LLM-вызов по плоской схеме intent, КОД-валидация значений
+    (_clean_extracted_fields). <SCHEMATIC_VALUES_MIN валидных → None (дроп —
+    лучше пусто, чем выдумка). Сбой вызова → None (точка останется без schematic-
+    кандидата, останется none — пасс не валим)."""
+    system = _EXTRACT_SYSTEM.get(intent)
+    schema = _EXTRACT_SCHEMA.get(intent)
+    if system is None or schema is None:
+        return None
+    user = ("Фрагмент речи:\n" + _plain_text(eff, lo, hi)
+            + "\n\nВерни JSON строго по схеме (все поля обязательны).")
+    try:
+        data = llm.chat_json(system, user, schema, keep_alive=keep_alive)
+    except Exception as e:  # noqa: BLE001 — сбойный экстрактор не валит пасс
+        log(f"  enrich: экстрактор {intent} пропущен ({e})")
+        return None
+    fields, n_valid = _clean_extracted_fields(intent, data, eff, lo, hi)
+    if n_valid < SCHEMATIC_VALUES_MIN and intent not in ("callout", "quote"):
+        return None                            # <2 значений → дроп (анти-слоп §8)
+    if n_valid < 1:
+        return None
+    return fields
+
+
+# === арт-дирекшн-промпт диффузии (MONTAGE_V2 §5, c_diff §2б) =====================
+# LLM пишет БОГАТЫЙ промпт (subject+свет+линза+grade); фото-суффикс/негатив — в
+# imagegen.py. Здесь — лёгкий код-обогатитель голого query_en, когда отдельного
+# LLM-вызова за арт-дирекшном делать не хочется (дёшево, без сети). Доказано
+# (c_diff §1/§2): голый query = слоп; «cinematic… depth of field… photorealistic»
+# = кадр. Суффикс STYLE_SUFFIX добавит imagegen — здесь только subject-обогащение.
+_ARTDIR_SUFFIX = (", cinematic lighting, shallow depth of field, "
+                  "photorealistic, professional photography, ultra detailed")
+
+
+def _art_direction_prompt(query_en: str) -> str:
+    """Голый английский query_en → БОГАТЫЙ арт-дирекшн-промпт (§5). Код-путь
+    (без LLM): subject как есть + кинематографичный хвост. Пусто/русский → ""."""
+    q = " ".join((query_en or "").split())
+    if not q or _CYRILLIC.search(q):
+        return ""
+    return q + _ARTDIR_SUFFIX
+
+
+# === §3.3 детектор-классификатор иллюстраций + сборка кандидатов =================
 def _detect_illustrations(eff: _EffStream, transcript: Transcript, llm,
                           ka_next, log: LogFn, prog) -> list[dict]:
     out: list[dict] = []
@@ -801,12 +1200,17 @@ def _detect_illustrations(eff: _EffStream, transcript: Transcript, llm,
                 continue                           # без концепта точка бессмысленна
             q = r.get("image_query_en")
             q = " ".join(q.split()) if isinstance(q, str) else ""
-            if not q or _CYRILLIC.search(q):
-                q = ""                             # пустой/русский запрос -> без
-                                                   # авто-ассета (asset_kind none)
-            style = r.get("style")
-            if style not in ("photo", "diagram", "icon"):
-                style = "photo"                    # style-фолбэк
+            quote = _trim_text(" ".join(w.word for w in eff.words[a:b + 1]), 120)
+            # РОУТЕР (§1): источник + intent по сигналам речи (взаимоисключающий).
+            src, intent = _route_source(r.get("source"), r.get("intent"),
+                                        concept, quote, q)
+            # Обратная совместимость: style_hint для старого рендера/плоского пути.
+            style_hint = ("diagram" if src == "schematic"
+                          else "icon" if src == "icon" else "photo")
+            if src == "photo":
+                q = " ".join(q.split())            # photo: query прошёл роутер
+            else:
+                q = ""                             # не-photo: без image_query
             orig_a, orig_b = eff.orig[a], eff.orig[b]
             si = eff.seg_of[orig_a]
             t0 = transcript.segments[si].start     # снап старта к началу сегмента
@@ -818,17 +1222,85 @@ def _detect_illustrations(eff: _EffStream, transcript: Transcript, llm,
                 "score": _ILL_SCORE_BASE + (_ILL_SCORE_QUERY if q else 0),
                 "word_start": eff.seg_first[si], "word_end": orig_b,
                 "t_start": t0, "t_end": t0 + dur,
-                "quote": _trim_text(
-                    " ".join(w.word for w in eff.words[a:b + 1]), 120),
+                "quote": quote,
                 "reason": f"иллюстрация: {concept}",
                 "payload": {"concept": concept, "image_query_en": q,
-                            "style_hint": style, "asset_kind": "none",
-                            "position": "top_right"},
+                            "style_hint": style_hint, "asset_kind": "none",
+                            "position": "top_right",
+                            "source": src, "intent": intent},
+                # служебное (для стадии кандидатов; НЕ в финальный payload):
+                "_route": {"source": src, "intent": intent,
+                           "lo": lo, "hi": hi, "query_en": q},
             })
             n_kept += 1
     # Плотность сверх окна-лимита здесь НЕ режем — потолки планировщика
     # (<=2/мин и общие) срежут по score (§3.3: «он срежет»).
     return out
+
+
+# === стадия КАНДИДАТОВ (MONTAGE_V2 §2) ==========================================
+# На каждый момент-иллюстрацию собираем 2-4 кандидата в payload.candidates (юзер
+# листает и выбирает; selected=0 = лучший). schematic-кандидаты — ЭАГЕРНО
+# (быстро, CPU/LLM, без GPU): узкий экстрактор заполняет fields. diffusion-
+# кандидат — только для photo-моментов (реальная генерация — стадия images,
+# VRAM-менеджер). none — ВСЕГДА как вариант («лучше пусто, чем слоп»).
+def _build_candidates(points: list, eff: _EffStream, llm, log: LogFn,
+                      *, default_style: str = SCHEMATIC_STYLE_DEF,
+                      run_diffusion: bool = True) -> int:
+    """Заполнить ``payload.candidates``/``selected``/``source`` точкам-иллюстрациям
+    (мутирует ``points``). Возврат — число точек, получивших ≥1 материальный
+    (не-none) кандидат.
+
+    Кандидаты по роутер-источнику точки (``_route``):
+      schematic → узкий экстрактор fields (ЭАГЕРНО, LLM без GPU); промах
+                  валидации → schematic-кандидата НЕТ (остаётся none).
+      photo     → diffusion-кандидат с богатым арт-дирекшн-промптом (реальная
+                  генерация N сидов — стадия images). run_diffusion=False
+                  (image_source=emoji и т.п.) → diffusion-кандидата нет.
+      icon      → icon-кандидат (эмодзи подберёт этап ассетов; здесь пометка).
+    none добавляется КАЖДОЙ точке последним вариантом. selected=0 — первый
+    материальный (или none, если материальных нет)."""
+    ill = [p for p in points
+           if isinstance(p, dict) and p.get("type") in (ENR_IMAGE, ENR_ANIMATION)
+           and isinstance(p.get("payload"), dict)]
+    style = default_style if default_style in SCHEMATIC_STYLES \
+        else SCHEMATIC_STYLE_DEF
+    materialized = 0
+    for p in ill:
+        route = p.get("_route") or {}
+        src = route.get("source", p["payload"].get("source", "none"))
+        intent = route.get("intent", "")
+        lo, hi = route.get("lo", 0), route.get("hi", len(eff.words))
+        cands: list[dict] = []
+        if src == "schematic" and intent in SCHEMATIC_INTENTS:
+            fields = _extract_schematic(intent, eff, lo, hi, llm,
+                                        keep_alive=KEEP_ALIVE_BETWEEN, log=log)
+            if fields:
+                cands.append({"source": "schematic", "intent": intent,
+                              "fields": fields, "style": style})
+        elif src == "photo":
+            prompt = _art_direction_prompt(route.get("query_en", ""))
+            if prompt and run_diffusion:
+                cands.append({"source": "diffusion", "prompt": prompt,
+                              "seed": -1})
+        elif src == "icon":
+            cands.append({"source": "icon", "emoji": ""})
+        # none ВСЕГДА доступен как вариант («лучше пусто, чем слоп»).
+        cands.append({"source": "none"})
+        clean = [c for c in (sanitize_candidate(c) for c in cands)
+                 if c is not None]
+        if not clean:
+            clean = [{"source": "none"}]
+        p["payload"]["candidates"] = clean
+        p["payload"]["selected"] = 0
+        p["payload"]["source"] = clean[0]["source"]
+        if clean[0]["source"] == "schematic":
+            p["payload"]["intent"] = clean[0].get("intent", "")
+            p["payload"]["schematic_style"] = clean[0].get("style", style)
+        if clean[0]["source"] != "none":
+            materialized += 1
+        p.pop("_route", None)                      # служебное наружу не уходит
+    return materialized
 
 
 # === §4 Tier 1: сопоставление папки ассетов юзера + эмодзи-фолбэк =================
@@ -843,24 +1315,17 @@ ASSET_INDEX_MAX = 200                             # потолок индекс�
 # отсутствию файла (в тестах мокаем через monkeypatch этой переменной/loader).
 EMOJI_MAP_PATH = EMOJI_SVG_DIR.parent / "emoji_map.json"
 
-# === SD-маршрутизация по style (ТРЕК-2, §2) ======================================
-# КРИТИЧНО: SDXL-Turbo рисует кракозябры вместо букв (§2). Поэтому НЕ всё идёт в
-# SD — выбор по style выживших точек-иллюстраций:
-#   photo            -> SD напрямую (query_en + STYLE_SUFFIX, текст-негатив).
-#   diagram / chart  -> query переписывается в text-free абстракцию (см.
-#                       _rewrite_diagram_prompt — паттерн «кадра 06»), затем SD;
-#                       пустой/русский query -> эмодзи (схему без предмета не
-#                       рисуем).
-#   icon             -> НЕ SD (логотип/значок SD не нарисует), сразу эмодзи.
-# Маршрутизатор лишь ПОМЕЧАЕТ точку asset_kind="generate" + gen_prompt_en и
-# параллельно подбирает эмодзи-фолбэк (поле emoji): реальный запуск бинаря — этап
-# images в задаче (serve.py) ПОСЛЕ unload Ollama (VRAM-менеджер §2). SD выключен/
-# не настроен -> в generate не уходим (сразу эмодзи) — задача не зависит от SD.
-_SD_STYLES_DIRECT = ("photo",)            # query_en как есть (+ суффикс)
-_SD_STYLES_REWRITE = ("diagram", "chart")  # query переписать в text-free
-# Префикс text-free переписывания схемы/графика (§2, «как кадр 06»): убираем
-# любые надписи, оставляем абстрактную концептуальную визуализацию.
-_DIAGRAM_REWRITE_PREFIX = "abstract conceptual illustration, no text, "
+# === SD-маршрутизация СТРОГО для фото-сцен (MONTAGE_V2 §5, c_diff §3) ============
+# ВЗАИМОИСКЛЮЧАЮЩИЙ роутер (§1) уже решил источник; SD зовём ТОЛЬКО для photo.
+# КРИТИЧНО (доказано кадром 05): схему/данные/числа в диффузию НЕЛЬЗЯ — кракозябры.
+# Поэтому diagram→SD УДАЛЁН (был «text-free пятно без сущностей» — бесполезен, §0):
+# данные идут в код-схему (schematic-кандидат), а не в SD. icon → эмодзи, не SD.
+#   photo  -> SD напрямую (богатый арт-дирекшн-промпт + фото-суффикс, текст-негатив)
+#   schematic/icon/прочее -> в SD НЕ уходят (False).
+# Маршрутизатор лишь ПОМЕЧАЕТ photo-точку asset_kind="generate" + gen_prompt_en
+# (арт-дирекшн): реальный запуск бинаря — этап images (serve.py) ПОСЛЕ unload
+# Ollama (VRAM-менеджер §5). SD выключен/не настроен -> точка остаётся none.
+_SD_STYLES_DIRECT = ("photo",)            # ТОЛЬКО photo идёт в диффузию (§5)
 
 # Плоская схема (R4: optional молча выкидывается — ВСЕ поля required): на каждую
 # точку модель возвращает point_idx + asset_filename ("" = нет совпадения).
@@ -1009,65 +1474,88 @@ def _emoji_for_concept(concept: str, emoji_map: dict) -> str:
     return ""
 
 
-def _rewrite_diagram_prompt(query_en: str) -> str:
-    """diagram/chart -> text-free промпт (§2): SDXL-Turbo не умеет буквы, поэтому
-    схему/график переписываем в абстрактную концептуальную визуализацию без
-    надписей (паттерн «кадра 06»). Дублирующийся «no text» не плодим."""
-    q = " ".join((query_en or "").split())
-    if not q:
-        return ""
-    return _DIAGRAM_REWRITE_PREFIX + q
-
-
 def _route_generate(pl: dict) -> bool:
-    """Решить, уходит ли точка в SD-генерацию по её ``style_hint`` (§2).
+    """Решить, уходит ли точка в SD-генерацию (СТРОГО photo, §5).
 
-    Мутирует payload: при положительном решении ставит ``asset_kind="generate"``
-    и ``gen_prompt_en`` (для photo — query_en как есть; для diagram/chart —
-    text-free переписывание). icon и пустой/русский query (для схемы) в SD НЕ
-    уходят -> False (выше по стеку сработает эмодзи-фолбэк). Возврат — True, если
-    точка помечена на генерацию."""
-    style = pl.get("style_hint")
-    query = " ".join(str(pl.get("image_query_en") or "").split())
-    if not query or _CYRILLIC.search(query):
-        return False                      # без английского предмета SD не зовём
-    if style in _SD_STYLES_DIRECT:
-        prompt = query                    # photo: query_en как есть (+ суффикс)
-    elif style in _SD_STYLES_REWRITE:
-        prompt = _rewrite_diagram_prompt(query)  # схему -> text-free абстракция
-    else:
-        return False                      # icon (и прочее) -> эмодзи, не SD
+    Мутирует payload: для ``style_hint=="photo"`` с валидным английским query
+    ставит ``asset_kind="generate"`` + ``gen_prompt_en`` (БОГАТЫЙ арт-дирекшн-
+    промпт, не голый query — c_diff §2б; фото-суффикс/негатив добавит imagegen).
+    schematic/icon/прочее и пустой/русский query в SD НЕ уходят -> False (данные
+    рисует код-схема, значок — эмодзи; «лучше пусто, чем слоп»). diagram→SD
+    УДАЛЁН (кадр 05: кракозябры). Возврат — True, если точка помечена на SD."""
+    if pl.get("style_hint") not in _SD_STYLES_DIRECT:
+        return False                      # ТОЛЬКО photo (icon/schematic — не SD)
+    prompt = _art_direction_prompt(pl.get("image_query_en"))
     if not prompt:
-        return False
+        return False                      # без английского предмета SD не зовём
     pl["asset_kind"] = "generate"
     pl["gen_prompt_en"] = prompt
     return True
 
 
+def _legacy_sync_from_candidate(pl: dict) -> None:
+    """Синхронизировать плоские поля payload (asset_kind/gen_prompt_en/asset_path)
+    с ВЫБРАННЫМ кандидатом (обратная совместимость со стадией images и рендером).
+
+    candidates[selected].source: diffusion → asset_kind="generate" + gen_prompt_en
+    (его подберёт enrich_image_batch); stock → asset_kind="user" + asset_path;
+    icon → asset_kind="emoji" (+emoji подберёт _attach_emoji); schematic/none →
+    asset_kind="none" (schematic-PNG кладёт стадия images в кандидат, не в плоский
+    asset_path — рендер берёт его через resolved_asset())."""
+    cands = pl.get("candidates") or []
+    sel = pl.get("selected", 0)
+    if not isinstance(cands, list) or not (0 <= sel < len(cands)):
+        return
+    c = cands[sel]
+    src = c.get("source")
+    if src == "diffusion":
+        pl["asset_kind"] = "generate"
+        pl["gen_prompt_en"] = c.get("prompt", "")
+        pl["gen_seed"] = c.get("seed", -1)
+    elif src == "stock":
+        pl["asset_kind"] = "user"
+        pl["asset_path"] = c.get("asset_path", "")
+    elif src == "icon":
+        pl["asset_kind"] = "emoji"
+    else:                                        # schematic / none
+        pl["asset_kind"] = "none"
+
+
+def _attach_emoji(pl: dict, emoji_map: dict) -> bool:
+    """Подобрать эмодзи ТОЛЬКО для явного icon-кандидата (§1: эмодзи больше НЕ
+    фолбэк иллюстрации). Ставит поле ``emoji`` icon-кандидату и плоскому payload.
+    Возврат — True, если эмодзи нашёлся."""
+    cands = pl.get("candidates") or []
+    sel = pl.get("selected", 0)
+    if not isinstance(cands, list) or not (0 <= sel < len(cands)):
+        return False
+    c = cands[sel]
+    if c.get("source") != "icon":
+        return False
+    name = _emoji_for_concept(_trim_text(pl.get("concept"), 80), emoji_map)
+    c["emoji"] = name
+    pl["emoji"] = name
+    return bool(name)
+
+
 def match_user_assets(points: list, folder, llm, log: LogFn = _noop,
                       *, emoji_map_path: Optional[Path] = None,
                       generate: bool = False) -> int:
-    """§4 + ТРЕК-2 §2: проставить ассеты точкам-иллюстрациям (мутирует ``points``).
+    """§4 (V2) — сток-кандидат из папки юзера + синк плоских полей (мутирует points).
 
-    Цепочка ассета для точки (§2): user(папка) -> generate(SD) -> emoji -> none.
+    V2-логика (взаимоисключающий роутер уже выбрал источник, кандидаты собраны
+    ``_build_candidates``): здесь только ДОБАВЛЯЕМ ``stock``-кандидат, когда файл
+    из папки юзера смыслово матчит точку (ОДИН LLM-вызов, path-traversal отбит),
+    и ставим его ЛУЧШИМ (``selected``=stock). Затем для icon-кандидата подбираем
+    эмодзи (узко, только явный значок — §1: эмодзи больше НЕ фолбэк иллюстрации)
+    и синхронизируем плоские поля payload с выбранным кандидатом (обратная
+    совместимость рендера/стадии images). diffusion-кандидат метится на SD через
+    плоский ``asset_kind="generate"`` (его генерит стадия images).
 
-    Индексирует png/jpg/jpeg/webp в ``folder`` (+ опц. descriptions.txt), ОДНИМ
-    LLM-вызовом сопоставляет concept каждой точки с доступным файлом, при матче
-    ставит ``asset_kind="user"`` + абсолютный ``asset_path`` (строго внутри
-    folder — path-traversal отбит). Не нашли файл и ``generate=True`` — пробуем
-    SD-маршрут по ``style_hint`` (``_route_generate``: photo напрямую,
-    diagram/chart — text-free переписывание, icon -> НЕ SD): помечаем точку
-    ``asset_kind="generate"`` + ``gen_prompt_en`` (реальный запуск бинаря — этап
-    images в задаче ПОСЛЕ unload Ollama, VRAM-менеджер). ПАРАЛЛЕЛЬНО всегда
-    подбираем эмодзи-фолбэк в поле ``emoji`` (на случай сбоя SD). Не ушли ни в
-    user, ни в generate — ``asset_kind="emoji"`` если эмодзи нашёлся, иначе
-    ``asset_kind="none"``.
-
-    Безопасен к сбоям: нет папки / пустой индекс / упавший LLM -> generate/эмодзи-
-    фолбэк (или none), исключение наружу НЕ летит (сбойный этап не валит пасс).
-    Точки — сырые dict-кандидаты иллюстраций (как из ``_detect_illustrations``: с
-    ``payload.concept``/``style_hint``/``image_query_en``). Возврат — число
-    точек, которым проставлен ассет или назначена генерация (user|generate|emoji)."""
+    ``generate`` — оставлен для совместимости сигнатуры; SD-маршрут теперь живёт
+    в diffusion-кандидате (его наличие = разрешение на SD). Безопасен к сбоям:
+    нет папки / пустой индекс / упавший LLM → без stock-кандидата (исключение
+    наружу НЕ летит). Возврат — число точек с материальным (не-none) выбором."""
     emoji_map = _load_emoji_map(emoji_map_path)
     ill = [p for p in points
            if isinstance(p, dict) and p.get("type") in (ENR_IMAGE, ENR_ANIMATION)
@@ -1081,7 +1569,7 @@ def match_user_assets(points: list, folder, llm, log: LogFn = _noop,
         if fp.is_dir():
             folder_p = fp
         else:
-            log(f"  enrich: папка ассетов не найдена ({folder}) — эмодзи-фолбэк")
+            log(f"  enrich: папка ассетов не найдена ({folder})")
 
     index = _index_assets(folder_p) if folder_p is not None else []
     by_idx: dict = {}                # point_idx -> filename (валидный, в папке)
@@ -1097,7 +1585,7 @@ def match_user_assets(points: list, folder, llm, log: LogFn = _noop,
             data = llm.chat_json(_MATCH_SYSTEM, user, _MATCH_SCHEMA,
                                  keep_alive=0)
         except Exception as e:  # noqa: BLE001 — сбойный матчинг не валит пасс
-            log(f"  enrich: матчинг ассетов пропущен ({e}) — эмодзи-фолбэк")
+            log(f"  enrich: матчинг ассетов пропущен ({e})")
             data = None
         raw = data.get("matches") if isinstance(data, dict) else None
         for r in (raw if isinstance(raw, list) else []):
@@ -1113,26 +1601,24 @@ def match_user_assets(points: list, folder, llm, log: LogFn = _noop,
     matched = 0
     for i, p in enumerate(ill):
         pl = p["payload"]
+        cands = pl.get("candidates")
+        if not isinstance(cands, list) or not cands:
+            cands = [{"source": "none"}]
+            pl["candidates"] = cands
         path = by_idx.get(i)
-        if path:                                 # Tier 1: файл из папки юзера
-            pl["asset_kind"] = "user"
-            pl["asset_path"] = path
-            pl["emoji"] = ""
+        if path:                                 # папка юзера → stock ЛУЧШИМ
+            sc = sanitize_candidate({"source": "stock", "asset_path": path})
+            if sc is not None:
+                cands.insert(0, sc)
+                pl["candidates"] = cands[:CANDIDATES_MAX]
+                pl["selected"] = 0
+                pl["source"] = "stock"
+        _attach_emoji(pl, emoji_map)             # только для icon-кандидата
+        _legacy_sync_from_candidate(pl)          # плоские поля ← выбранный кандидат
+        sel = pl.get("selected", 0)
+        cs = pl["candidates"]
+        if 0 <= sel < len(cs) and cs[sel].get("source") != "none":
             matched += 1
-            continue
-        # Эмодзи-фолбэк подбираем ВСЕГДА (даже когда уходим в generate): если SD
-        # на этапе images сорвётся, enrich_image_batch откатится на это поле.
-        name = _emoji_for_concept(_trim_text(pl.get("concept"), 80), emoji_map)
-        pl["emoji"] = name
-        pl["asset_path"] = ""
-        if generate and _route_generate(pl):     # Tier (SD): photo/diagram -> SD
-            matched += 1                          # asset_kind="generate" + prompt
-            continue
-        if name:                                 # Tier 0 fallback: эмодзи
-            pl["asset_kind"] = "emoji"
-            matched += 1
-        else:
-            pl["asset_kind"] = "none"            # ни папка/SD/эмодзи — без ассета
     return matched
 
 
@@ -1227,11 +1713,22 @@ def detect_all(transcript: Optional[Transcript], cutlist: Optional[CutList],
         except Exception as e:  # noqa: BLE001
             log(f"enrich: детектор иллюстраций упал ({e}) — пропускаю")
     prog(1.0 - PROGRESS_WEIGHTS["assets"])
-    # Этап assets (§4 Tier 0/1 + SD §2, вес 10%): иллюстрации идут от детектора с
-    # asset_kind="none" — здесь проставляем ассет/метим на генерацию.
-    # image_source=emoji: сразу эмодзи-фолбэк (folder=None, generate=False).
-    # auto/user_folder: LLM-матчинг папки юзера. generate/auto: не нашли в папке ->
-    # метим точку на SD (asset_kind="generate"); сам бинарь зовётся этапом images.
+    # Стадия КАНДИДАТОВ (§2): на каждый момент собираем 2-4 кандидата в
+    # payload.candidates (schematic-кандидат ЭАГЕРНО узким экстрактором; diffusion
+    # — для photo; none всегда). selected=0 = лучший. Реальный рендер кандидатов
+    # (codegfx PNG / SD N=4) — стадия images задачи (serve.py) ПОСЛЕ unload Ollama.
+    # diffusion-кандидат собираем только если image_source допускает SD
+    # ({auto,generate}); при emoji/user_folder фото уходит в none (или сток ниже).
+    if run_ill:
+        try:
+            _build_candidates(dicts, eff, llm, log,
+                              run_diffusion=image_source in ("auto", "generate"))
+        except Exception as e:  # noqa: BLE001 — сбойная стадия не валит пасс
+            log(f"enrich: стадия кандидатов упала ({e}) — точки без кандидатов")
+    # Этап assets (§4 V2, вес 10%): добавляем сток-кандидат из папки юзера (если
+    # image_source ∈ {auto,user_folder}), узко подбираем эмодзи icon-кандидату,
+    # синхронизируем плоские поля payload с выбранным кандидатом (обратная
+    # совместимость рендера/стадии images). SD сам разрешён/нет решает serve.py.
     if run_assets:
         try:
             folder = user_folder if image_source in ("auto", "user_folder") \

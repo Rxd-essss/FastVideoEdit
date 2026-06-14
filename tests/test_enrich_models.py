@@ -462,3 +462,203 @@ def test_plan_roundtrip_preserves_gen_fields():
     img = again["items"][0]["payload"]
     assert img["asset_kind"] == "generate" and img["gen_seed"] == 99
     assert img["gen_prompt_en"].startswith("abstract")
+
+
+# --- «Монтаж V2» §6: визуал-кандидаты + выбор (аддитивно, back-compat) -----------
+def _schematic_cand(**over):
+    d = {"source": "schematic", "intent": "compare", "style": "minimal",
+         "fields": {"title": "Linux vs Windows", "col_a": "Linux",
+                    "col_b": "Windows",
+                    "rows": [{"feature": "Доля серверов", "a": "96 %",
+                              "b": "4 %", "winner": "a"}]},
+         "preview": "D:/cache/codegfx/abc.png"}
+    d.update(over)
+    return d
+
+
+def _diffusion_cand(**over):
+    d = {"source": "diffusion", "prompt": "modern data center, cinematic",
+         "seed": 12345, "asset_path": "D:/cache/enrich_img/s0.png"}
+    d.update(over)
+    return d
+
+
+def test_v2_candidates_roundtrip_and_idempotent():
+    """ImagePayload c кандидатами: round-trip + идемпотентность санитайза."""
+    d = raw_image()
+    d["payload"].update({"candidates": [_schematic_cand(), _diffusion_cand()],
+                         "selected": 1})
+    p = item_from_dict(d).payload
+    assert len(p.candidates) == 2
+    assert p.selected == 1
+    assert p.source == "diffusion"               # source = source выбранного канд.
+    assert p.candidates[0]["source"] == "schematic"
+    assert p.candidates[0]["intent"] == "compare"
+    assert p.candidates[0]["fields"]["col_a"] == "Linux"
+    assert p.candidates[0]["fields"]["rows"][0]["winner"] == "a"
+    assert p.candidates[1]["seed"] == 12345
+    # to_dict -> sanitize идемпотентно
+    back = ImagePayload.sanitize(p.to_dict())
+    assert back == p
+    for key in ("candidates", "selected", "source", "intent",
+                "schematic_style"):
+        assert key in p.to_dict()
+
+
+def test_v2_defaults_no_candidates():
+    """Пустой payload → дефолты «Монтаж V2», старое поведение цело."""
+    p = ImagePayload.sanitize({})
+    assert p.candidates == [] and p.selected == 0
+    assert p.source == "none" and p.intent == ""
+    assert p.schematic_style == "minimal"
+    # старые поля не сдвинуты
+    assert p.asset_kind == "none" and p.gen_seed == -1
+
+
+def test_v2_back_compat_old_image_payload():
+    """Старый image-payload БЕЗ candidates читается как раньше (back-compat)."""
+    old = item_from_dict(raw_image()).payload     # asset_kind=user, без V2-полей
+    assert old.candidates == [] and old.selected == 0
+    assert old.asset_path == "D:/assets/registry.png"
+    assert old.asset_kind == "user"
+    # source выводится из плоского asset_kind через resolved_asset()
+    ap, src = old.resolved_asset()
+    assert ap == "D:/assets/registry.png" and src == "stock"
+    # generate → diffusion; emoji → icon; none → none
+    gen = ImagePayload.sanitize({"asset_kind": "generate",
+                                 "asset_path": "D:/cache/x.png"})
+    assert gen.resolved_asset() == ("D:/cache/x.png", "diffusion")
+    emj = ImagePayload.sanitize({"asset_kind": "emoji", "emoji": "u26a1"})
+    assert emj.resolved_asset() == ("", "icon")
+    assert ImagePayload.sanitize({}).resolved_asset() == ("", "none")
+
+
+def test_v2_selected_clamped_into_range():
+    """selected клампится в [0, len-1]; пустой список → 0."""
+    base = raw_image()
+    base["payload"]["candidates"] = [_schematic_cand(), _diffusion_cand()]
+    for raw, exp in ((99, 1), (-3, 0), ("мусор", 0), (True, 0)):
+        d = raw_image()
+        d["payload"]["candidates"] = [_schematic_cand(), _diffusion_cand()]
+        d["payload"]["selected"] = raw
+        assert item_from_dict(d).payload.selected == exp
+    # selected без кандидатов -> 0
+    d = raw_image()
+    d["payload"]["selected"] = 5
+    assert item_from_dict(d).payload.selected == 0
+
+
+def test_v2_candidates_capped_at_six():
+    """Не больше CANDIDATES_MAX=6 кандидатов (листание)."""
+    d = raw_image()
+    d["payload"]["candidates"] = [_diffusion_cand(seed=i) for i in range(10)]
+    p = item_from_dict(d).payload
+    assert len(p.candidates) == enrich.CANDIDATES_MAX == 6
+
+
+def test_v2_candidate_sanitize_per_source():
+    """sanitize_candidate: по source оставляет только осмысленные ключи."""
+    sc = enrich.sanitize_candidate(_schematic_cand())
+    assert sc["source"] == "schematic" and sc["intent"] == "compare"
+    assert sc["style"] == "minimal" and "fields" in sc
+    # незнакомый intent/style -> фолбэк ("" / minimal)
+    sc2 = enrich.sanitize_candidate(_schematic_cand(intent="hologram",
+                                                    style="vaporwave"))
+    assert sc2["intent"] == "" and sc2["style"] == "minimal"
+    # diffusion: seed bool/мусор -> -1, относительный asset_path выкинут
+    df = enrich.sanitize_candidate(
+        {"source": "diffusion", "prompt": "x", "seed": True,
+         "asset_path": "../evil.png"})
+    assert df["seed"] == -1 and "asset_path" not in df
+    # icon: emoji ИЛИ abs asset_path
+    ic = enrich.sanitize_candidate({"source": "icon", "emoji": "u1f427"})
+    assert ic["emoji"] == "u1f427"
+    # kinetic: text + style
+    kn = enrich.sanitize_candidate({"source": "kinetic", "text": "и тут магия"})
+    assert kn["text"] == "и тут магия" and kn["style"] == "minimal"
+    # none -> только source
+    nn = enrich.sanitize_candidate({"source": "none"})
+    assert nn == {"source": "none"}
+    # битый/неизвестный source -> None (дроп)
+    assert enrich.sanitize_candidate({"source": "tiktok"}) is None
+    assert enrich.sanitize_candidate("не словарь") is None
+    assert enrich.sanitize_candidate({}) is None
+
+
+def test_v2_candidate_fields_flattened_and_limited():
+    """_clean_fields: глубокая вложенность/не-данные отбрасываются, скаляры цело."""
+    cand = {"source": "schematic", "intent": "stat",
+            "fields": {"eyebrow": "Ядро Linux",
+                       "stats": [{"value": "11 000", "label": "разработчиков"},
+                                 {"deep": {"nope": 1}},          # row схлопся -> дроп
+                                 "просто строка"],
+                       "bar": 96,
+                       "junk": {"a": {"b": 1}},                  # dict-значение -> дроп
+                       "nan": float("nan")}}                     # NaN -> дроп
+    sc = enrich.sanitize_candidate(cand)
+    f = sc["fields"]
+    assert f["eyebrow"] == "Ядро Linux" and f["bar"] == 96
+    assert "junk" not in f and "nan" not in f
+    # row из одних вложенных dict схлопывается в пустой -> выбрасывается из списка;
+    # выживают валидная строка-dict и скаляр-строка.
+    assert f["stats"] == [{"value": "11 000", "label": "разработчиков"},
+                          "просто строка"]
+
+
+def test_v2_resolved_asset_from_chosen_candidate():
+    """resolved_asset(): выбранный кандидат -> (asset_path|preview, source)."""
+    d = raw_image()
+    d["payload"].update({"candidates": [_schematic_cand(), _diffusion_cand()],
+                         "selected": 0})
+    p = item_from_dict(d).payload
+    # schematic: asset_path нет -> preview как путь (PNG движка)
+    ap, src = p.resolved_asset()
+    assert src == "schematic" and ap == "D:/cache/codegfx/abc.png"
+    # переключение selected -> diffusion asset_path
+    d["payload"]["selected"] = 1
+    p2 = item_from_dict(d).payload
+    assert p2.resolved_asset() == ("D:/cache/enrich_img/s0.png", "diffusion")
+    # none-кандидат -> ("", "none")
+    d2 = raw_image()
+    d2["payload"]["candidates"] = [{"source": "none"}]
+    assert item_from_dict(d2).payload.resolved_asset() == ("", "none")
+    assert item_from_dict(d2).payload.chosen_candidate() == {"source": "none"}
+
+
+def test_v2_plan_save_load_roundtrip_with_candidates(tmp_path):
+    """Полный план с кандидатами переживает save/load + идемпотентен."""
+    d = full_plan_dict()
+    d["items"][0]["payload"].update(
+        {"candidates": [_schematic_cand(), _diffusion_cand()], "selected": 1})
+    plan = EnrichPlan.from_dict(d)
+    p = tmp_path / "v2.enrich.json"
+    save_enrich(plan, p)
+    loaded = load_enrich(p)
+    assert loaded is not None
+    again = EnrichPlan.from_dict(loaded.to_dict()).to_dict()
+    assert again == plan.to_dict()
+    img = again["items"][0]["payload"]
+    assert len(img["candidates"]) == 2 and img["selected"] == 1
+    assert img["source"] == "diffusion"
+
+
+def test_v2_config_codegfx_defaults():
+    """config.render.codegfx — дефолты (codegfx_enabled=True, автопоиск Chrome)."""
+    from vpipe.config import Config
+    cg = Config().render.codegfx
+    assert cg.codegfx_enabled is True
+    assert cg.codegfx_chrome == ""               # пусто = автопоиск
+    assert cg.codegfx_style == "minimal"
+    assert cg.codegfx_size == "1920x1080"
+
+
+def test_v2_config_imagegen_diffusion_defaults():
+    """ImageGenCfg += cfg/candidates/vae (§5); старые поля цело."""
+    from vpipe.config import Config
+    ig = Config().render.imagegen
+    assert ig.imagegen_cfg == pytest.approx(1.5)
+    assert ig.imagegen_candidates == 4
+    assert ig.imagegen_vae == ""
+    # старые поля не сдвинуты
+    assert ig.imagegen_size == 768 and ig.imagegen_steps == 4
+    assert ig.imagegen_enabled is False

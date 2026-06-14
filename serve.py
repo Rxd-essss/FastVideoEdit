@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import logging
 import math
@@ -103,9 +104,13 @@ MUSIC_EXT = AUDIO_EXT | VIDEO_EXT
 # для /api/browse?kind=image — ровно те форматы, что индексирует match_user_assets.
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp"}
 # Extensions /api/output is allowed to serve — exactly the artifacts the pipeline
-# produces (rendered video, sidecar subs, chapters/metadata txt, NLE projects).
+# produces (rendered video, sidecar subs, chapters/metadata txt, NLE projects)
+# PLUS the V2 «Монтаж» enrich previews (code-graphic PNG from headless Chrome and
+# diffusion PNG from SD) — the UI shows the *real* rendered candidate, not a CSS
+# mock-up (MONTAGE_V2_PLAN §3), so the preview files must be servable by name.
 OUTPUT_EXT_ALLOWED = {".mp4", ".mov", ".mkv", ".webm", ".m4v",
-                      ".srt", ".vtt", ".ass", ".txt", ".edl", ".fcpxml", ".json"}
+                      ".srt", ".vtt", ".ass", ".txt", ".edl", ".fcpxml",
+                      ".json"} | IMAGE_EXT
 
 # P2-#5: allowed faster-whisper model names for the UI presets (quality↔speed
 # on an 8 GB card). A whitelist on the UI side — any other name -> 400. This is a
@@ -2509,6 +2514,30 @@ def export_nle(body: dict = Body(default={})):
             "format": fmt, "segments": len(kept)}
 
 
+def _enrich_preview_roots() -> set[Path]:
+    """V2 «Монтаж» preview roots for /api/output: the code-graphic cache
+    (``cache/codegfx``, written by ``_run_schematic_candidates`` /
+    ``codegfx.render``) and the diffusion cache (``cache/enrich_img``, written by
+    ``imagegen.generate_*``). Both writers root at ``Path("cache")`` (cwd) and the
+    configured ``cfg.paths.cache_dir`` is the same folder — we include both forms
+    so previews resolve regardless of how the server was launched. The
+    relative-path guard in ``output()`` still confines reads to these subdirs."""
+    bases: set[Path] = set()
+    try:
+        bases.add(Path(APP["cfg"].paths.cache_dir))
+    except Exception:  # noqa: BLE001 — no cfg yet -> fall back to cwd cache
+        pass
+    bases.add(Path("cache"))
+    roots: set[Path] = set()
+    for b in bases:
+        for sub in ("codegfx", "enrich_img"):
+            try:
+                roots.add((b / sub).resolve())
+            except Exception:  # noqa: BLE001
+                continue
+    return roots
+
+
 @app.get("/api/output/{name}")
 def output(name: str):
     # Serve from the editor's out dirs AND every queue job's out dir, so result
@@ -2528,6 +2557,10 @@ def output(name: str):
                 roots.add(Path(j.out_dir).resolve())
             except Exception:  # noqa: BLE001
                 continue
+    # V2 «Монтаж» honest previews live in the cache, not out_dir — add their
+    # roots so the candidate <img src=/api/output/<basename>> resolves to the
+    # real rendered PNG instead of a 404 (MONTAGE_V2_PLAN §3 «конец лажи»).
+    roots |= _enrich_preview_roots()
     # Only ever hand back files we actually produce. Without this an out_dir
     # pointed at a populated folder would let /api/output read ANY file there by
     # name (matters most if the server is bound to a non-loopback host).
@@ -3306,42 +3339,161 @@ def _wait_ollama_unloaded(s: Session, log, *, tries: int = 20,
         "продолжаю (sd-cli с --max-vram).")
 
 
+def _codegfx_cache_path(cache_root: Path, intent: str, style: str,
+                        fields: dict) -> Path:
+    """Детерминированный путь PNG код-схемы: cache/codegfx/<sha1>.png (intent+
+    style+fields). Один и тот же кандидат между прогонами/перерендерами =
+    мгновенно (как кэш SD)."""
+    blob = json.dumps({"i": intent, "s": style, "f": fields},
+                      sort_keys=True, ensure_ascii=False)
+    key = hashlib.sha1(blob.encode("utf-8")).hexdigest()
+    return (cache_root / "codegfx" / f"{key}.png").resolve()
+
+
+def _run_schematic_candidates(s: Session, items: list, log) -> int:
+    """Стадия images (часть 1, §2/§4): отрендерить ВСЕ schematic-кандидаты через
+    код-графику (codegfx.render.render_schematic, CPU/headless-Chrome, 0 VRAM —
+    можно ДО unload Ollama). Пишет ``asset_path``/``preview`` в кандидат (рендер
+    ролика берёт его через ImagePayload.resolved_asset()). codegfx-модуль —
+    домен другого агента; импорт ЗАЩИЩЁН (нет модуля/Chrome → кандидат остаётся
+    без PNG, UI покажет none/диффузию; задача НЕ падает). Возврат — число
+    отрендеренных schematic-кандидатов."""
+    cfg_cg = getattr(s.cfg.render, "codegfx", None)
+    if cfg_cg is not None and not getattr(cfg_cg, "codegfx_enabled", True):
+        return 0
+    # точки с хотя бы одним schematic-кандидатом
+    targets: list[tuple] = []          # (candidate dict, payload)
+    for it in items:
+        pl = getattr(it, "payload", None)
+        cands = getattr(pl, "candidates", None) if pl is not None else None
+        for c in (cands or []):
+            if isinstance(c, dict) and c.get("source") == "schematic" \
+                    and c.get("fields"):
+                targets.append((c, pl))
+    if not targets:
+        return 0
+    try:
+        from vpipe.codegfx.render import render_schematic
+    except Exception as e:  # noqa: BLE001 — codegfx ещё не готов / нет Chrome
+        log(f"  Код-схема: движок недоступен ({e}) — schematic-кандидаты без "
+            "превью (UI покажет none/диффузию).")
+        return 0
+    cache_root = Path("cache").resolve()
+    s.stage(f"Монтаж: код-схемы ({len(targets)})…")
+    made = 0
+    for c, _pl in targets:
+        intent = c.get("intent", "")
+        style = c.get("style", "minimal")
+        fields = c.get("fields") or {}
+        out_png = _codegfx_cache_path(cache_root, intent, style, fields)
+        try:
+            out_png.parent.mkdir(parents=True, exist_ok=True)
+            path = render_schematic(intent, fields, style, out_png,
+                                    cfg=cfg_cg, log=log)
+        except Exception as e:  # noqa: BLE001 — одна схема не валит остальные
+            log(f"  Код-схема «{intent}» упала ({e}).")
+            path = None
+        if path:
+            c["asset_path"] = str(path)
+            c["preview"] = str(path)
+            made += 1
+    return made
+
+
 def _run_enrich_images(s: Session, items: list, params: dict, log) -> int:
-    """Этап images (ТРЕК-2 §2): сгенерировать SD-картинки точкам, помеченным
-    маршрутизатором ``asset_kind="generate"``. Зовётся ПОСЛЕ детекторов и
-    ПЕРЕД планировщиком. Последовательность VRAM: unload Ollama -> ждём пустого
-    /api/ps -> пачка ``enrich_image_batch``. НЕ запускаем при image_source вне
-    {generate, auto} или если SD не настроен (точки с generate откатятся на
-    эмодзи в самом батче). Сбой этапа не валит задачу. Возврат — число
-    сгенерированных картинок."""
+    """Стадия images (MONTAGE_V2 §2/§4): сначала код-схемы (CPU, до unload),
+    потом диффузия фото-кандидатов (после unload Ollama, VRAM-менеджер §5).
+
+    Зовётся ПОСЛЕ детекторов/стадии кандидатов и ПЕРЕД планировщиком. Порядок:
+      1. ``_run_schematic_candidates`` — рендер schematic-кандидатов код-графикой
+         (0 VRAM, безопасно до выгрузки Ollama);
+      2. диффузия: для каждой photo-точки (выбранный diffusion-кандидат) гоним
+         N сидов (``generate_candidates``) → превью в кандидаты, выбранному —
+         asset_path. Только при image_source ∈ {generate, auto} И настроенном SD.
+    Сбой любой части не валит задачу. Возврат — число материализованных
+    (schematic + diffusion) ассетов."""
+    made = 0
+    try:
+        made += _run_schematic_candidates(s, items, log)
+    except Exception as e:  # noqa: BLE001 — код-схемы не валят задачу
+        log(f"enrich: стадия код-схем упала ({e}) — пропускаю")
+
     src = (params or {}).get("image_source", "auto")
-    if src not in ("generate", "auto"):
-        return 0
-    gen_pts = [it for it in items
-               if getattr(getattr(it, "payload", None), "asset_kind", None)
-               == "generate"]
-    if not gen_pts:
-        return 0
+    # diffusion-точки = выбранный кандидат source==diffusion (синхронизирован в
+    # плоский asset_kind="generate" этапом ассетов — но источник правды кандидат).
+    diff_pts = [it for it in items
+                if _has_diffusion_candidate(getattr(it, "payload", None))]
+    if src not in ("generate", "auto") or not diff_pts:
+        return made
     if not _sd_configured(s.cfg):
-        # Маршрутизатор пометил точки на генерацию, но SD не настроен — откат на
-        # эмодзи-фолбэк (батч сам это сделает по полю emoji), задача жива.
-        log("  SD не настроен (бинарь/модель) — эмодзи-фолбэк для "
-            f"{len(gen_pts)} картинок.")
-        imagegen_mod.enrich_image_batch(gen_pts, s.cfg.render.imagegen, log)
-        return 0
-    s.stage(f"Монтаж: генерация {len(gen_pts)} картинок (ИИ)…")
+        log("  SD не настроен (бинарь/модель) — фото-кандидаты без генерации "
+            f"({len(diff_pts)} шт., останутся none/эмодзи).")
+        return made
+    s.stage(f"Монтаж: генерация фото ({len(diff_pts)})…")
     _wait_ollama_unloaded(s, log)
     base = 1.0 - enrich_llm.PROGRESS_WEIGHTS["assets"]
-
-    def img_prog(frac: float) -> None:
-        s.set_progress(base + enrich_llm.PROGRESS_WEIGHTS["assets"] * frac)
-
+    n = len(diff_pts)
     try:
-        return imagegen_mod.enrich_image_batch(
-            gen_pts, s.cfg.render.imagegen, log, on_progress=img_prog)
+        for i, it in enumerate(diff_pts):
+            s.set_progress(base + enrich_llm.PROGRESS_WEIGHTS["assets"] * i / n)
+            made += _generate_point_candidates(it.payload, s.cfg.render.imagegen,
+                                               log)
+        s.set_progress(1.0 - enrich_llm.PROGRESS_WEIGHTS["assets"]
+                       + enrich_llm.PROGRESS_WEIGHTS["assets"])
     except Exception as e:  # noqa: BLE001 — сбойный SD-этап не валит задачу
-        log(f"enrich: этап генерации картинок упал ({e}) — эмодзи-фолбэк")
-        return 0
+        log(f"enrich: этап генерации фото упал ({e})")
+    return made
+
+
+def _has_diffusion_candidate(pl) -> bool:
+    """payload несёт хотя бы один diffusion-кандидат (V2) ИЛИ старый плоский
+    asset_kind=="generate" (обратная совместимость)."""
+    if pl is None:
+        return False
+    cands = getattr(pl, "candidates", None) or []
+    if any(isinstance(c, dict) and c.get("source") == "diffusion"
+           for c in cands):
+        return True
+    return getattr(pl, "asset_kind", None) == "generate"
+
+
+def _generate_point_candidates(pl, ig_cfg, log) -> int:
+    """Сгенерировать N=4 SD-кандидата всем diffusion-кандидатам одной точки и
+    записать превью в кандидаты; выбранному diffusion-кандидату — asset_path.
+    Старый плоский план (без candidates) — откат на enrich_image_batch ([pl]).
+    Возврат — 1 если выбранный visual материализовался, иначе 0."""
+    cands = getattr(pl, "candidates", None) or []
+    diff_idx = [i for i, c in enumerate(cands)
+                if isinstance(c, dict) and c.get("source") == "diffusion"]
+    if not diff_idx:                              # старый плоский путь
+        return imagegen_mod.enrich_image_batch([type("P", (), {"payload": pl})()],
+                                               ig_cfg, log)
+    sel = getattr(pl, "selected", 0)
+    materialized = 0
+    for i in diff_idx:
+        c = cands[i]
+        prompt = c.get("prompt") or ""
+        try:
+            paths = imagegen_mod.generate_candidates(prompt, ig_cfg, log=log)
+        except Exception as e:  # noqa: BLE001 — одна точка не валит остальные
+            log(f"  SD: фото-кандидат упал ({e}).")
+            paths = []
+        if paths:
+            c["asset_path"] = paths[0]
+            c["preview"] = paths[0]
+            # доп. сиды как отдельные diffusion-кандидаты (листание §3): добираем
+            # до потолка CANDIDATES_MAX, не дублируя.
+            for extra in paths[1:]:
+                if len(cands) >= enrich_mod.CANDIDATES_MAX:
+                    break
+                cands.append({"source": "diffusion", "prompt": prompt,
+                              "seed": -1, "asset_path": extra,
+                              "preview": extra})
+            if i == sel:
+                pl.asset_kind = "user"
+                pl.asset_path = paths[0]
+                materialized = 1
+    return materialized
 
 
 def _merge_enrich_user_state(s: Session, items: list) -> list:
@@ -3556,6 +3708,56 @@ def enrich_save(body: dict = Body(default={})):
     except OSError as e:
         raise HTTPException(500, f"Не удалось сохранить enrich.json: {e}")
     return {"ok": True, "items": updated}
+
+
+@app.post("/api/enrich/select")
+def enrich_select(body: dict = Body(default={})):
+    """Выбор кандидата визуала (MONTAGE_V2 §3): ``{id, idx}`` — поставить
+    ``payload.selected=idx`` точке-иллюстрации ``id`` (юзер листает кандидаты в
+    «Монтаже» и фиксирует лучший). Лёгкий целевой эндпоинт (НЕ ставит
+    ``edited=true`` — выбор кандидата это не правка содержимого, а назначение
+    одного из УЖЕ предложенных вариантов).
+
+    ``idx`` клампится в [0, len(candidates)-1] санитайзером ImagePayload. После
+    выбора плоские поля payload (asset_kind/asset_path/source) пересинхронизируем
+    под новый выбранный кандидат — рендер берёт ассет через resolved_asset().
+    Контракт для UI-агента. Нет плана / другой видео → 409; неизвестный id или
+    не-иллюстрация → 404; невалидный idx → 400."""
+    s = S()
+    _guard_no_task()
+    eid = body.get("id")
+    idx = body.get("idx")
+    if not isinstance(eid, str) or not eid:
+        raise HTTPException(400, "id обязателен (строка)")
+    if isinstance(idx, bool) or not isinstance(idx, int) or idx < 0:
+        raise HTTPException(400, "idx: ожидается неотрицательное целое")
+
+    plan = enrich_mod.load_enrich(_enrich_json_path(s))
+    if plan is None:
+        raise HTTPException(409, "План обогащения не найден")
+    if plan.hash != s.audio_hash:
+        raise HTTPException(409, "enrich.json от другого видео")
+
+    target = next((it for it in plan.items if it.id == eid), None)
+    if target is None or target.type != enrich_mod.ENR_IMAGE:
+        raise HTTPException(404, f"Точка-иллюстрация {eid} не найдена")
+    cands = getattr(target.payload, "candidates", None) or []
+    if not cands:
+        raise HTTPException(400, "У точки нет кандидатов для выбора")
+    if idx >= len(cands):
+        raise HTTPException(400, f"idx {idx} вне диапазона (кандидатов "
+                                 f"{len(cands)})")
+    # Меняем selected и пересобираем item через санитайзер (клампы/синк source).
+    d = target.payload.to_dict()
+    d["selected"] = idx
+    new_pl = enrich_mod.ImagePayload.sanitize(d)
+    target.payload = new_pl
+    try:
+        enrich_mod.save_enrich(plan, _enrich_json_path(s))
+    except OSError as e:
+        raise HTTPException(500, f"Не удалось сохранить enrich.json: {e}")
+    return {"ok": True, "id": eid, "selected": new_pl.selected,
+            "source": new_pl.source}
 
 
 def _render_clip_job(s: Session, *, start: float, end: float, idx: int,

@@ -89,7 +89,10 @@ const st = {
   enrichCutlistChanged: false,  // мягкий баннер «вырезы изменились»
   enrichStale: false,      // план от другого аудио (hash) — лента пуста
   _enrPreviewEnd: null,    // ▶-превью предложения: авто-стоп оверлея на этом orig-времени
-  _enrPreviewItem: null,   // предложение, чей мокап сейчас лежит поверх плеера
+  _enrPreviewItem: null,   // предложение, чей кадр-превью сейчас лежит поверх плеера
+  // ТРЕК-2 V2 (§3): индекс листаемого кандидата В СТРИПЕ (НЕ сохранённый выбор) —
+  // визуальное окно прокрутки мини-превью; сохранённый выбор живёт в visual.chosen.
+  enrichCandPage: {},      // id предложения -> индекс первого видимого кандидата в стрипе
 }
 const UNDO_CAP = 50
 const undoStack = [], redoStack = []
@@ -3250,8 +3253,9 @@ function enrThumbPump() {
   } catch { done(false) }
 }
 
-// Карточка предложения (гибрид clipCard + cut-row): слева превью+мокап, справа
-// бейдж типа, таймкод, цитата, «почему», score, контролы.
+// Карточка предложения (гибрид clipCard + cut-row): слева СТРИП кандидатов
+// (реальные мини-превью), справа бейдж типа, таймкод, цитата, «почему», score,
+// контролы. CSS-мокап удалён — превью только из реальных ассетов движков.
 function enrichCard(it) {
   const g = ENR_GROUP(it.type)
   const cls = ENR_GROUP_CLASS[g]
@@ -3260,14 +3264,8 @@ function enrichCard(it) {
   row.className = 'enr-row ' + cls + (it.enabled ? '' : ' off') + (st.enrichActive === it.id ? ' sel' : '')
   row.dataset.id = it.id
 
-  // --- слева: превью кадра + CSS-мокап оверлея ---
-  const prevWrap = document.createElement('div'); prevWrap.className = 'enrPrev'
-  const thumb = document.createElement('div'); thumb.className = 'enrThumb'
-  thumb.dataset.t = String(it.t_start || 0)
-  thumb.appendChild(enrichMockup(it))   // позиционированный мокап поверх кадра
-  const badgeMk = document.createElement('span'); badgeMk.className = 'enrPrevTag'
-  badgeMk.textContent = 'превью-макет'
-  prevWrap.appendChild(thumb); prevWrap.appendChild(badgeMk)
+  // --- слева: стрип кандидатов (РЕАЛЬНЫЕ мини-превью, не CSS-мокап) ---
+  const prevWrap = enrichCandStrip(it)
 
   // --- справа: метаданные ---
   const meta = document.createElement('div'); meta.className = 'enrMeta'
@@ -3345,68 +3343,246 @@ function enrichCard(it) {
   return row
 }
 
-// CSS-мокап оверлея поверх кадра (позиционированный div в стиле рендера).
-function enrichMockup(it) {
-  const m = document.createElement('div'); m.className = 'enrMock'
-  const p = it.payload || {}
-  if (it.type === 'image' || it.type === 'animation') {
-    const pip = document.createElement('div')
-    pip.className = 'enrMockPip ' + (p.position === 'top_left' ? 'tl' : 'tr')
-    pip.style.width = Math.round((p.width_frac || 0.3) * 100) + '%'
-    pip.textContent = enrichAssetGlyph(p)
-    m.appendChild(pip)
-  } else if (it.type === 'list_card') {
-    const scrim = document.createElement('div'); scrim.className = 'enrMockScrim'
-    if (p.title) { const ti = document.createElement('div'); ti.className = 'enrMockTitle'; ti.textContent = p.title; scrim.appendChild(ti) }
-    const ul = document.createElement('div'); ul.className = 'enrMockItems'
-    const items = (p.items || []).slice(0, 5)
-    // По умолчанию активен последний пункт (как в эталонном кадре): нумерация
-    // 1/2/3, активный пункт — белый со «акцентным» оранжевым номером, остальные
-    // приглушены. Активный пункт во время ▶-превью обновляется по timeupdate.
-    const active = items.length ? items.length - 1 : -1
-    items.forEach((li, i) => {
-      const row = document.createElement('div'); row.className = 'enrMockItem'
-      if (i === active) row.classList.add('on')
-      const num = document.createElement('span'); num.className = 'enrMockNum'; num.textContent = String(i + 1)
-      const txt = document.createElement('span'); txt.className = 'enrMockItemTxt'; txt.textContent = li.text || ''
-      row.appendChild(num); row.appendChild(txt)
-      ul.appendChild(row)
-    })
-    scrim.appendChild(ul); m.appendChild(scrim)
-  } else if (it.type === 'cta_comment') {
-    const bubble = document.createElement('div'); bubble.className = 'enrMockCta enrMockBubble'
-    bubble.textContent = '💬 ' + (p.question || 'Вопрос в комментарии')
-    m.appendChild(bubble)
-  } else {  // cta_subscribe / cta_like
-    const badge = document.createElement('div'); badge.className = 'enrMockCta enrMockBadge'
-    badge.textContent = it.type === 'cta_like' ? '👍 Лайк' : '🔔 Подпишись + 👍'
-    m.appendChild(badge)
-  }
-  return m
+/* ==================================================================
+   ТРЕК-2 V2 (§3, §6) — кандидаты + ЧЕСТНОЕ превью.
+   CSS-мокап удалён («конец лажи»): превью карточки = РЕАЛЬНЫЙ кадр.
+   - schematic: PNG от headless-Chromium (visual.candidates[].preview);
+   - diffusion: реальный SD-PNG (visual.candidates[].preview);
+   - нет ассета (none) — честная пустая плитка «нечего иллюстрировать»,
+     лучше пусто, чем слоп.
+   Источник кандидатов: payload.visual (новая схема §6). Если бэкенд ещё
+   не отдаёт visual — клиент строит «шим» из плоского payload, чтобы
+   старые планы рендерились как раньше (аддитивная совместимость).
+   ================================================================== */
+
+// Подписи источника визуала (честная подпись «схема/фото/сток/нет»).
+const ENR_SRC_RU = {
+  schematic: 'схема', diffusion: 'фото (ИИ)', stock: 'сток',
+  kinetic: 'текст', icon: 'значок', none: 'нет',
+}
+// Темы схематического движка (§2.4): подпись + дефолтный порядок миниатюр.
+const ENR_THEMES = ['minimal', 'neon', 'business', 'whiteboard']
+const ENR_THEME_RU = { minimal: 'minimal', neon: 'neon', business: 'business', whiteboard: 'whiteboard' }
+// Тип схемы (intent) → русская подпись (таксономия §2.3).
+const ENR_INTENT_RU = {
+  stat: 'статистика', tree: 'дерево', list: 'список', timeline: 'таймлайн',
+  compare: 'сравнение', process: 'шаги', quote: 'цитата', code: 'код',
+  map: 'карта', callout: 'выноска',
 }
 
-// Глиф ассета для мокапа: эмодзи (если есть), иначе иконка-плейсхолдер.
-function enrichAssetGlyph(p) {
-  if (p.asset_kind === 'emoji' && p.emoji) return enrichEmojiChar(p.emoji)
-  if (p.asset_kind === 'user' && p.asset_path) return '🖼'
-  return '🖼'
+// Нормализованный объект visual для предложения. Берём payload.visual как
+// источник истины (§6). Если его нет (бэкенд ещё на старой схеме) — строим
+// клиентский шим из плоского payload, БЕЗ выдумывания превью: candidates даём
+// только когда у точки реально есть готовый ассет (asset_path).
+function enrichVisual(it) {
+  const p = it.payload || {}
+  if (p.visual && typeof p.visual === 'object') {
+    const v = p.visual
+    const cands = Array.isArray(v.candidates) ? v.candidates.filter((c) => c && (c.preview || c.id != null)) : []
+    return {
+      source: v.source || 'none',
+      intent: v.intent || null,
+      candidates: cands,
+      chosen: Number.isInteger(v.chosen) ? Math.max(0, Math.min(v.chosen, Math.max(0, cands.length - 1))) : 0,
+      schematic_style: v.schematic_style || v.style || null,
+    }
+  }
+  // --- шим из легаси-payload (asset_kind/asset_path) ---
+  let source = 'none'
+  if (p.asset_kind === 'generate') source = 'diffusion'
+  else if (p.asset_kind === 'user') source = 'stock'
+  else if (p.asset_kind === 'emoji') source = 'icon'
+  const cands = []
+  if (p.asset_path && (p.asset_kind === 'generate' || p.asset_kind === 'user')) {
+    cands.push({ kind: source === 'diffusion' ? 'seed' : 'asset', id: 0, preview: p.asset_path })
+  }
+  return { source, intent: null, candidates: cands, chosen: 0, schematic_style: null }
 }
-// noto-имя «u1f5c3» / «u1f5c3_uXXXX» → юникод-символ (best-effort для мокапа).
-function enrichEmojiChar(name) {
-  try {
-    const cps = String(name).split('_').map((s) => s.replace(/^u/i, '')).filter(Boolean)
-      .map((h) => parseInt(h, 16)).filter((n) => Number.isFinite(n))
-    if (cps.length) return String.fromCodePoint(...cps)
-  } catch {}
-  return '🖼'
+
+// Превью-URL кандидата → src для <img>. Бэкенд кладёт относительное имя ассета,
+// которое отдаёт /api/output (как у клипов/рендера). Абсолютные http(s)/data —
+// как есть; иначе — через /api/output/<basename>.
+function enrichPreviewSrc(preview) {
+  if (!preview) return ''
+  const s = String(preview)
+  if (/^(https?:|data:|blob:|\/api\/)/i.test(s)) return s
+  const base = s.split(/[\\/]/).pop()
+  return '/api/output/' + encodeURIComponent(base) + (st.cb || '')
+}
+
+// Стрип кандидатов слева в карточке: мини-превью 2-4 вариантов (РЕАЛЬНЫЕ PNG),
+// листание ←/→, клик = выбор (chosen), подпись источника + (для схемы) тип.
+function enrichCandStrip(it) {
+  const v = enrichVisual(it)
+  const wrap = document.createElement('div'); wrap.className = 'enrPrev'
+  const stripBox = document.createElement('div'); stripBox.className = 'enrStrip'
+
+  if (!v.candidates.length) {
+    // Честно пусто: нет готового ассета. Для schematic/diffusion с ещё не
+    // отрендеренными кандидатами показываем «кадр из видео» как контекст-фон +
+    // подпись, что вариант ещё не готов. Для none — «нечего иллюстрировать».
+    const tile = document.createElement('div'); tile.className = 'enrCandTile empty'
+    if (v.source === 'none') {
+      tile.classList.add('none')
+      tile.innerHTML = '<div class="enrCandNone">' + icon('image') + '<span>нечего иллюстрировать</span></div>'
+    } else {
+      // кадр видео как контекст (ленивый грабер), подпись «вариант не готов».
+      const f = document.createElement('div'); f.className = 'enrThumb'; f.dataset.t = String(it.t_start || 0)
+      tile.appendChild(f)
+      const note = document.createElement('span'); note.className = 'enrCandPending'; note.textContent = 'вариант не готов'
+      tile.appendChild(note)
+    }
+    stripBox.appendChild(tile)
+    wrap.appendChild(stripBox)
+    wrap.appendChild(enrichSrcCaption(it, v))
+    return wrap
+  }
+
+  // Окно из ≤2 видимых превью + кнопки листания, если кандидатов больше.
+  const VIS = 2
+  const n = v.candidates.length
+  let page = st.enrichCandPage[it.id]
+  if (!Number.isInteger(page)) page = Math.max(0, Math.min(v.chosen, Math.max(0, n - VIS)))
+  page = Math.max(0, Math.min(page, Math.max(0, n - VIS)))
+  st.enrichCandPage[it.id] = page
+
+  const row = document.createElement('div'); row.className = 'enrCandRow'
+  if (n > VIS) {
+    const prev = document.createElement('button'); prev.className = 'enrCandNav'
+    prev.innerHTML = icon('prev-cut'); prev.title = 'Предыдущие варианты'; prev.setAttribute('aria-label', 'Предыдущие варианты')
+    prev.disabled = page <= 0
+    prev.onclick = (e) => { e.stopPropagation(); st.enrichCandPage[it.id] = Math.max(0, page - 1); renderEnrich({ silent: true }) }
+    row.appendChild(prev)
+  }
+  const list = document.createElement('div'); list.className = 'enrCandList'
+  for (let i = page; i < Math.min(n, page + VIS); i++) {
+    list.appendChild(enrichCandTile(it, v, i))
+  }
+  row.appendChild(list)
+  if (n > VIS) {
+    const next = document.createElement('button'); next.className = 'enrCandNav'
+    next.innerHTML = icon('next-cut'); next.title = 'Следующие варианты'; next.setAttribute('aria-label', 'Следующие варианты')
+    next.disabled = page >= n - VIS
+    next.onclick = (e) => { e.stopPropagation(); st.enrichCandPage[it.id] = Math.min(n - VIS, page + 1); renderEnrich({ silent: true }) }
+    row.appendChild(next)
+  }
+  stripBox.appendChild(row)
+  // Счётчик «вариант k/n».
+  if (n > 1) {
+    const cnt = document.createElement('div'); cnt.className = 'enrCandCount muted'
+    cnt.textContent = `вариант ${v.chosen + 1}/${n}`
+    stripBox.appendChild(cnt)
+  }
+  wrap.appendChild(stripBox)
+  wrap.appendChild(enrichSrcCaption(it, v))
+  return wrap
+}
+
+// Одна плитка кандидата: РЕАЛЬНЫЙ <img> превью, рамка-выбор у chosen, клик = выбор.
+function enrichCandTile(it, v, idx) {
+  const c = v.candidates[idx] || {}
+  const tile = document.createElement('button'); tile.type = 'button'
+  tile.className = 'enrCandTile' + (idx === v.chosen ? ' chosen' : '')
+  tile.setAttribute('aria-pressed', String(idx === v.chosen))
+  const src = enrichPreviewSrc(c.preview)
+  if (src) {
+    const img = document.createElement('img'); img.className = 'enrCandImg'; img.loading = 'lazy'
+    img.alt = (c.kind === 'theme' ? (ENR_THEME_RU[c.id] || 'тема') : 'вариант ' + (idx + 1))
+    img.src = src
+    // Битый/неотданный ассет — честный плейсхолдер, без молчаливой «дыры».
+    img.onerror = () => { img.remove(); tile.classList.add('broken'); tile.innerHTML = icon('image') }
+    tile.appendChild(img)
+  } else {
+    tile.classList.add('broken'); tile.innerHTML = icon('image')
+  }
+  // Метка темы (для schematic) — какой стиль на этом кандидате.
+  if (c.kind === 'theme' && c.id) {
+    const tag = document.createElement('span'); tag.className = 'enrCandTag'; tag.textContent = ENR_THEME_RU[c.id] || c.id
+    tile.appendChild(tag)
+  }
+  if (idx === v.chosen) { const ch = document.createElement('span'); ch.className = 'enrCandCheck'; ch.innerHTML = icon('check'); tile.appendChild(ch) }
+  tile.title = (idx === v.chosen ? 'Выбран' : 'Выбрать этот вариант')
+  tile.onclick = (e) => { e.stopPropagation(); enrichChooseCandidate(it.id, idx) }
+  return tile
+}
+
+// Подпись источника визуала под стрипом («схема · сравнение», «фото (ИИ)», «нет»).
+function enrichSrcCaption(it, v) {
+  const cap = document.createElement('div'); cap.className = 'enrSrcCap'
+  const dot = document.createElement('span'); dot.className = 'enrSrcDot src-' + v.source
+  const label = document.createElement('span'); label.className = 'enrSrcLbl'
+  let txt = ENR_SRC_RU[v.source] || v.source
+  if (v.source === 'schematic' && v.intent) txt += ' · ' + (ENR_INTENT_RU[v.intent] || v.intent)
+  label.textContent = txt
+  cap.appendChild(dot); cap.appendChild(label)
+  return cap
+}
+
+// Выбор кандидата: сохраняем visual.chosen (+ финальный asset_path = chosen).
+// Контракт выбора неясен (бэкенд ещё на старой схеме) — реализуем через
+// существующий POST /api/enrich/save полем payload.visual.chosen; см. отчёт.
+function enrichChooseCandidate(id, idx) {
+  const it = enrichLocal(id); if (!it) return
+  const v = enrichVisual(it)
+  if (idx < 0 || idx >= v.candidates.length || idx === v.chosen) return
+  const chosen = v.candidates[idx] || {}
+  // Полный visual (с candidates) — бэкенд мержит payload ПЛОСКО, потому шлём весь
+  // объект, чтобы не потерять список кандидатов при сохранении.
+  const visual = { ...(it.payload && it.payload.visual ? it.payload.visual : {}),
+    source: v.source, candidates: v.candidates, chosen: idx }
+  if (chosen.preview) visual.asset_path = chosen.preview
+  if (chosen.kind === 'theme' && chosen.id) visual.schematic_style = chosen.id
+  it.payload = { ...(it.payload || {}), visual }
+  // Легаси-щит: текущий render.py читает payload.asset_path — пусть выбранный
+  // кандидат уходит в рендер и на старом бэкенде (для diffusion/stock-ассетов).
+  const patch = { visual }
+  if (chosen.preview && (v.source === 'diffusion' || v.source === 'stock')) {
+    it.payload.asset_path = chosen.preview; patch.asset_path = chosen.preview
+  }
+  // Стрип следует за выбором (окно прокрутки центрируется на выбранном).
+  st.enrichCandPage[id] = Math.max(0, Math.min(idx, Math.max(0, v.candidates.length - 2)))
+  enrichQueueSave(id, { payload: patch })
+  renderEnrich({ silent: true })
+}
+
+// Кнопки смены СТИЛЯ схемы (§2.4: minimal/neon/business/whiteboard). Выбор темы =
+// переключение готового кандидата-темы, если он есть (мгновенно, без перерендера),
+// иначе — запрос перерисовки через save (schematic_style); бэкенд дорендерит.
+function enrichStyleSwitch(it, v) {
+  const wrap = document.createElement('div'); wrap.className = 'enrEdit enrStyleEdit'
+  const lbl = document.createElement('div'); lbl.className = 'enrEditLbl muted'
+  lbl.textContent = 'Стиль схемы' + (v.intent ? ` (${ENR_INTENT_RU[v.intent] || v.intent})` : '')
+  wrap.appendChild(lbl)
+  const cur = v.schematic_style || (v.candidates[v.chosen] && v.candidates[v.chosen].id) || 'minimal'
+  const rowEl = document.createElement('div'); rowEl.className = 'enrStyleBtns' + ' ' + 'enrStyleBtns--' + cur
+  for (const th of ENR_THEMES) {
+    const b = document.createElement('button'); b.type = 'button'
+    b.className = 'enrStyleBtn st-' + th + (th === cur ? ' active' : '')
+    b.textContent = ENR_THEME_RU[th]
+    b.setAttribute('aria-pressed', String(th === cur))
+    b.title = 'Стиль ' + th
+    b.onclick = (e) => { e.stopPropagation(); enrichSetStyle(it.id, th) }
+    rowEl.appendChild(b)
+  }
+  wrap.appendChild(rowEl)
+  return wrap
 }
 
 // Редакторы текста по типу (раскрываемая секция «изменить» под мета).
 function enrichEditors(it) {
   const p = it.payload || {}
+  const v = enrichVisual(it)
   if (it.type === 'list_card') {
     const wrap = document.createElement('div'); wrap.className = 'enrEdit'
-    const lbl = document.createElement('div'); lbl.className = 'enrEditLbl muted'; lbl.textContent = 'Пункты карточки'
+    // Заголовок карточки (§3 «редактирование полей: заголовок, строки»).
+    const tlbl = document.createElement('div'); tlbl.className = 'enrEditLbl muted'; tlbl.textContent = 'Заголовок'
+    const tin = document.createElement('input'); tin.type = 'text'; tin.className = 'search enrItemInput'
+    tin.value = p.title || ''; tin.maxLength = 48; tin.placeholder = 'без заголовка'
+    tin.setAttribute('aria-label', 'Заголовок карточки')
+    tin.onclick = (e) => e.stopPropagation()
+    tin.onchange = () => enrichEditPayload(it.id, { title: tin.value.trim() })
+    wrap.appendChild(tlbl); wrap.appendChild(tin)
+    const lbl = document.createElement('div'); lbl.className = 'enrEditLbl muted'; lbl.textContent = 'Пункты / строки'
     wrap.appendChild(lbl)
     ;(p.items || []).forEach((li, i) => {
       const inp = document.createElement('input'); inp.type = 'text'; inp.className = 'search enrItemInput'
@@ -3416,6 +3592,9 @@ function enrichEditors(it) {
       inp.onchange = () => enrichEditCardItem(it.id, i, inp.value)
       wrap.appendChild(inp)
     })
+    // Карточка-перечисление может рендериться схематическим движком —
+    // тогда показываем переключатель стиля темы.
+    if (v.source === 'schematic') wrap.appendChild(enrichStyleSwitch(it, v))
     return wrap
   }
   if (it.type === 'cta_comment') {
@@ -3431,11 +3610,16 @@ function enrichEditors(it) {
   }
   if (it.type === 'image' || it.type === 'animation') {
     const wrap = document.createElement('div'); wrap.className = 'enrEdit'
-    const lbl = document.createElement('div'); lbl.className = 'enrEditLbl muted'; lbl.textContent = 'Ассет'
+    // schematic-картинка (код-схема) — переключатель стиля темы, не путь к файлу.
+    if (v.source === 'schematic') { wrap.appendChild(enrichStyleSwitch(it, v)); return wrap }
+    // Прочие источники (фото-сцена ИИ / сток / своя картинка) — ручная замена
+    // ассета своим файлом. Эмодзи-слоп как иллюстрация убран: только реальный
+    // путь к картинке (значки-эмодзи живут отдельным источником icon).
+    const lbl = document.createElement('div'); lbl.className = 'enrEditLbl muted'; lbl.textContent = 'Своя картинка'
     const row = document.createElement('div'); row.className = 'routrow'
     const inp = document.createElement('input'); inp.type = 'text'; inp.className = 'search'
-    inp.placeholder = 'путь к картинке или имя эмодзи (например u1f5c3)'
-    inp.value = p.asset_kind === 'emoji' ? (p.emoji || '') : (p.asset_path || '')
+    inp.placeholder = 'путь к картинке (png, jpg, webp)'
+    inp.value = (p.asset_kind === 'user' || p.asset_kind === 'generate') ? (p.asset_path || '') : ''
     inp.onclick = (e) => e.stopPropagation()
     inp.onchange = () => enrichSetAsset(it.id, inp.value.trim())
     const browse = document.createElement('button'); browse.className = 'btn'
@@ -3445,19 +3629,36 @@ function enrichEditors(it) {
       e.stopPropagation()
       // Серверный пикер показывает папки (файлы-изображения он не индексирует) —
       // подставляем путь папки с разделителем, юзер дописывает имя файла и Enter
-      // сохраняет (onchange инпута). Эмодзи задаётся именем uXXXX тем же полем.
+      // сохраняет (onchange инпута).
       openFiles(true, (dir) => { if (dir) { inp.value = dir.replace(/[\\/]+$/, '') + '\\'; inp.focus() } })
     }
     row.appendChild(inp); row.appendChild(browse)
     wrap.appendChild(lbl); wrap.appendChild(row)
     const hint = document.createElement('div'); hint.className = 'hint muted'
-    hint.textContent = p.asset_kind === 'none'
-      ? 'Ассет не подобран — впишите полный путь к картинке или имя эмодзи (uXXXX), затем Enter.'
-      : 'Полный путь к картинке или имя эмодзи (например u1f5c3). Enter — сохранить.'
+    hint.textContent = v.source === 'none'
+      ? 'Ассет не подобран. Перезапустите «Предложить монтаж» или впишите свой путь к картинке (Enter).'
+      : 'Полный путь к своей картинке — заменит выбранный вариант. Enter — сохранить.'
     wrap.appendChild(hint)
     return wrap
   }
   return null
+}
+
+// Сменить стиль схемы: если есть готовый кандидат этой темы — просто выбрать его
+// (мгновенно). Иначе записать желаемый schematic_style — бэкенд дорендерит при
+// следующем проходе/рендере (контракт перерисовки см. отчёт).
+function enrichSetStyle(id, theme) {
+  const it = enrichLocal(id); if (!it) return
+  const v = enrichVisual(it)
+  const idx = v.candidates.findIndex((c) => c.kind === 'theme' && c.id === theme)
+  if (idx >= 0) { enrichChooseCandidate(id, idx); return }
+  // Полный visual (плоский мерж payload на бэкенде) — не теряем candidates.
+  const visual = { ...(it.payload && it.payload.visual ? it.payload.visual : {}),
+    source: v.source || 'schematic', candidates: v.candidates, chosen: v.chosen, schematic_style: theme }
+  it.payload = { ...(it.payload || {}), visual }
+  enrichQueueSave(id, { payload: { visual } })
+  toast('Стиль «' + theme + '» применится при следующем рендере схемы', 'info')
+  renderEnrich({ silent: true })
 }
 
 // --- мутации + save ---------------------------------------------------------
@@ -3540,13 +3741,20 @@ function enrichEditPayload(id, patch) {
   renderEnrich({ silent: true })
 }
 
-// «Заменить ассет»: эмодзи-имя (uXXXX) → asset_kind=emoji; путь → asset_kind=user.
+// «Заменить ассет» своей картинкой: путь → asset_kind=user (источник stock).
+// Эмодзи-как-иллюстрация убран (§1: значки только для явного icon, не фолбэк).
+// Также синхронизируем payload.visual, чтобы превью/выбор показали свой файл.
 function enrichSetAsset(id, val) {
   const it = enrichLocal(id); if (!it) return
   let patch
-  if (!val) patch = { asset_kind: 'none', asset_path: '', emoji: '' }
-  else if (/^u[0-9a-f]{4,6}(_u[0-9a-f]{4,6})*$/i.test(val)) patch = { asset_kind: 'emoji', emoji: val, asset_path: '' }
-  else patch = { asset_kind: 'user', asset_path: val, emoji: '' }
+  if (!val) {
+    patch = { asset_kind: 'none', asset_path: '', emoji: '', visual: { source: 'none', candidates: [], chosen: 0, asset_path: '' } }
+  } else {
+    patch = {
+      asset_kind: 'user', asset_path: val, emoji: '',
+      visual: { source: 'stock', candidates: [{ kind: 'asset', id: 0, preview: val }], chosen: 0, asset_path: val },
+    }
+  }
   enrichEditPayload(id, patch)
 }
 
@@ -3575,8 +3783,10 @@ function enrichToggleActive() {
 }
 function enrichPreviewActive() { const it = enrichLocal(st.enrichActive); if (it) enrichPreview(it) }
 
-// ▶ превью предложения: мокап поверх ОСНОВНОГО плеера + seek+play на окно
-// предложения, авто-стоп на t_end (clipsPreview-паттерн).
+// ▶ ЧЕСТНОЕ превью предложения (§3): РЕАЛЬНЫЙ кадр выбранного кандидата
+// (отрендеренный PNG schematic/diffusion) поверх ОСНОВНОГО плеера + seek+play
+// на окно предложения, авто-стоп на t_end (clipsPreview-паттерн). CSS-мокап
+// удалён — превью = тот же ассет, что уйдёт в рендер.
 function enrichPreview(it) {
   if (!video) return
   enrichSetActive(it.id)
@@ -3589,30 +3799,42 @@ function enrichPreview(it) {
   seek(Math.max(0, (it.t_start || 0)))
   video.play()
 }
+// Оверлей-превью = РЕАЛЬНЫЙ PNG выбранного кандидата (или честная плашка «нет
+// ассета», если иллюстрировать нечего). Позиционирование PiP — по payload
+// (как в рендере: угол + ширина); полнокадровые схемы — на весь оверлей.
 function enrichShowOverlay(it) {
   const el = $('#enrichOverlay'); if (!el) return
-  el.replaceChildren(enrichMockup(it))
+  el.replaceChildren()
+  const v = enrichVisual(it)
+  const chosen = v.candidates[v.chosen] || v.candidates[0]
+  const src = chosen ? enrichPreviewSrc(chosen.preview) : ''
+  if (!src) {
+    // Лучше честно «нет», чем CSS-мокап-лажа.
+    const none = document.createElement('div'); none.className = 'enrOverNone'
+    none.innerHTML = icon('image') + '<span>' + (v.source === 'none' ? 'нечего иллюстрировать' : 'вариант ещё не готов — нажмите «Предложить монтаж»') + '</span>'
+    el.appendChild(none)
+    el.classList.remove('hidden')
+    return
+  }
+  const p = it.payload || {}
+  const img = document.createElement('img'); img.className = 'enrOverImg'
+  img.src = src; img.alt = 'Превью кадра'
+  img.onerror = () => { img.remove(); const n = document.createElement('div'); n.className = 'enrOverNone'; n.innerHTML = icon('image') + '<span>ассет недоступен</span>'; el.appendChild(n) }
+  // image/animation = PiP в углу; list_card/схемы = крупно (cut-out со сдвигом
+  // вправо под talking-head слева, как в эталонных кадрах §2).
+  if (it.type === 'image' || it.type === 'animation') {
+    img.classList.add('pip')
+    img.classList.add(p.position === 'top_left' ? 'tl' : 'tr')
+    img.style.width = Math.round((p.width_frac || 0.3) * 100) + '%'
+  } else {
+    img.classList.add('full')
+  }
+  el.appendChild(img)
   el.classList.remove('hidden')
 }
-// «Мягкое караоке списком» в ▶-превью: по orig-времени t подсвечивает последний
-// уже произнесённый пункт (t_word) карточки поверх плеера — пункты «появляются»
-// один за другим, как в финальном рендере (§6 «появление пунктов по timeupdate»).
-function enrichUpdateOverlayKaraoke(t) {
-  const it = st._enrPreviewItem
-  if (!it || it.type !== 'list_card') return
-  const el = $('#enrichOverlay'); if (!el || el.classList.contains('hidden')) return
-  const rows = el.querySelectorAll('.enrMockItem'); if (!rows.length) return
-  const items = (it.payload && it.payload.items) || []
-  let active = -1
-  for (let i = 0; i < rows.length; i++) {
-    const tw = items[i] && Number(items[i].t_word)
-    if (Number.isFinite(tw) && t >= tw) active = i
-  }
-  rows.forEach((r, i) => {
-    r.classList.toggle('on', i === active)
-    r.classList.toggle('pending', active >= 0 && i > active)  // ещё не произнесён — скрыт
-  })
-}
+// V2: превью = готовый PNG (текст/пункты уже впечатаны движком), CSS-караоке
+// больше не нужно. Хук оставлен пустым для совместимости вызова из onFrame.
+function enrichUpdateOverlayKaraoke() { /* honest PNG preview — no CSS karaoke */ }
 function enrichHideOverlay() {
   const el = $('#enrichOverlay'); if (el) { el.classList.add('hidden'); el.replaceChildren() }
   st._enrPreviewItem = null; st._enrPreviewEnd = null
@@ -3669,22 +3891,53 @@ function seedEnrichModal() {
   $('#enType_list_card').checked = types.list_card !== false
   $('#enType_cta').checked = types.cta !== false
   $('#enDensity').value = ['min', 'normal', 'aggressive'].includes(o.density) ? o.density : 'normal'
-  const src = ['auto', 'generate', 'emoji', 'user_folder'].includes(o.image_source) ? o.image_source : 'auto'
-  $('#enImageSource').value = src
+  // V2-движки: предпочитаем новое поле o.sources; для старых params восстанавливаем
+  // из легаси image_source (auto→авто-роутер; generate→схемы+фото; user_folder→сток).
+  const srcs = (o.sources && typeof o.sources === 'object') ? o.sources : null
+  const legacy = o.image_source
+  const auto = srcs ? srcs.auto !== false : (legacy === 'auto' || legacy == null)
+  $('#enSrcAuto').checked = auto
+  $('#enSrcSchematic').checked = srcs ? srcs.schematic !== false : (legacy !== 'user_folder')
+  $('#enSrcDiffusion').checked = srcs ? !!srcs.diffusion : (legacy === 'auto' || legacy === 'generate' || legacy == null)
+  $('#enSrcStock').checked = srcs ? !!srcs.stock : (legacy === 'user_folder')
   $('#enUserFolder').value = o.user_folder || ''
   enrichToggleUserFolder()
   const off = !st.llmReady
   $('#enrichModalLlm').classList.toggle('hidden', !off)
   $('#btnEnrichRun').disabled = off
 }
+// Состояние источников из чекбоксов модалки (с учётом авто-роутера).
+function enrichSourcesState() {
+  const auto = $('#enSrcAuto').checked
+  // В авто-режиме движки управляются роутером, но чекбоксы остаются как «разрешения».
+  return {
+    auto,
+    schematic: $('#enSrcSchematic').checked,
+    diffusion: $('#enSrcDiffusion').checked,
+    stock: $('#enSrcStock').checked,
+  }
+}
 function enrichToggleUserFolder() {
-  const src = $('#enImageSource').value
-  $('#enUserFolderRow').classList.toggle('hidden', src !== 'user_folder')
-  // ТРЕК-2 §2: источники с SD-генерацией (auto/generate) показывают инфо про
-  // ~4 ГБ модель и время; если SD не настроена — warning про эмодзи-фолбэк.
-  const usesGen = src === 'auto' || src === 'generate'
+  const s = enrichSourcesState()
+  // Под-набор движков активен и читаем всегда, но в авто-режиме это лишь «разрешения».
+  $('#enSrcSub').classList.toggle('autoOn', s.auto)
+  // Папка-сток показывается, когда сток разрешён.
+  $('#enUserFolderRow').classList.toggle('hidden', !s.stock)
+  // Движок фото-сцен (диффузия) разрешён → инфо про ~4 ГБ модель; если SD не
+  // настроена → честный warning, что фото-сцены пропускаются.
+  const usesGen = s.diffusion
   $('#enGenInfoRow').classList.toggle('hidden', !(usesGen && st.imagegenReady))
   $('#enGenWarnRow').classList.toggle('hidden', !(usesGen && !st.imagegenReady))
+}
+// Свести V2-источники к легаси image_source для текущего бэкенда (он ещё не знает
+// про sources). auto→"auto"; только сток→"user_folder"; иначе разрешена генерация
+// →"generate"; ничего из картиночных движков → "emoji"-эквивалент НЕ шлём (его
+// больше нет) — отдаём "auto" и полагаемся на роутер/честный none. См. отчёт.
+function enrichLegacyImageSource(s) {
+  if (s.auto) return 'auto'
+  if (s.stock && !s.schematic && !s.diffusion) return 'user_folder'
+  if (s.diffusion) return 'generate'
+  return 'auto'
 }
 function openEnrichModal() {
   if (!st.hasSession) return
@@ -3697,6 +3950,7 @@ function openEnrichModal() {
 async function runEnrichSuggest() {
   if (st.task) { toast('Дождитесь завершения текущей задачи', 'info'); return }
   if (!st.llmReady) { toast('ИИ выключен (Ollama не найдена) — монтаж недоступен', 'info'); return }
+  const sources = enrichSourcesState()
   const body = {
     types: {
       image: $('#enType_image').checked,
@@ -3705,7 +3959,10 @@ async function runEnrichSuggest() {
       cta: $('#enType_cta').checked,
     },
     density: $('#enDensity').value,
-    image_source: $('#enImageSource').value,
+    // V2-движки (новый бэкенд читает sources/router); image_source — легаси-щит
+    // для текущего сервера, выводится из тех же чекбоксов.
+    sources,
+    image_source: enrichLegacyImageSource(sources),
     user_folder: $('#enUserFolder').value.trim(),
   }
   closeOverlay('#enrichModal')
@@ -3941,7 +4198,10 @@ function bindUI() {
   $('#btnCloseEnrich').onclick = () => closeOverlay('#enrichModal')
   $('#btnEnrichCancel').onclick = () => closeOverlay('#enrichModal')
   $('#btnEnrichRun').onclick = runEnrichSuggest
-  $('#enImageSource').onchange = enrichToggleUserFolder
+  // V2-движки: любой из чекбоксов источников меняет видимость папки-стока/инфо.
+  for (const id of ['#enSrcAuto', '#enSrcSchematic', '#enSrcDiffusion', '#enSrcStock']) {
+    const el = $(id); if (el) el.onchange = enrichToggleUserFolder
+  }
   $('#btnEnPickFolder').onclick = () => {
     $('#enrichModal').classList.add('hidden')
     openFiles(true, (dir) => { if (dir) $('#enUserFolder').value = dir; openOverlay('#enrichModal') })

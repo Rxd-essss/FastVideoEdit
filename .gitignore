@@ -46,3 +46,4 @@ Thumbs.db
 /tools/*.dll
 /tools/*.gguf
 /tools/*.safetensors
+/MONTAGE_V2_PLAN.md

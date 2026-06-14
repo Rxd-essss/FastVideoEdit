@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -35,13 +36,28 @@ def _noop(*_a, **_k) -> None:
 # Repo root (родитель vpipe/) — `tools/sd-cli.exe` лежит относительно него.
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
-# --- константы генерации (R1 спайка, §2; менять только новым ревью) -----------
-STYLE_SUFFIX = (", clean illustration, dark background, orange accent, minimal")
-NEGATIVE_PROMPT = ("text, words, letters, numbers, labels, watermark, blurry, "
-                   "low quality")
-DIFFUSION_STEPS = 4               # SDXL-Turbo: 4 шага
-CFG_SCALE = 1.0                   # Turbo: guidance 1.0
+# --- константы генерации (MONTAGE_V2 §5, c_diff §2; A/B 07a vs 07b) -----------
+# СТРОГО фото-сцены (роутер enrich_llm уже отсёк данные/схемы → код-графика).
+# Слоп лечит ПРОМПТ, не модель (доказано кадром): фото-суффикс + сильный негатив.
+# Старый суффикс «clean illustration, orange accent, minimal» УДАЛЁН (тянул в
+# мультик + красил всё оранжевым — c_diff §1). Новый — фотографический (§5.3).
+STYLE_SUFFIX = (", cinematic, photorealistic, professional photography, "
+                "moody dark scene, teal and cyan ambient light, "
+                "shallow depth of field, ultra detailed")
+# Сильный негатив (c_diff §2б, критичен): бьёт текст/буквы/цифры + мультяшность/
+# пластик/cgi/деформации. Для людей добавляется NEGATIVE_PEOPLE (руки/пальцы).
+NEGATIVE_PROMPT = (
+    "text, words, letters, numbers, labels, watermark, logo, signature, "
+    "cartoon, illustration, drawing, painting, blurry, low quality, deformed, "
+    "distorted, oversaturated, plastic, cgi, render, ugly, jpeg artifacts")
+NEGATIVE_PEOPLE = ", extra fingers, mutated hands"   # +для сцен с людьми (§5.4)
+_PEOPLE_RE = re.compile(
+    r"\b(person|people|man|woman|men|women|coder|developer|programmer|hand|"
+    r"hands|face|portrait|human|guy|girl|boy)\b", re.IGNORECASE)
+DIFFUSION_STEPS = 8               # SDXL-Turbo: 8 шагов чище 4 (+3 c, c_diff §2а)
+CFG_SCALE = 1.5                  # Turbo на 1.5 крепче держит композицию (§5.4)
 SAMPLING_METHOD = "euler_a"
+DIFFUSION_CANDIDATES = 4         # N сидов на момент (-b 4 -s -1) → выбор (§5.5)
 SD_TIMEOUT_S = 300               # один кадр на RTX 3080 ~ секунды; гард на зависание
 CACHE_DIR = Path("cache") / "enrich_img"
 
@@ -120,40 +136,51 @@ def generate_image(query_en: str, style_suffix: str, seed: int, W: int, H: int,
                    log: LogFn = _noop) -> Optional[str]:
     """Сгенерировать ОДИН кадр через ``sd-cli`` -> путь к PNG или ``None``.
 
-    ``query_en`` — английский запрос (уже text-free для diagram, маршрутизация в
-    enrich_llm). ``style_suffix`` — стиль-хвост (дефолт ``STYLE_SUFFIX``);
-    негатив — ``NEGATIVE_PROMPT`` (бьём текст/буквы/цифры — §2). Кэш по
-    ``_cache_key`` в ``cache/enrich_img/<sha1>.png`` (идемпотентно: есть файл —
-    отдаём; пишем атомарно .tmp->replace). ЛЮБОЙ сбой (нет бинаря/модели, exit!=0,
-    пустой PNG, таймаут) -> ``None`` (эмодзи-фолбэк выше по стеку).
+    ``query_en`` — БОГАТЫЙ арт-дирекшн-промпт photo-сцены (роутер enrich_llm уже
+    отсёк данные/схемы в код-графику — c_diff §3). ``style_suffix`` — фото-хвост
+    (дефолт ``STYLE_SUFFIX``); негатив — ``NEGATIVE_PROMPT`` (+``NEGATIVE_PEOPLE``
+    при людях в промпте — §5.4). Кэш по ``_cache_key`` в
+    ``cache/enrich_img/<sha1>.png`` (идемпотентно: есть файл — отдаём; пишем
+    атомарно .tmp->replace). ЛЮБОЙ сбой (нет бинаря/модели, exit!=0, пустой PNG,
+    таймаут) -> ``None`` (фолбэк выше по стеку).
 
-    Флаги R1 спайка (§2): ``--steps 4 --cfg-scale 1.0 --sampling-method euler_a
-    --diffusion-fa -W/-H``. ``imagegen_vae_on_cpu`` -> ``--vae-on-cpu`` (аварийный
-    VRAM-путь). Подавляем чтение env моделью; работаем строго по cfg."""
+    Флаги (§5.4, c_diff §2): ``--steps`` (cfg.imagegen_steps), ``--cfg-scale``
+    (cfg.imagegen_cfg, дефолт 1.5), ``--sampling-method euler_a --diffusion-fa
+    -W/-H``; ``--vae`` (cfg.imagegen_vae, если задан — sdxl_vae_fp16fix);
+    ``imagegen_vae_on_cpu`` -> ``--vae-on-cpu`` (аварийный VRAM-путь). Работаем
+    строго по cfg."""
     query_en = " ".join((query_en or "").split())
     if not query_en:
         return None
     binp = _resolve_sd_bin(getattr(cfg, "imagegen_bin", "tools/sd-cli.exe"))
     if not binp:
-        log("  SD: бинарь sd-cli не найден — эмодзи-фолбэк.")
+        log("  SD: бинарь sd-cli не найден — фолбэк.")
         return None
     model = _resolve_model(getattr(cfg, "imagegen_model", ""))
     if not model:
-        log("  SD: модель .gguf не настроена (imagegen_model) — эмодзи-фолбэк.")
+        log("  SD: модель .gguf не настроена (imagegen_model) — фолбэк.")
         return None
 
     suffix = style_suffix if style_suffix is not None else STYLE_SUFFIX
     steps = max(1, int(getattr(cfg, "imagegen_steps", DIFFUSION_STEPS)))
+    cfg_scale = float(getattr(cfg, "imagegen_cfg", CFG_SCALE) or CFG_SCALE)
     real_seed = _seed_for(query_en, seed)
     prompt = query_en + suffix
+    # Сильнее негатив для сцен с людьми (руки/пальцы — c_diff §2б, кадр 03).
+    negative = NEGATIVE_PROMPT
+    if _PEOPLE_RE.search(prompt):
+        negative += NEGATIVE_PEOPLE
+    vae = _resolve_model(getattr(cfg, "imagegen_vae", "") or "")
 
     # АБСОЛЮТНЫЙ путь обязателен: enrich.ImagePayload._abs_path (P2 path-traversal
     # guard) обнуляет любой ОТНОСИТЕЛЬНЫЙ asset_path при перезагрузке/санитайзе
     # плана — иначе сгенерированная картинка «отвязывается» от карточки (asset_kind
     # =user, но asset_path пустой → blank-превью, рендер дропает). resolve() здесь.
     cache = (Path(cache_dir) if cache_dir is not None else CACHE_DIR).resolve()
-    key = _cache_key(query_en, suffix, NEGATIVE_PROMPT, real_seed, W, H,
-                     steps, _model_hash(model))
+    # cfg-scale/vae входят в ключ (меняют картинку): добавлены в model_sig-слот
+    # как часть сигнатуры (старые кэши инвалидируются честно — новые настройки §5).
+    key = _cache_key(prompt, suffix, negative, real_seed, W, H,
+                     steps, f"{_model_hash(model)}:cfg{cfg_scale}:vae{bool(vae)}")
     out_png = cache / f"{key}.png"
     if out_png.is_file() and out_png.stat().st_size > 0:
         return str(out_png)             # идемпотентно: уже сгенерировано
@@ -167,18 +194,21 @@ def generate_image(query_en: str, style_suffix: str, seed: int, W: int, H: int,
         binp, "-M", "img_gen",
         "-m", model,
         "-p", prompt,
-        "-n", NEGATIVE_PROMPT,
+        "-n", negative,
         "--steps", str(steps),
-        "--cfg-scale", str(CFG_SCALE),
+        "--cfg-scale", str(cfg_scale),
         "--sampling-method", SAMPLING_METHOD,
         "--diffusion-fa",
         "-W", str(int(W)), "-H", str(int(H)),
         "-s", str(real_seed),
         "-o", str(tmp),
     ]
+    if vae:
+        cmd += ["--vae", vae]           # sdxl_vae_fp16fix: стабильнее цвет (§5.6)
     if bool(getattr(cfg, "imagegen_vae_on_cpu", False)):
         cmd.append("--vae-on-cpu")
-    log(f"  SD: генерация «{query_en}» ({W}x{H}, {steps} шага, seed {real_seed})…")
+    log(f"  SD: генерация «{query_en}» ({W}x{H}, {steps} шагов, "
+        f"cfg {cfg_scale}, seed {real_seed})…")
     try:
         r = subprocess.run(cmd, capture_output=True, text=True,
                            encoding="utf-8", errors="replace",
@@ -208,6 +238,42 @@ def generate_image(query_en: str, style_suffix: str, seed: int, W: int, H: int,
         _unlink(tmp)
         return None
     return str(out_png)
+
+
+def generate_candidates(prompt: str, cfg, *, n: Optional[int] = None,
+                        cache_dir: Optional[Path] = None,
+                        log: LogFn = _noop) -> list[str]:
+    """N кандидатов одного photo-момента (§5.5, c_diff §2г): N разных сидов одного
+    арт-дирекшн-промпта → список путей к PNG (юзер выберет лучший в «Монтаже»).
+
+    N = cfg.imagegen_candidates (дефолт ``DIFFUSION_CANDIDATES``=4). Сиды
+    детерминированы (хэш «prompt#i») — повторный прогон даёт те же 4 кадра (кэш
+    переиспользуется). Каждый кадр через ``generate_image`` (graceful-degrade:
+    упавший сид просто не попадает в список). Пустой/без-бинаря → []. Реальный
+    батч ``-b N`` амортизирует загрузку модели — здесь последовательно (бинарь
+    кэширует модель в рамках процесса при общем прогоне; простота > 1 загрузка)."""
+    prompt = " ".join((prompt or "").split())
+    if not prompt:
+        return []
+    size = max(64, int(getattr(cfg, "imagegen_size", 768)))
+    count = n if (isinstance(n, int) and n > 0) else \
+        max(1, int(getattr(cfg, "imagegen_candidates", DIFFUSION_CANDIDATES)))
+    out: list[str] = []
+    seen: set[str] = set()
+    for i in range(count):
+        # детерминированный РАЗНЫЙ сид на кандидата: хэш «prompt#i» → стабильно
+        # между прогонами, но 4 разных кадра (не один и тот же сид × 4).
+        seed = _seed_for(f"{prompt}#{i}", -1)
+        try:
+            path = generate_image(prompt, STYLE_SUFFIX, seed, size, size,
+                                  cfg=cfg, cache_dir=cache_dir, log=log)
+        except Exception as e:  # noqa: BLE001 — один сид не валит остальные
+            log(f"  SD: кандидат {i} упал ({e}).")
+            path = None
+        if path and path not in seen:
+            seen.add(path)
+            out.append(path)
+    return out
 
 
 def _unlink(p: Path) -> None:
@@ -274,11 +340,12 @@ def enrich_image_batch(points: list, cfg, log: LogFn = _noop,
             path = generate_image(query, STYLE_SUFFIX, seed, size, size,
                                   cfg=cfg, log=log)
         except Exception as e:  # noqa: BLE001 — одна точка не валит батч
-            log(f"  SD: точка «{query}» упала ({e}) — эмодзи-фолбэк.")
+            log(f"  SD: точка «{query}» упала ({e}) — фолбэк.")
             path = None
         if path:
             _pl_set(pl, "asset_kind", "user")  # рендер ест как user-ассет
             _pl_set(pl, "asset_path", path)
+            _write_diffusion_candidate(pl, path)  # V2: и в выбранный кандидат
             made += 1
         elif _pl_get(pl, "emoji"):
             _pl_set(pl, "asset_kind", "emoji")  # маршрутизатор подобрал эмодзи
@@ -286,3 +353,19 @@ def enrich_image_batch(points: list, cfg, log: LogFn = _noop,
             _pl_set(pl, "asset_kind", "none")   # ни SD, ни эмодзи — без ассета
     prog(1.0)
     return made
+
+
+def _write_diffusion_candidate(pl, path: str) -> None:
+    """Записать сгенерированный PNG в ВЫБРАННЫЙ diffusion-кандидат (V2): рендер
+    берёт ассет через ``ImagePayload.resolved_asset()`` (= candidate.asset_path).
+    Без кандидатов (старый плоский план) — no-op (рендер возьмёт плоский
+    asset_path по шиму обратной совместимости)."""
+    cands = _pl_get(pl, "candidates")
+    sel = _pl_get(pl, "selected", 0)
+    if not isinstance(cands, list) or not (isinstance(sel, int) and
+                                           0 <= sel < len(cands)):
+        return
+    c = cands[sel]
+    if isinstance(c, dict) and c.get("source") == "diffusion":
+        c["asset_path"] = path
+        c["preview"] = path

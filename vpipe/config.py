@@ -294,6 +294,35 @@ class ImageGenCfg(_Base):
     imagegen_size: int = 768                 # сторона кадра, px
     imagegen_steps: int = 4                  # шаги сэмплера (Turbo = 4)
     imagegen_vae_on_cpu: bool = False        # аварийный VRAM-путь (медленно)
+    # «Монтаж V2» §5 (диффузия СТРОГО для фото-сцен): арт-дирекшн-промпт + эти
+    # числа лечат слоп (доказано A/B 07a vs 07b). Дефолты — рекомендация §5;
+    # фактический промпт/суффикс/маршрут правит backend-агент (imagegen.py),
+    # config лишь держит числа (политика репо «числа в коде, не в промпте»).
+    imagegen_cfg: float = 1.5                 # cfg-scale (Turbo крепче держит на 1.5)
+    imagegen_candidates: int = 4             # N сидов на момент (-b 4 -s -1) → выбор
+    imagegen_vae: str = ""                   # путь к sdxl_vae_fp16fix.safetensors (--vae); ""=без
+
+
+class CodegfxCfg(_Base):
+    """Код-графика «Монтаж V2» (MONTAGE_V2_PLAN §2, render.codegfx).
+
+    Движок схем/инфографики: речь → точная карточка с РЕАЛЬНЫМ текстом/числами
+    через системный headless-Chrome (HTML→PNG с альфой). CPU-only, 0 VRAM,
+    zero-upload (всё локально). Контракт функции рендера зафиксирован в
+    ``vpipe/enrich.py`` (см. «КОНТРАКТ КОД-ГРАФИКИ»); реализацию кладёт
+    codegfx-агент в ``vpipe/codegfx/`` (новая папка) — config лишь несёт
+    настройки.
+
+    ``codegfx_enabled`` — дефолт True: код-графика дешёвая (CPU, мгновенно) и
+    есть рабочий движок; при отсутствии Chrome рендер честно деградирует
+    (render_schematic → None, кадр дропается, задача НЕ падает). ``codegfx_chrome``
+    пусто = автопоиск (системный Chrome→Edge→Playwright-фолбэк; НЕ хардкодить
+    путь — §10). ``codegfx_style`` — канальный дефолт-тема (одна из 4).
+    ``codegfx_size`` — канвас «WxH» (1920x1080 — доказанный прототип)."""
+    codegfx_enabled: bool = True
+    codegfx_chrome: str = ""               # "" = автопоиск (Chrome→Edge→Playwright)
+    codegfx_style: str = "minimal"         # minimal | neon | business | whiteboard
+    codegfx_size: str = "1920x1080"        # канвас рендера, «WxH»
 
 
 class RenderCfg(_Base):
@@ -307,6 +336,7 @@ class RenderCfg(_Base):
     music: MusicCfg = Field(default_factory=MusicCfg)
     enrich: EnrichRenderCfg = Field(default_factory=EnrichRenderCfg)
     imagegen: ImageGenCfg = Field(default_factory=ImageGenCfg)
+    codegfx: CodegfxCfg = Field(default_factory=CodegfxCfg)
     # Smoothing at every cut seam. Without it the kept audio segments are
     # hard-concatenated and each join is a waveform discontinuity → an audible
     # click and an overall "choppy" feel. A short equal-length fade-out/fade-in

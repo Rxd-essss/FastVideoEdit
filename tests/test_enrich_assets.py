@@ -147,9 +147,22 @@ def test_read_descriptions_missing_file_tolerant(tmp_path):
 
 
 # === 3+4. матчинг MockLLM + path-traversal =======================================
-def _point(concept: str, typ: str = enrich_mod.ENR_IMAGE) -> dict:
+def _point(concept: str, typ: str = enrich_mod.ENR_IMAGE,
+           candidates=None) -> dict:
+    """Сырой dict-кандидат точки (как из детектора V2). ``candidates`` —
+    список визуал-кандидатов (None → один none-кандидат, как у photo→none /
+    schematic-без-данных)."""
+    cands = candidates if candidates is not None else [{"source": "none"}]
     return {"type": typ, "payload": {"concept": concept, "asset_kind": "none",
-                                     "asset_path": "", "emoji": ""}}
+                                     "asset_path": "", "emoji": "",
+                                     "candidates": list(cands), "selected": 0}}
+
+
+def _icon_point(concept: str) -> dict:
+    """Точка с явным icon-кандидатом (бренд/значок) — единственный случай, где
+    эмодзи легитимен в V2 (§1: эмодзи больше НЕ фолбэк иллюстрации)."""
+    return _point(concept, candidates=[{"source": "icon", "emoji": ""},
+                                       {"source": "none"}])
 
 
 def _emoji_map(tmp_path: Path, mapping: dict) -> Path:
@@ -179,29 +192,47 @@ def test_match_point_to_user_asset_single_llm_call(tmp_path):
         assert Path(p["payload"]["asset_path"]).is_absolute()
 
 
-def test_match_no_hit_falls_back_to_emoji(tmp_path):
+def test_match_no_hit_non_icon_stays_none_no_emoji(tmp_path):
+    """V2 (§1): эмодзи больше НЕ фолбэк иллюстрации. Точка БЕЗ icon-кандидата и
+    без совпадения в папке остаётся none — эмодзи не подбирается, даже если он
+    есть в карте («лучше пусто, чем нелепый эмодзи»)."""
     folder = tmp_path / "assets"
     _mk_assets(folder)
-    pts = [_point("облако маркетинга")]
+    pts = [_point("облако маркетинга")]                  # none-кандидат (не icon)
     emap = _emoji_map(tmp_path, {"облако": "u2601", "реестр": "u1f5c3"})
-    # модель не нашла файл -> пустая строка
+    llm = MockLLM([{"matches": [{"point_idx": 0, "asset_filename": ""}]}])
+    n = match_user_assets(pts, str(folder), llm, _SILENT, emoji_map_path=emap)
+    assert n == 0
+    assert pts[0]["payload"]["asset_kind"] == "none"
+    assert pts[0]["payload"]["emoji"] == ""             # эмодзи НЕ навязан
+
+
+def test_match_icon_point_gets_emoji(tmp_path):
+    """V2: эмодзи легитимен ТОЛЬКО для явного icon-кандидата (бренд/значок)."""
+    folder = tmp_path / "assets"
+    _mk_assets(folder)
+    pts = [_icon_point("облако маркетинга")]
+    emap = _emoji_map(tmp_path, {"облако": "u2601"})
     llm = MockLLM([{"matches": [{"point_idx": 0, "asset_filename": ""}]}])
     n = match_user_assets(pts, str(folder), llm, _SILENT, emoji_map_path=emap)
     assert n == 1
     assert pts[0]["payload"]["asset_kind"] == "emoji"
     assert pts[0]["payload"]["emoji"] == "u2601"        # «облако» -> noto u2601
-    assert pts[0]["payload"]["asset_path"] == ""
+    assert pts[0]["payload"]["candidates"][0]["emoji"] == "u2601"
 
 
-def test_match_no_hit_no_emoji_stays_none(tmp_path):
+def test_match_icon_no_emoji_stays_none(tmp_path):
+    """icon-кандидат, но эмодзи в карте нет — точка остаётся none (без значка
+    значок не рисуем)."""
     folder = tmp_path / "assets"
     _mk_assets(folder)
-    pts = [_point("нечто несопоставимое")]
+    pts = [_icon_point("нечто несопоставимое")]
     emap = _emoji_map(tmp_path, {"облако": "u2601"})
     llm = MockLLM([{"matches": [{"point_idx": 0, "asset_filename": ""}]}])
     n = match_user_assets(pts, str(folder), llm, _SILENT, emoji_map_path=emap)
-    assert n == 0
-    assert pts[0]["payload"]["asset_kind"] == "none"
+    assert n == 1                                        # icon-кандидат материален
+    assert pts[0]["payload"]["candidates"][0]["source"] == "icon"
+    assert pts[0]["payload"]["emoji"] == ""
 
 
 def test_match_path_traversal_rejected(tmp_path):
@@ -221,36 +252,41 @@ def test_match_path_traversal_rejected(tmp_path):
     assert all(p["payload"]["asset_kind"] == "none" for p in pts)
 
 
-def test_match_no_folder_emoji_only_no_llm(tmp_path):
-    pts = [_point("молния скорость")]
+def test_match_no_folder_icon_emoji_no_llm(tmp_path):
+    """Без папки LLM-матчинг не зовётся; icon-кандидат получает эмодзи без сети."""
+    pts = [_icon_point("молния скорость")]
     emap = _emoji_map(tmp_path, {"молния": "u26a1"})
     llm = MockLLM([])                                   # без папки LLM не зовётся
     n = match_user_assets(pts, "", llm, _SILENT, emoji_map_path=emap)
     assert n == 1
-    assert llm.calls == []                              # эмодзи-фолбэк без LLM
+    assert llm.calls == []                              # эмодзи icon без LLM
     assert pts[0]["payload"]["asset_kind"] == "emoji"
     assert pts[0]["payload"]["emoji"] == "u26a1"
 
 
 def test_match_missing_folder_tolerant(tmp_path):
+    """Папки нет → без stock-кандидата и без LLM; не-icon точка остаётся none."""
     pts = [_point("реестр")]
     emap = _emoji_map(tmp_path, {"реестр": "u1f5c3"})
     llm = MockLLM([])
     n = match_user_assets(pts, str(tmp_path / "does_not_exist"), llm, _SILENT,
                           emoji_map_path=emap)
-    assert n == 1 and llm.calls == []                  # папки нет -> эмодзи-фолбэк
-    assert pts[0]["payload"]["emoji"] == "u1f5c3"
+    assert n == 0 and llm.calls == []                  # папки нет, не-icon → none
+    assert pts[0]["payload"]["asset_kind"] == "none"
+    assert pts[0]["payload"]["emoji"] == ""
 
 
-def test_match_llm_failure_falls_back_to_emoji(tmp_path):
+def test_match_llm_failure_does_not_crash(tmp_path):
+    """Сбой LLM-матчинга не валит пасс: без stock-кандидата точка остаётся при
+    своём (none-кандидат) — эмодзи-фолбэк иллюстрации УДАЛЁН."""
     folder = tmp_path / "assets"
     _mk_assets(folder)
     pts = [_point("реестр")]
     emap = _emoji_map(tmp_path, {"реестр": "u1f5c3"})
     llm = MockLLM([RuntimeError("boom")])              # матчинг упал
     n = match_user_assets(pts, str(folder), llm, _SILENT, emoji_map_path=emap)
-    assert n == 1                                       # сбой не валит — эмодзи
-    assert pts[0]["payload"]["asset_kind"] == "emoji"
+    assert n == 0                                       # сбой не валит — none
+    assert pts[0]["payload"]["asset_kind"] == "none"
 
 
 def test_emoji_map_loader_tolerant_missing_and_garbage(tmp_path):
@@ -318,10 +354,11 @@ def _tr_and_cut(n_words: int = 300):
     return tr, cl
 
 
-def test_detect_all_user_folder_match_counts_as_last_call(tmp_path,
-                                                          monkeypatch):
-    """image_source=user_folder + папка -> матчинг = последний LLM-вызов пасса
-    (keep_alive=0), иллюстрации проставляются asset_kind=user."""
+def test_detect_all_user_folder_match_inserts_stock_candidate(tmp_path,
+                                                              monkeypatch):
+    """V2: image_source=user_folder + папка → файл из папки даёт ЛУЧШИЙ
+    stock-кандидат (selected=0). Порядок вызовов: иллюстрации → узкий экстрактор
+    schematic (точка «реестр» роутится в tree) → матчинг (ПОСЛЕДНИЙ, keep_alive=0)."""
     folder = tmp_path / "assets"
     _mk_assets(folder)
     monkeypatch.setattr(enrich_llm, "EMOJI_MAP_PATH", tmp_path / "no_map.json")
@@ -330,26 +367,38 @@ def test_detect_all_user_folder_match_counts_as_last_call(tmp_path,
     params["types"] = {"image": True, "animation": False, "list_card": False,
                        "cta": False}
     params["image_source"] = "user_folder"
-    # 1 окно иллюстраций -> 1 точка; затем 1 вызов матчинга
+    # tree-экстрактор: 2 узла с якорями (слова сегмента точки) — пройдут снап.
+    q = lambda i: " ".join(f"ток{j:03d}" for j in range(i, i + 3))  # noqa: E731
     llm = MockLLM([
         {"points": [{"word_start": 100, "word_end": 105,
-                     "concept": "реестр Windows",
-                     "image_query_en": "windows registry", "style": "diagram"}]},
+                     "concept": "реестр Windows", "source": "schematic",
+                     "intent": "tree", "image_query_en": ""}]},
+        {"title": "Реестр", "root_label": "HKLM", "nodes": [
+            {"label": "SOFTWARE", "desc": "программы", "parent": "",
+             "quote": q(100)},
+            {"label": "SYSTEM", "desc": "службы", "parent": "",
+             "quote": q(103)}]},
         {"matches": [{"point_idx": 0, "asset_filename": "registry.png"}]},
     ])
     out = enrich_llm.detect_all(tr, cl, params, llm, log=_SILENT,
                                 user_folder=str(folder))
-    assert len(llm.calls) == 2                          # иллюстрации + матчинг
+    assert len(llm.calls) == 3                          # ill + extractor + match
     assert llm.calls[-1]["keep_alive"] == 0             # матчинг — ПОСЛЕДНИЙ
     assert llm.calls[-1]["schema"] is enrich_llm._MATCH_SCHEMA
-    assert llm.calls[0]["keep_alive"] == 300            # иллюстрации не последние
     assert len(out) == 1
-    assert out[0].payload.asset_kind == "user"
-    assert out[0].payload.asset_path.endswith("registry.png")
+    pl = out[0].payload
+    assert pl.candidates[0]["source"] == "stock"        # папка-файл = лучший
+    assert pl.candidates[0]["asset_path"].endswith("registry.png")
+    assert pl.selected == 0 and pl.source == "stock"
+    assert pl.asset_kind == "user"                      # синк плоских полей
+    assert pl.asset_path.endswith("registry.png")
+    # schematic-кандидат всё равно собран (юзер может переключиться)
+    assert any(c["source"] == "schematic" for c in pl.candidates)
 
 
-def test_detect_all_emoji_source_no_extra_llm_call(tmp_path, monkeypatch):
-    """image_source=emoji -> эмодзи-фолбэк по карте, БЕЗ вызова матчинга."""
+def test_detect_all_emoji_source_no_diffusion_candidate(tmp_path, monkeypatch):
+    """image_source=emoji → photo-точка БЕЗ diffusion-кандидата (SD выключен),
+    эмодзи только если это icon-кандидат. Здесь точка-photo → none (нет icon)."""
     emap = _emoji_map(tmp_path, {"реестр": "u1f5c3"})
     monkeypatch.setattr(enrich_llm, "EMOJI_MAP_PATH", emap)
     tr, cl = _tr_and_cut(300)
@@ -358,14 +407,39 @@ def test_detect_all_emoji_source_no_extra_llm_call(tmp_path, monkeypatch):
                        "cta": False}
     params["image_source"] = "emoji"
     llm = MockLLM([
-        {"points": [{"word_start": 100, "word_end": 105, "concept": "реестр",
-                     "image_query_en": "registry", "style": "icon"}]},
+        {"points": [{"word_start": 100, "word_end": 105, "concept": "ноутбук",
+                     "source": "photo", "intent": "",
+                     "image_query_en": "laptop on desk"}]},
     ])
     out = enrich_llm.detect_all(tr, cl, params, llm, log=_SILENT,
                                 user_folder="")
     assert len(llm.calls) == 1                          # только иллюстрации
-    assert out[0].payload.asset_kind == "emoji"
-    assert out[0].payload.emoji == "u1f5c3"
+    pl = out[0].payload
+    # SD выключен (emoji-источник) → diffusion-кандидата нет, точка none
+    assert all(c["source"] != "diffusion" for c in pl.candidates)
+    assert pl.source == "none" and pl.asset_kind == "none"
+
+
+def test_detect_all_icon_source_emoji(tmp_path, monkeypatch):
+    """Явный icon (бренд) → icon-кандидат + эмодзи по карте (узко, §1)."""
+    emap = _emoji_map(tmp_path, {"реестр": "u1f5c3"})
+    monkeypatch.setattr(enrich_llm, "EMOJI_MAP_PATH", emap)
+    tr, cl = _tr_and_cut(300)
+    params = enrich_mod.default_params()
+    params["types"] = {"image": True, "animation": False, "list_card": False,
+                       "cta": False}
+    params["image_source"] = "emoji"
+    llm = MockLLM([
+        {"points": [{"word_start": 100, "word_end": 105,
+                     "concept": "логотип реестр", "source": "icon",
+                     "intent": "", "image_query_en": ""}]},
+    ])
+    out = enrich_llm.detect_all(tr, cl, params, llm, log=_SILENT,
+                                user_folder="")
+    assert len(llm.calls) == 1                          # только иллюстрации
+    pl = out[0].payload
+    assert pl.source == "icon"
+    assert pl.asset_kind == "emoji" and pl.emoji == "u1f5c3"
 
 
 # === 7. валидность вшитых CTA-ассетов (ROBUST к файлам соседнего агента) ==========

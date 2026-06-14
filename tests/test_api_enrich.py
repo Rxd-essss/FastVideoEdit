@@ -337,6 +337,20 @@ def _enable_sd(sess):
     sess.cfg.render.imagegen.imagegen_model = "x.gguf"
 
 
+def _install_fake_codegfx(monkeypatch, render_fn):
+    """Подсунуть заглушку-модуль vpipe.codegfx.render (домен другого агента) в
+    sys.modules, чтобы `from vpipe.codegfx.render import render_schematic` в
+    стадии images зарезолвился на ``render_fn``. Чистится monkeypatch'ем."""
+    import sys
+    import types
+    pkg = types.ModuleType("vpipe.codegfx")
+    pkg.__path__ = []                                # пакет
+    mod = types.ModuleType("vpipe.codegfx.render")
+    mod.render_schematic = render_fn
+    monkeypatch.setitem(sys.modules, "vpipe.codegfx", pkg)
+    monkeypatch.setitem(sys.modules, "vpipe.codegfx.render", mod)
+
+
 def test_suggest_generate_runs_images_stage_with_unload_order(client,
                                                               monkeypatch,
                                                               tmp_path):
@@ -380,11 +394,12 @@ def test_suggest_generate_runs_images_stage_with_unload_order(client,
     assert data["items"][0]["payload"]["asset_kind"] == "user"
 
 
-def test_suggest_generate_sd_not_configured_warns_emoji_fallback(client,
-                                                                 monkeypatch,
-                                                                 tmp_path):
-    """SD не настроена → warning в stage, задача НЕ падает, точка-generate
-    откатывается на эмодзи-фолбэк (батч зовётся для отката, unload — нет)."""
+def test_suggest_generate_sd_not_configured_warns_no_batch(client,
+                                                           monkeypatch,
+                                                           tmp_path):
+    """V2: SD не настроена → warning в stage, задача НЕ падает, генерация НЕ
+    запускается (unload не звался). Эмодзи-фолбэк иллюстрации УДАЛЁН — точка
+    остаётся как есть («лучше пусто, чем слоп»)."""
     llm = _FakeLLM()
     sess = FakeSession(tmp_path, llm=llm, duration=120.0)
     _install(monkeypatch, sess)
@@ -400,15 +415,13 @@ def test_suggest_generate_sd_not_configured_warns_emoji_fallback(client,
 
     def fake_batch(points, cfg, log, on_progress=None):
         fired["batch"] += 1
-        for p in points:                 # откат: emoji подобран ранее
-            p.payload.asset_kind = "emoji" if p.payload.emoji else "none"
         return 0
     monkeypatch.setattr(serve.imagegen_mod, "enrich_image_batch", fake_batch)
 
     client.post("/api/enrich/suggest", json={"image_source": "generate"})
     _wait_done(sess)
     assert sess.task["error"] is None       # задача НЕ упала
-    assert fired["batch"] == 1              # батч позван для эмодзи-отката
+    assert fired["batch"] == 0              # SD не настроена → батч НЕ зовётся
     assert llm.events == []                 # SD не настроена → unload не звался
     assert any("SD не настроен" in m for m in stages)
 
@@ -431,6 +444,173 @@ def test_suggest_emoji_source_skips_images_stage(client, monkeypatch, tmp_path):
     assert sess.task["error"] is None
     assert fired["batch"] == 0              # SD-этап пропущен
     assert llm.events == []
+
+
+# === 1c. MONTAGE_V2: стадия кандидатов (schematic codegfx + diffusion N) =========
+def _img_with_candidates(iid, cands, *, t=60.0, selected=0):
+    pl = enrich_mod.ImagePayload(concept="реестр", candidates=list(cands),
+                                 selected=selected,
+                                 source=cands[selected]["source"] if cands
+                                 else "none")
+    return enrich_mod.EnrichItem(id=iid, type=enrich_mod.ENR_IMAGE, score=80,
+                                 t_start=t, t_end=t + 3.0, payload=pl)
+
+
+def test_images_stage_renders_schematic_via_codegfx(client, monkeypatch,
+                                                    tmp_path):
+    """Стадия images зовёт codegfx.render_schematic (мок) для schematic-кандидата
+    ДО unload Ollama (CPU, 0 VRAM); PNG пишется в кандидат (asset_path/preview)."""
+    llm = _FakeLLM()
+    sess = FakeSession(tmp_path, llm=llm, duration=120.0)
+    _install(monkeypatch, sess)
+
+    sch = {"source": "schematic", "intent": "stat",
+           "fields": {"stats": [{"value": "96", "label": "серверов"}]},
+           "style": "minimal"}
+    item = _img_with_candidates("enr_s1", [sch, {"source": "none"}])
+
+    def fake_detect(s, params, log):
+        return [item]
+    monkeypatch.setattr(serve, "_run_enrich_detectors", fake_detect)
+
+    seen = {"calls": []}
+    out_png = tmp_path / "sch.png"
+    out_png.write_bytes(b"\x89PNG")
+
+    def fake_render(intent, fields, style, out, *, cfg=None, log=None):
+        seen["calls"].append((intent, style, dict(fields)))
+        return str(out_png)
+
+    # codegfx — домен другого агента; подсовываем заглушку-модуль (как если бы он
+    # был реализован) через sys.modules, чтобы `from vpipe.codegfx.render import
+    # render_schematic` в стадии images зарезолвился.
+    _install_fake_codegfx(monkeypatch, fake_render)
+
+    client.post("/api/enrich/suggest", json={"image_source": "auto"})
+    _wait_done(sess)
+    assert sess.task["error"] is None
+    assert len(seen["calls"]) == 1
+    assert seen["calls"][0][0] == "stat" and seen["calls"][0][1] == "minimal"
+    # PNG записан в schematic-кандидат
+    data = _plan_file(sess)
+    cands = data["items"][0]["payload"]["candidates"]
+    assert cands[0]["source"] == "schematic"
+    assert cands[0]["asset_path"] == str(out_png)
+    assert cands[0]["preview"] == str(out_png)
+    # код-схема НЕ требует unload (рендерится до VRAM-этапа)
+    assert "unload" not in llm.events
+
+
+def test_images_stage_codegfx_missing_degrades(client, monkeypatch, tmp_path):
+    """codegfx-движок недоступен (нет модуля/Chrome) → schematic-кандидат без
+    превью, задача НЕ падает (graceful degrade — домен другого агента)."""
+    llm = _FakeLLM()
+    sess = FakeSession(tmp_path, llm=llm, duration=120.0)
+    _install(monkeypatch, sess)
+    sch = {"source": "schematic", "intent": "stat",
+           "fields": {"stats": [{"value": "96", "label": "x"}]},
+           "style": "minimal"}
+    item = _img_with_candidates("enr_s1", [sch, {"source": "none"}])
+    monkeypatch.setattr(serve, "_run_enrich_detectors",
+                        lambda s, params, log: [item])
+
+    # симулируем отсутствие движка: импорт render_schematic бросает
+    import builtins
+    real_import = builtins.__import__
+
+    def boom_import(name, *a, **k):
+        if name == "vpipe.codegfx.render":
+            raise ImportError("codegfx not ready")
+        return real_import(name, *a, **k)
+    monkeypatch.setattr(builtins, "__import__", boom_import)
+
+    client.post("/api/enrich/suggest", json={"image_source": "auto"})
+    _wait_done(sess)
+    assert sess.task["error"] is None       # задача жива
+    data = _plan_file(sess)
+    cands = data["items"][0]["payload"]["candidates"]
+    assert "asset_path" not in cands[0] or not cands[0].get("asset_path")
+
+
+def test_images_stage_diffusion_generates_n_candidates(client, monkeypatch,
+                                                       tmp_path):
+    """photo-точка с diffusion-кандидатом → стадия images гонит N сидов
+    (generate_candidates) ПОСЛЕ unload Ollama; превью пишутся в кандидаты."""
+    llm = _FakeLLM()
+    sess = FakeSession(tmp_path, llm=llm, duration=120.0)
+    _enable_sd(sess)
+    _install(monkeypatch, sess)
+    monkeypatch.setattr(serve, "_sd_configured", lambda cfg: True)
+    diff = {"source": "diffusion", "prompt": "data center, photorealistic",
+            "seed": -1}
+    item = _img_with_candidates("enr_d1", [diff, {"source": "none"}])
+    monkeypatch.setattr(serve, "_run_enrich_detectors",
+                        lambda s, params, log: [item])
+
+    seen = {"events": None}
+
+    def fake_gen_cands(prompt, cfg, *, n=None, cache_dir=None, log=None):
+        seen["events"] = list(llm.events)         # VRAM-состояние на момент SD
+        return [str(tmp_path / f"c{i}.png") for i in range(4)]
+    monkeypatch.setattr(serve.imagegen_mod, "generate_candidates", fake_gen_cands)
+
+    client.post("/api/enrich/suggest", json={"image_source": "generate"})
+    _wait_done(sess)
+    assert sess.task["error"] is None
+    assert "unload" in seen["events"]             # unload ДО генерации
+    data = _plan_file(sess)
+    cands = data["items"][0]["payload"]["candidates"]
+    # выбранному diffusion-кандидату проставлен asset_path; доп. сиды добавлены
+    assert cands[0]["source"] == "diffusion"
+    assert cands[0]["asset_path"].endswith("c0.png")
+    n_diff = sum(1 for c in cands if c["source"] == "diffusion")
+    assert n_diff >= 2                            # лучший + доп. сиды (листание)
+
+
+# === 1d. POST /api/enrich/select (выбор кандидата §3) ============================
+def test_select_sets_selected_and_resyncs_source(client, monkeypatch, tmp_path):
+    sess = FakeSession(tmp_path, duration=120.0)
+    _install(monkeypatch, sess)
+    sch = {"source": "schematic", "intent": "stat",
+           "fields": {"stats": [{"value": "96", "label": "x"}]},
+           "style": "minimal", "asset_path": str(tmp_path / "s.png")}
+    (tmp_path / "s.png").write_bytes(b"x")
+    item = _img_with_candidates("enr_x1", [sch, {"source": "none"}], selected=0)
+    _write_plan(sess, [item])
+
+    # выбрать none (idx 1)
+    r = client.post("/api/enrich/select", json={"id": "enr_x1", "idx": 1})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["selected"] == 1 and body["source"] == "none"
+    data = _plan_file(sess)
+    assert data["items"][0]["payload"]["selected"] == 1
+    assert data["items"][0]["payload"]["source"] == "none"
+
+
+def test_select_clamps_and_validates(client, monkeypatch, tmp_path):
+    sess = FakeSession(tmp_path, duration=120.0)
+    _install(monkeypatch, sess)
+    item = _img_with_candidates(
+        "enr_x1", [{"source": "diffusion", "prompt": "p", "seed": -1},
+                   {"source": "none"}])
+    _write_plan(sess, [item])
+    # idx вне диапазона → 400
+    assert client.post("/api/enrich/select",
+                       json={"id": "enr_x1", "idx": 9}).status_code == 400
+    # bool/отрицательный idx → 400
+    assert client.post("/api/enrich/select",
+                       json={"id": "enr_x1", "idx": -1}).status_code == 400
+    # неизвестный id → 404
+    assert client.post("/api/enrich/select",
+                       json={"id": "nope", "idx": 0}).status_code == 404
+
+
+def test_select_no_plan_409(client, monkeypatch, tmp_path):
+    sess = FakeSession(tmp_path, duration=120.0)
+    _install(monkeypatch, sess)
+    assert client.post("/api/enrich/select",
+                       json={"id": "x", "idx": 0}).status_code == 409
 
 
 def test_state_includes_imagegen_ready(client, monkeypatch, tmp_path):

@@ -220,8 +220,9 @@
       <div class="videoWrap">
         <video id="video" preload="metadata" aria-label="Предпросмотр ролика"></video>
         <div id="subOverlay" class="subOverlay hidden"></div>
-        <!-- P4 — превью-мокап обогащения поверх плеера (▶ на карточке): позиционированный
-             CSS-макет оверлея на время предложения. Честно подписан «превью-макет». -->
+        <!-- ТРЕК-2 V2 — ЧЕСТНОЕ превью обогащения поверх плеера (▶ на карточке):
+             РЕАЛЬНЫЙ PNG выбранного кандидата (схема/фото) на время предложения,
+             тот же ассет, что уйдёт в рендер. CSS-мокап удалён («конец лажи»). -->
         <div id="enrichOverlay" class="enrOverlay hidden" aria-hidden="true"></div>
       </div>
       <!-- Микро-таб-бар правой колонки: 4 вкладки, панели смонтированы ВСЕГДА
@@ -344,9 +345,10 @@
         </div>
       </section>
 
-      <!-- P4 — авто-обогащение: вкладка «Монтаж» (ENRICH_PLAN §6).
-           ИИ предлагает картинки/анимации/карточки-перечисления/CTA по контексту —
-           юзер видит карточки с CSS-мокап-превью и решает каждое решение вкл/выкл. -->
+      <!-- ТРЕК-2 V2 — вкладка «Монтаж» (MONTAGE_V2_PLAN §3): ИИ предлагает
+           картинки/анимации/карточки/CTA по контексту, для каждого момента —
+           СТРИП кандидатов с РЕАЛЬНЫМИ мини-превью (схема/фото), листание ←/→,
+           выбор кликом, ▶ честное превью поверх плеера; юзер вкл/выкл/правит. -->
       <section id="panel-enrich" class="tabPanel" role="tabpanel" aria-labelledby="tab-enrich" tabindex="0" hidden>
         <div class="tabTools">
           <button id="btnEnrichSuggest" class="btn small" title="ИИ предложит картинки, карточки-перечисления и призывы (подписка/комментарий) по контексту речи"><svg class="ic" aria-hidden="true"><use href="#i-sparkles"/></svg>Предложить монтаж</button>
@@ -924,25 +926,30 @@
           </select>
           <div class="hint muted">Сколько оформления допускать. «Минимум» — профессионально-сдержанно.</div>
         </label>
-        <label>Источник картинок
-          <select id="enImageSource" class="select">
-            <option value="auto" selected>Авто (папка → ИИ → эмодзи)</option>
-            <option value="generate">Генерировать (локально, ИИ)</option>
-            <option value="emoji">Только эмодзи</option>
-            <option value="user_folder">Папка с ассетами</option>
-          </select>
-        </label>
+      </div>
+      <!-- ТРЕК-2 V2 (§1): движки картинок по новой архитектуре. Авто-роутер —
+           дефолт: каждый момент получает РОВНО один источник «как у монтажёра».
+           Эмодзи-слоп-режим убран; значки остаются только для явных логотипов. -->
+      <div class="enrSources" role="group" aria-label="Откуда брать визуал">
+        <span class="enrSubTitle muted">Откуда брать визуал</span>
+        <label class="chk" title="Авто-роутер: данные/числа/сравнение → код-схема; реальная сцена → фото; иначе — честно пусто"><input type="checkbox" id="enSrcAuto" checked> Авто-роутер (рекомендуется)</label>
+        <div class="enrSrcSub" id="enSrcSub">
+          <label class="chk" title="Код-схемы: таблицы/деревья/статистика — реальный текст из речи, без GPU"><input type="checkbox" id="enSrcSchematic" checked> Код-схемы</label>
+          <label class="chk" title="Фото-сцены: локальная ИИ-генерация только для реальных физ-сцен/объектов"><input type="checkbox" id="enSrcDiffusion" checked> Фото-сцены (ИИ)</label>
+          <label class="chk" title="Сток: подбор из вашей папки по контексту (имена файлов / descriptions.txt)"><input type="checkbox" id="enSrcStock"> Сток (ваша папка)</label>
+        </div>
+        <div class="hint muted">Авто-роутер сам решает, что поставить в каждом месте. Снимите «Авто-роутер», чтобы ограничить набор движков вручную. Принцип: лучше пусто, чем неуместная картинка.</div>
       </div>
       <div id="enUserFolderRow" class="rout hidden">
         <div class="routrow">
           <input id="enUserFolder" class="search" type="text" placeholder="папка с вашими картинками (png, jpg, webp)" aria-label="Папка ассетов пользователя">
           <button class="btn" id="btnEnPickFolder"><svg class="ic" aria-hidden="true"><use href="#i-folder-open"/></svg>Обзор</button>
         </div>
-        <div class="hint muted">ИИ подберёт картинки из этой папки по контексту (по именам файлов / descriptions.txt). Не найдёт подходящую — предложит выбрать вручную.</div>
+        <div class="hint muted">Сток ищет картинки в этой папке по контексту (по именам файлов / descriptions.txt). Не найдёт подходящую — оставит место пустым.</div>
       </div>
-      <!-- ТРЕК-2 §2: предупреждения для генерации (показываем при auto/generate) -->
-      <div id="enGenInfoRow" class="hint muted hidden">Картинки рисует локальная модель SDXL-Turbo (~4 ГБ, скачивается отдельно). Первая генерация может занять время; всё считается на вашем GPU, в сеть ничего не уходит.</div>
-      <div id="enGenWarnRow" class="hint hidden" style="color:var(--warn,#d08700)">Локальная генерация (ИИ) не настроена — нужны бинарь sd-cli и модель .gguf. Пока картинки заменит эмодзи-фолбэк.</div>
+      <!-- ТРЕК-2 §5: инфо/варнинг для движка фото-сцен (показываем, когда он включён) -->
+      <div id="enGenInfoRow" class="hint muted hidden">Фото-сцены рисует локальная модель SDXL-Turbo (~4 ГБ, скачивается отдельно) — только для реальных сцен/объектов. Первая генерация может занять время; всё считается на вашем GPU, в сеть ничего не уходит.</div>
+      <div id="enGenWarnRow" class="hint hidden" style="color:var(--warn,#d08700)">Локальная генерация (ИИ) не настроена — нужны бинарь sd-cli и модель. Без неё фото-сцены пропускаются (место останется пустым); код-схемы работают без GPU.</div>
       <div id="enrichModalLlm" class="hint muted hidden">ИИ выключен (Ollama не найдена) — анализ недоступен. Включите Ollama (модель qwen3:8b).</div>
       <div class="ractions">
         <button class="btn" id="btnEnrichCancel">Отмена</button>

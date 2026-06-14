@@ -29,6 +29,7 @@ def _cfg(tmp_path, **over):
                 imagegen_bin=str(tmp_path / "sd-cli.exe"),
                 imagegen_model=str(tmp_path / "m.gguf"),
                 imagegen_size=768, imagegen_steps=4,
+                imagegen_cfg=1.5, imagegen_candidates=4, imagegen_vae="",
                 imagegen_vae_on_cpu=False)
     base.update(over)
     return SimpleNamespace(**base)
@@ -122,10 +123,10 @@ def test_generate_happy_writes_png_and_caches(monkeypatch, tmp_path):
 
     def fake_run(cmd, **kw):
         calls["n"] += 1
-        # флаги R1 спайка присутствуют
+        # флаги §5 (c_diff §2): cfg-scale из cfg (1.5), euler_a, diffusion-fa
         assert "--diffusion-fa" in cmd
-        assert cmd[cmd.index("--steps") + 1] == "4"
-        assert cmd[cmd.index("--cfg-scale") + 1] == "1.0"
+        assert cmd[cmd.index("--steps") + 1] == "4"     # cfg.imagegen_steps
+        assert cmd[cmd.index("--cfg-scale") + 1] == "1.5"
         assert cmd[cmd.index("--sampling-method") + 1] == "euler_a"
         assert cmd[cmd.index("-W") + 1] == "768"
         out = cmd[cmd.index("-o") + 1]
@@ -281,3 +282,120 @@ def test_batch_progress_reaches_full(monkeypatch, tmp_path):
                                 _cfg(tmp_path), log=_SILENT,
                                 on_progress=seen.append)
     assert seen[-1] == 1.0 and seen == sorted(seen)
+
+
+def test_batch_success_writes_into_diffusion_candidate(monkeypatch, tmp_path):
+    """V2: успешная генерация выбранного diffusion-кандидата пишет asset_path/
+    preview в кандидат (рендер берёт через resolved_asset())."""
+    monkeypatch.setattr(imagegen, "generate_image",
+                        lambda *a, **k: str(tmp_path / "gen.png"))
+    pl = ImagePayload(asset_kind="generate", gen_prompt_en="dell server",
+                      source="diffusion", selected=0,
+                      candidates=[{"source": "diffusion", "prompt": "dell server",
+                                   "seed": -1}])
+    it = EnrichItem(id="d1", type=ENR_IMAGE, t_start=1.0, t_end=4.0, payload=pl)
+    n = imagegen.enrich_image_batch([it], _cfg(tmp_path), log=_SILENT)
+    assert n == 1
+    assert pl.candidates[0]["asset_path"] == str(tmp_path / "gen.png")
+    assert pl.candidates[0]["preview"] == str(tmp_path / "gen.png")
+
+
+# === 6. диффузия §5: арт-промпт, фото-суффикс, N=4, негатив, vae ================
+def test_style_suffix_is_photographic_not_illustration():
+    """Старый суффикс «clean illustration/orange accent/minimal» УДАЛЁН (c_diff
+    §1: тянул в мультик); новый — фотографический (§5.3)."""
+    s = imagegen.STYLE_SUFFIX
+    assert "photorealistic" in s and "depth of field" in s
+    assert "clean illustration" not in s
+    assert "orange accent" not in s and "minimal" not in s
+
+
+def test_negative_prompt_strong_and_people_variant():
+    neg = imagegen.NEGATIVE_PROMPT
+    for w in ("text", "letters", "cartoon", "plastic", "deformed"):
+        assert w in neg                               # сильный негатив (§5.4)
+    assert "extra fingers" in imagegen.NEGATIVE_PEOPLE
+
+
+def test_diffusion_defaults_8_steps_cfg_1_5_n4():
+    assert imagegen.DIFFUSION_STEPS == 8              # §5.4 (было 4)
+    assert imagegen.CFG_SCALE == 1.5                  # §5.4 (было 1.0)
+    assert imagegen.DIFFUSION_CANDIDATES == 4         # §5.5 (-b 4)
+
+
+def test_generate_image_people_prompt_adds_hand_negative(monkeypatch, tmp_path):
+    _touch(tmp_path / "sd-cli.exe")
+    _touch(tmp_path / "m.gguf")
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+        from pathlib import Path
+        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"\x89PNG")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    imagegen.generate_image("a developer coding at night", imagegen.STYLE_SUFFIX,
+                            1, 768, 768, cfg=_cfg(tmp_path),
+                            cache_dir=tmp_path / "c", log=_SILENT)
+    neg = seen["cmd"][seen["cmd"].index("-n") + 1]
+    assert "extra fingers" in neg                     # люди → +негатив рук
+
+
+def test_generate_image_vae_flag_when_configured(monkeypatch, tmp_path):
+    _touch(tmp_path / "sd-cli.exe")
+    _touch(tmp_path / "m.gguf")
+    vae = _touch(tmp_path / "vae.safetensors")
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+        from pathlib import Path
+        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"\x89PNG")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    imagegen.generate_image("data center", imagegen.STYLE_SUFFIX, 1, 768, 768,
+                            cfg=_cfg(tmp_path, imagegen_vae=str(vae)),
+                            cache_dir=tmp_path / "c", log=_SILENT)
+    assert "--vae" in seen["cmd"]
+    assert seen["cmd"][seen["cmd"].index("--vae") + 1] == str(vae)
+
+
+def test_generate_candidates_n4_distinct_seeds(monkeypatch, tmp_path):
+    """generate_candidates → N=4 кадра разными (детерминированными) сидами."""
+    seeds_seen = []
+
+    def fake_gen(prompt, suffix, seed, W, H, *, cfg, cache_dir=None, log=None):
+        seeds_seen.append(seed)
+        return str(tmp_path / f"s{seed}.png")
+
+    monkeypatch.setattr(imagegen, "generate_image", fake_gen)
+    paths = imagegen.generate_candidates("data center aisle", _cfg(tmp_path),
+                                         log=_SILENT)
+    assert len(paths) == 4                             # cfg.imagegen_candidates
+    assert len(set(seeds_seen)) == 4                   # 4 РАЗНЫХ сида
+    # детерминизм: повторный прогон — те же сиды (кэш переиспользуется)
+    seeds2 = []
+    monkeypatch.setattr(imagegen, "generate_image",
+                        lambda *a, **k: (seeds2.append(a[2]),
+                                         str(tmp_path / f"s{a[2]}.png"))[1])
+    imagegen.generate_candidates("data center aisle", _cfg(tmp_path), log=_SILENT)
+    assert seeds2 == seeds_seen
+
+
+def test_generate_candidates_empty_prompt_returns_empty(tmp_path):
+    assert imagegen.generate_candidates("", _cfg(tmp_path), log=_SILENT) == []
+
+
+def test_generate_candidates_failures_skipped(monkeypatch, tmp_path):
+    """Упавший сид (None) просто не попадает в список — остальные живут."""
+    calls = {"n": 0}
+
+    def flaky(*a, **k):
+        calls["n"] += 1
+        return None if calls["n"] % 2 else str(tmp_path / f"ok{calls['n']}.png")
+
+    monkeypatch.setattr(imagegen, "generate_image", flaky)
+    paths = imagegen.generate_candidates("x scene", _cfg(tmp_path), log=_SILENT)
+    assert 0 < len(paths) < 4                          # часть отсеялась

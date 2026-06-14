@@ -97,6 +97,79 @@ CARD_LEAD_S = 0.3                     # t0 карточки = remap(intro) - 0.3
 IMG_WIDTH_MIN, IMG_WIDTH_DEF, IMG_WIDTH_MAX = 0.30, 0.32, 0.34   # PiP 30-34% (R5)
 ANIM_WIDTH_MIN, ANIM_WIDTH_DEF, ANIM_WIDTH_MAX = 0.14, 0.18, 0.22
 FADE_MS_MAX = 1000
+
+# --- «Монтаж V2» визуал-кандидаты (MONTAGE_V2_PLAN §6) ------------------------
+# Аддитивное расширение ImagePayload: момент-иллюстрация теперь несёт N кандидатов
+# из РАЗНЫХ источников (код-схема / диффузия / сток / кинетика / значок / ничего),
+# юзер листает и выбирает в «Монтаже»; рендер ест ВЫБРАННЫЙ кандидат. Старый
+# плоский asset_kind/asset_path/style_hint/gen_* СОХРАНЁН (старые планы читаются
+# как были). Все числа-лимиты — в КОДЕ (политика репо: модель числа игнорирует).
+#
+# Источник кандидата / выбранного визуала (взаимоисключающий роутер §1):
+#   schematic — код-графика (headless-Chromium PNG с альфой, intent + поля данных)
+#   diffusion — локальная SD фото-сцена (prompt/seed/asset_path)
+#   stock     — локальная библиотека/папка юзера (asset_path)
+#   kinetic   — кинетический текст-лозунг (рендерится отдельным движком)
+#   icon      — эмодзи/SVG-значок бренда (emoji/asset_path)
+#   none      — иллюстрировать нечего («лучше пусто, чем слоп»)
+VISUAL_SOURCES = ("schematic", "diffusion", "stock", "kinetic", "icon", "none")
+# Таксономия 10 интентов код-графики (codegfx/a_code.md §1). Пусто = не schematic.
+SCHEMATIC_INTENTS = ("stat", "tree", "list", "timeline", "compare",
+                     "process", "quote", "code", "map", "callout")
+# 4 темы движка код-схем (codegfx/a_code.md §4); дефолт — тёмная премиум канала.
+SCHEMATIC_STYLES = ("minimal", "neon", "business", "whiteboard")
+SCHEMATIC_STYLE_DEF = "minimal"
+CANDIDATES_MAX = 6                    # жёсткий потолок вариантов на момент (листание)
+CAND_TEXT_MAX = 200                  # лимит любого строкового поля кандидата (анти-слоп)
+CAND_FIELDS_MAX = 24                 # лимит ключей в schematic-fields (анти-раздувание)
+
+# =============================================================================
+# КОНТРАКТ КОД-ГРАФИКИ (codegfx) — ЗАКОН для 3 параллельных треков «Монтаж V2».
+# Schema-фаза фиксирует его ОДИН раз здесь; codegfx-агент реализует функцию в
+# vpipe/codegfx/ (новая папка), backend/serve её зовут, UI рисует превью её
+# выхода. НИКТО не переопределяет сигнатуру — иначе треки разойдутся.
+# =============================================================================
+#
+# Функция рендера код-схемы (codegfx-агент кладёт в vpipe/codegfx/render.py):
+#
+#   def render_schematic(
+#           intent: str,            # один из SCHEMATIC_INTENTS (stat/compare/...)
+#           fields: dict,           # ПЛОСКАЯ валидированная data-схема интента
+#                                   #   (ровно candidate["fields"], уже после
+#                                   #   quote-снапа и валидации чисел в КОДЕ —
+#                                   #   движок данные НЕ выдумывает и НЕ валидирует)
+#           style: str,             # одна из SCHEMATIC_STYLES (тема, дефолт
+#                                   #   SCHEMATIC_STYLE_DEF = "minimal")
+#           out_png: str | Path,    # абсолютный путь назначения PNG (вызывающий
+#                                   #   решает где: cache/codegfx/<sha1>.png)
+#           cfg=None,               # config.render.codegfx (CodegfxCfg ниже):
+#                                   #   chrome-путь (""=автопоиск), size "WxH"
+#           *, log=None,            # LogFn для honest-degrade (как в проекте)
+#   ) -> Optional[str]:
+#       '''intent+fields+style → PNG с АЛЬФОЙ (cut-out поверх talking-head) через
+#       системный headless-Chrome (--default-background-color=00000000). Возврат
+#       АБСОЛЮТНЫЙ путь к НЕпустому PNG, либо None при сбое (нет Chrome / пустые
+#       fields / переполнение вёрстки) — вызывающий честно дропает кадр
+#       («лучше пусто, чем слоп»). CPU-only, 0 VRAM, zero-upload (всё локально).
+#       Доказанный прототип-движок: D:/tmp/montage2/code/{engine.html,render.py}.'''
+#
+# fields-форма по интенту (codegfx/a_code.md §1, ПЛОСКО — движок собирает
+# вложенность сам): stat → {eyebrow,stats:[{value,unit,label}],bar,source};
+# compare → {title,col_a,col_b,rows:[{feature,a,b,winner}]}; tree →
+# {title,root_label,nodes:[{label,desc,parent}]}; list → {title,items:[{text,note}],
+# ordered}; timeline → {events:[{when,what}]}; process → {steps:[{title,desc}]};
+# quote → {text,by}; code → {code,lang}; callout → {term,definition}; map →
+# {region,points:[{label}]}. Точные required-ключи финализирует codegfx-агент по
+# прототипу; Schema-фаза гарантирует лишь ТИП контейнера (_clean_fields: скаляры
+# + списки плоских dict). Превью в UI «Монтаж» = именно этот PNG (не CSS-мокап).
+#
+# Поток данных: enrich_llm (backend) классифицирует intent + узким экстрактором
+# заполняет fields (quote-снап) → кладёт кандидат {source:"schematic",intent,
+# fields,style} в ImagePayload.candidates → стадия images зовёт render_schematic
+# для КАЖДОГО schematic-кандидата (после unload Ollama), пишет preview/asset_path
+# в кандидат → UI листает превью, юзер ставит selected → рендер ролика берёт
+# ImagePayload.resolved_asset() (выбранный PNG как нынешний user-ассет).
+# =============================================================================
 CTA_WIDTH_FRAC = 220.0 / 1920.0       # ~220 px @1080p (§2.3)
 PIP_PAD_PX = 48                       # отступ PiP от углов @1080p (R2 §1)
 CTA_BOTTOM_PX = 160                   # CTA: overlay=48:H-h-160 @1080p (§2.3)
@@ -222,6 +295,105 @@ def _abs_path(v) -> str:
     return s if s and Path(s).is_absolute() else ""
 
 
+# --- «Монтаж V2» candidate sanitize (MONTAGE_V2_PLAN §6) ----------------------
+def _clean_scalar(v):
+    """Один скаляр поля кандидата: строку — trim+лимит; конечное число — как есть;
+    bool — как есть; иначе (None/контейнер/NaN) → None (дроп ключа). Держит
+    schematic-fields плоскими и предсказуемыми для рендера код-графики."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        return _trim_text(v, CAND_TEXT_MAX)
+    if isinstance(v, (int, float)):
+        return v if math.isfinite(float(v)) else None
+    return None
+
+
+def _clean_fields(v) -> dict:
+    """Плоская валидированная data-схема интента (после снапа): только
+    str/число/bool скаляры ИЛИ список таких/плоских dict-строк (stats[]/rows[]/
+    items[] из codegfx). Вложенность глубже 2 уровней и не-данные отбрасываются —
+    рендер код-графики ест предсказуемый плоский payload, не произвольный JSON."""
+    if not isinstance(v, dict):
+        return {}
+    out: dict = {}
+    for k, val in v.items():
+        if not isinstance(k, str) or len(out) >= CAND_FIELDS_MAX:
+            continue
+        if isinstance(val, list):
+            rows = []
+            for el in val:
+                if isinstance(el, dict):
+                    row = {kk: sv for kk, vv in el.items()
+                           if isinstance(kk, str)
+                           and (sv := _clean_scalar(vv)) is not None}
+                    if row:
+                        rows.append(row)
+                else:
+                    sv = _clean_scalar(el)
+                    if sv is not None:
+                        rows.append(sv)
+            out[k] = rows
+        else:
+            sv = _clean_scalar(val)
+            if sv is not None:
+                out[k] = sv
+    return out
+
+
+def sanitize_candidate(d) -> Optional[dict]:
+    """Один кандидат визуала → нормализованный dict, либо None (дроп).
+
+    Контракт (§6): ``{source, ...source-specific}``. По source оставляем только
+    осмысленные ключи (анти-слоп, анти-раздувание):
+      schematic — ``intent`` (таксономия), ``fields`` (плоская data-схема),
+                  ``style`` (тема), ``preview`` (абс. путь к PNG движка).
+      diffusion — ``prompt`` (арт-дирекшн), ``seed`` (int, -1=авто),
+                  ``asset_path``/``preview`` (абс. путь к SD-PNG).
+      stock     — ``asset_path``/``preview`` (абс. путь к локальному клипу/кадру).
+      icon      — ``emoji`` (имя Noto) и/или ``asset_path`` (SVG/PNG).
+      kinetic   — ``text`` (лозунг), опц. ``style``.
+      none      — пусто.
+    Незнакомый/битый source → None (вызывающий пропускает кандидата)."""
+    if not isinstance(d, dict):
+        return None
+    src = _enum(d.get("source"), VISUAL_SOURCES, "")
+    if not src:
+        return None
+    out: dict = {"source": src}
+    preview = _abs_path(d.get("preview"))
+    if src == "schematic":
+        out["intent"] = _enum(d.get("intent"), SCHEMATIC_INTENTS, "")
+        out["style"] = _enum(d.get("style"), SCHEMATIC_STYLES,
+                             SCHEMATIC_STYLE_DEF)
+        out["fields"] = _clean_fields(d.get("fields"))
+    elif src == "diffusion":
+        out["prompt"] = _trim_text(d.get("prompt"), CAND_TEXT_MAX)
+        out["seed"] = _i(d.get("seed"), -1, -1)
+        ap = _abs_path(d.get("asset_path"))
+        if ap:
+            out["asset_path"] = ap
+    elif src == "stock":
+        ap = _abs_path(d.get("asset_path"))
+        if ap:
+            out["asset_path"] = ap
+    elif src == "icon":
+        emj = _s(d.get("emoji"))
+        if emj:
+            out["emoji"] = emj
+        ap = _abs_path(d.get("asset_path"))
+        if ap:
+            out["asset_path"] = ap
+    elif src == "kinetic":
+        out["text"] = _trim_text(d.get("text"), CAND_TEXT_MAX)
+        out["style"] = _enum(d.get("style"), SCHEMATIC_STYLES,
+                             SCHEMATIC_STYLE_DEF)
+    # none → только {"source":"none"}
+    if preview:
+        out["preview"] = preview
+    return out
+
+
 # --- payload models (§1.2) -----------------------------------------------------
 @dataclass
 class ImagePayload:
@@ -237,6 +409,12 @@ class ImagePayload:
     fade_ms: int = 220
     gen_seed: int = -1                  # детерм. сид SD (-1 = хэш query_en, §2)
     gen_prompt_en: str = ""            # фактический промпт после diagram→concept
+    # --- «Монтаж V2» визуал-с-выбором (MONTAGE_V2_PLAN §6, аддитивно) ---------
+    source: str = "none"               # источник ВЫБРАННОГО визуала: VISUAL_SOURCES
+    intent: str = ""                   # тип код-схемы выбранного (если schematic)
+    schematic_style: str = SCHEMATIC_STYLE_DEF  # тема код-схемы (minimal/...)
+    candidates: list[dict] = field(default_factory=list)  # N вариантов на момент
+    selected: int = 0                  # индекс выбранного в candidates (кламп кодом)
 
     def to_dict(self) -> dict:
         return {"concept": self.concept, "image_query_en": self.image_query_en,
@@ -245,10 +423,31 @@ class ImagePayload:
                 "position": self.position,
                 "width_frac": round(self.width_frac, 3),
                 "kenburns": self.kenburns, "fade_ms": self.fade_ms,
-                "gen_seed": self.gen_seed, "gen_prompt_en": self.gen_prompt_en}
+                "gen_seed": self.gen_seed, "gen_prompt_en": self.gen_prompt_en,
+                "source": self.source, "intent": self.intent,
+                "schematic_style": self.schematic_style,
+                "candidates": [dict(c) for c in self.candidates],
+                "selected": self.selected}
 
     @staticmethod
     def sanitize(d: dict) -> "ImagePayload":
+        raw = d.get("candidates") if isinstance(d.get("candidates"), list) else []
+        cands: list[dict] = []
+        for c in raw:
+            sc = sanitize_candidate(c)
+            if sc is not None:
+                cands.append(sc)
+            if len(cands) >= CANDIDATES_MAX:   # жёсткий потолок (листание)
+                break
+        # selected клампится в [0, len-1]; пустой список → 0 (рендер падёт на
+        # плоский asset_path/asset_kind — обратная совместимость).
+        sel = _i(d.get("selected"), 0, 0, max(0, len(cands) - 1))
+        # source выбранного: если есть кандидаты — берём source выбранного
+        # кандидата (единый источник правды), иначе явный/дефолт.
+        if cands:
+            source = cands[sel]["source"]
+        else:
+            source = _enum(d.get("source"), VISUAL_SOURCES, "none")
         return ImagePayload(
             concept=_s(d.get("concept")),
             image_query_en=_s(d.get("image_query_en")),
@@ -265,7 +464,53 @@ class ImagePayload:
             kenburns=bool(d.get("kenburns", False)),
             fade_ms=_i(d.get("fade_ms"), 220, 0, FADE_MS_MAX),
             gen_seed=_i(d.get("gen_seed"), -1, -1),
-            gen_prompt_en=_s(d.get("gen_prompt_en")))
+            gen_prompt_en=_s(d.get("gen_prompt_en")),
+            source=source,
+            intent=_enum(d.get("intent"), SCHEMATIC_INTENTS, ""),
+            schematic_style=_enum(d.get("schematic_style"), SCHEMATIC_STYLES,
+                                  SCHEMATIC_STYLE_DEF),
+            candidates=cands, selected=sel)
+
+    def chosen_candidate(self) -> Optional[dict]:
+        """Выбранный кандидат (``candidates[selected]``) или None, если кандидатов
+        нет (старый плоский план). ``selected`` уже клампнут санитайзером."""
+        if self.candidates and 0 <= self.selected < len(self.candidates):
+            return self.candidates[self.selected]
+        return None
+
+    def resolved_asset(self) -> tuple[str, str]:
+        """Итоговый (asset_path, source) для рендера ВЫБРАННОГО визуала.
+
+        Единая точка «выбранный кандидат → что и откуда рисовать»: рендер/serve
+        не разбирают форму кандидатов сами. Логика:
+
+        * Есть кандидаты → берём ``candidates[selected]``:
+          ``asset_path`` = его ``asset_path`` (для schematic это путь к PNG
+          движка код-графики; его кладёт codegfx-рендер ДО рендера ролика, см.
+          контракт ``render_schematic`` ниже), иначе ``preview``; source —
+          ``candidate["source"]``. ``none`` → ("", "none").
+        * Нет кандидатов (старый план) → обратная совместимость по плоскому
+          ``asset_kind``: ``user`` → (asset_path, "stock"); ``generate`` →
+          (asset_path, "diffusion"); ``emoji`` → ("", "icon"); ``none`` →
+          ("", "none").
+
+        Возвращает абсолютный путь к ассету (или "" если ассета ещё нет / source
+        не материальный) и нормализованный source ∈ VISUAL_SOURCES. Рендер при
+        пустом пути и не-``none`` source честно дропает item со status_note."""
+        c = self.chosen_candidate()
+        if c is not None:
+            src = c["source"]
+            ap = _s(c.get("asset_path")) or _s(c.get("preview"))
+            return (ap if Path(ap).is_absolute() else "", src) if ap else \
+                ("", src)
+        # старый плоский план (без candidates) — шим по asset_kind (§6)
+        if self.asset_kind == "user":
+            return self.asset_path, "stock"
+        if self.asset_kind == "generate":
+            return self.asset_path, "diffusion"
+        if self.asset_kind == "emoji":
+            return "", "icon"
+        return "", "none"
 
 
 @dataclass

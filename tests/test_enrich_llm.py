@@ -423,17 +423,32 @@ def test_cta_markers_thinned_for_long_video(monkeypatch):
     assert "[25|" not in user                        # шага 25 больше нет
 
 
-# === 3. иллюстрации ==============================================================
+# === 3. иллюстрации (РОУТЕР + КАНДИДАТЫ, MONTAGE_V2 §1-2) ========================
 def _pt(a: int, b: int, *, concept="реестр Windows",
-        q="windows registry diagram", style="diagram") -> dict:
+        q="windows registry diagram", source="schematic", intent="tree") -> dict:
+    """Сырая точка от детектора-классификатора V2 (source/intent вместо style)."""
     return {"word_start": a, "word_end": b, "concept": concept,
-            "image_query_en": q, "style": style}
+            "image_query_en": q, "source": source, "intent": intent}
+
+
+def _ill_only(**over):
+    """params: только иллюстрации, image_source по умолчанию auto (SD разрешён)."""
+    p = _only("image")
+    p.update(over)
+    return p
+
+
+# photo-точка (без data-сигналов в concept) → diffusion-кандидат СТРОИТСЯ КОДОМ
+# (без LLM-экстрактора) — удобно для проверки геометрии детектора.
+def _photo(a: int, b: int, *, concept="ноутбук на столе",
+           q="laptop on desk") -> dict:
+    return _pt(a, b, concept=concept, q=q, source="photo", intent="")
 
 
 def test_ill_snap_to_segment_start_and_duration_clamp():
     tr = _build_tr(300)
-    llm = MockLLM([{"points": [_pt(15, 16)]}])
-    out = detect_all(tr, _cl(tr), _only("image"), llm, log=_SILENT)
+    llm = MockLLM([{"points": [_photo(15, 16)]}])
+    out = detect_all(tr, _cl(tr), _ill_only(), llm, log=_SILENT)
     assert len(out) == 1
     it = out[0]
     assert it.type == ENR_IMAGE
@@ -443,101 +458,105 @@ def test_ill_snap_to_segment_start_and_duration_clamp():
     assert it.word_end == 16
     # dur = конец слова 16 (8.4) − 5.0 = 3.4 → в клампе 2.5–4.0
     assert it.t_end - it.t_start == pytest.approx(3.4)
-    assert it.payload.style_hint == "diagram"
-    assert it.payload.image_query_en == "windows registry diagram"
-    # image_source=auto + diagram + валидный английский query → SD-генерация
-    # (ТРЕК-2 §2): помечен asset_kind="generate", промпт переписан в text-free.
-    assert it.payload.asset_kind == "generate"
-    assert it.payload.gen_prompt_en == (
-        "abstract conceptual illustration, no text, windows registry diagram")
+    assert it.payload.style_hint == "photo"
     assert it.payload.position == "top_right"
-    assert it.score == 70                             # 55 + 15 за валидный query
+    # РОУТЕР: photo → diffusion-кандидат (богатый арт-дирекшн-промпт), selected=0
+    assert it.payload.source == "diffusion"
+    assert it.payload.candidates[0]["source"] == "diffusion"
+    assert it.payload.candidates[0]["prompt"].startswith("laptop on desk")
+    assert "photorealistic" in it.payload.candidates[0]["prompt"]
+    # none ВСЕГДА как вариант
+    assert it.payload.candidates[-1]["source"] == "none"
+    # обратная совместимость плоского пути: помечен на SD
+    assert it.payload.asset_kind == "generate"
+    assert it.payload.gen_prompt_en == it.payload.candidates[0]["prompt"]
 
 
 def test_ill_duration_clamped_to_max():
     tr = _build_tr(300)
-    llm = MockLLM([{"points": [_pt(15, 40)]}])        # сырых 15.4 c → кламп 4.0
-    out = detect_all(tr, _cl(tr), _only("image"), llm, log=_SILENT)
+    llm = MockLLM([{"points": [_photo(15, 40)]}])     # сырых 15.4 c → кламп 4.0
+    out = detect_all(tr, _cl(tr), _ill_only(), llm, log=_SILENT)
     assert out[0].t_end - out[0].t_start == pytest.approx(4.0)
 
 
 def test_ill_clamps_indices_to_window():
     tr = _build_tr(300)
-    llm = MockLLM([{"points": [_pt(-5, 999)]}])       # клампы к окну [0, 300)
-    out = detect_all(tr, _cl(tr), _only("image"), llm, log=_SILENT)
+    llm = MockLLM([{"points": [_photo(-5, 999)]}])    # клампы к окну [0, 300)
+    out = detect_all(tr, _cl(tr), _ill_only(), llm, log=_SILENT)
     assert len(out) == 1
     assert out[0].word_start == 0                     # сегмент слова 0
     assert out[0].word_end == 299
 
 
-def test_ill_style_fallback_and_russian_query_means_no_asset():
+def test_ill_photo_russian_or_empty_query_means_none():
+    """photo без английского предмета → роутер схлопывает в none (§1: без
+    предмета SD не зовём, «лучше пусто, чем слоп»). Без diffusion-кандидата."""
     tr = _build_tr(300)
     llm = MockLLM([{"points": [
-        _pt(15, 20, style="logo"),                    # вне множества → photo
-        _pt(150, 155, q="сервер делл", style="photo"),  # русский → без ассета
-        _pt(250, 255, q="   ", style="photo"),        # пустой → без ассета
+        _photo(150, 155, q="сервер делл"),            # русский → none
+        _photo(250, 255, q="   "),                    # пустой → none
     ]}])
-    out = detect_all(tr, _cl(tr), _only("image"), llm, log=_SILENT)
-    assert len(out) == 3
-    assert out[0].payload.style_hint == "photo"
-    assert out[1].payload.image_query_en == ""
-    assert out[2].payload.image_query_en == ""
-    # русский/пустой query → SD не зовём; без emoji_map → asset_kind="none".
-    assert out[1].payload.asset_kind == "none"
-    assert out[2].payload.asset_kind == "none"
-    # точка 0: photo + валидный английский query (дефолт _pt) → SD-генерация
-    # напрямую, query как есть (без diagram-переписывания).
-    assert out[0].payload.asset_kind == "generate"
-    assert out[0].payload.gen_prompt_en == "windows registry diagram"
-    assert out[1].score == 55                         # без query — без бонуса
+    out = detect_all(tr, _cl(tr), _ill_only(), llm, log=_SILENT)
+    assert len(out) == 2
+    for it in out:
+        assert it.payload.source == "none"
+        assert it.payload.image_query_en == ""
+        assert it.payload.asset_kind == "none"
+        assert all(c["source"] != "diffusion"
+                   for c in it.payload.candidates)
 
 
-def test_ill_icon_style_never_generates_falls_back_to_emoji_or_none():
-    """style=icon → SD НЕ зовём (логотип/значок SD не нарисует, §2). Без
-    emoji_map → asset_kind="none" (предложение без ассета)."""
+def test_ill_icon_source_no_diffusion():
+    """РОУТЕР: явный значок (concept «логотип …») + source=icon → icon-кандидат,
+    НЕ диффузия (логотип SD не нарисует, §1)."""
     tr = _build_tr(300)
-    llm = MockLLM([{"points": [_pt(15, 20, q="windows logo", style="icon")]}])
-    out = detect_all(tr, _cl(tr), _only("image"), llm, log=_SILENT)
+    llm = MockLLM([{"points": [_pt(15, 20, concept="логотип ubuntu",
+                                   q="", source="icon", intent="")]}])
+    out = detect_all(tr, _cl(tr), _ill_only(), llm, log=_SILENT)
     assert len(out) == 1
     assert out[0].payload.style_hint == "icon"
-    assert out[0].payload.asset_kind == "none"        # icon → не generate
-    assert out[0].payload.gen_prompt_en == ""
+    assert out[0].payload.source == "icon"
+    assert all(c["source"] != "diffusion" for c in out[0].payload.candidates)
 
 
-def test_ill_emoji_source_skips_sd_routing(monkeypatch):
-    """image_source=emoji → SD-маршрут выключен даже для photo с валидным
-    английским query: точка уходит в эмодзи-фолбэк (тут emoji_map подменён)."""
+def test_ill_emoji_source_skips_diffusion(monkeypatch):
+    """image_source=emoji → diffusion-кандидат НЕ собирается даже для photo с
+    валидным английским query (SD выключен): точка → none."""
     tr = _build_tr(300)
     monkeypatch.setattr(enrich_llm, "_load_emoji_map",
                         lambda *_a, **_k: {"registry": "u1f4c1"})
-    llm = MockLLM([{"points": [_pt(15, 20, q="windows registry", style="photo",
-                                   concept="реестр registry")]}])
+    llm = MockLLM([{"points": [_photo(15, 20, q="windows registry",
+                                      concept="ноутбук")]}])
     out = detect_all(tr, _cl(tr),
-                     {**_only("image"), "image_source": "emoji"},
+                     {**_ill_only(), "image_source": "emoji"},
                      llm, log=_SILENT)
     assert len(out) == 1
-    assert out[0].payload.asset_kind == "emoji"       # SD не звался
-    assert out[0].payload.emoji == "u1f4c1"
+    assert all(c["source"] != "diffusion" for c in out[0].payload.candidates)
+    assert out[0].payload.source == "none"
 
 
-def test_ill_generate_source_routes_photo_to_sd():
-    """image_source=generate → photo с английским query помечается на SD
-    (asset_kind="generate"), без папки юзера."""
+def test_ill_generate_source_routes_photo_to_diffusion():
+    """image_source=generate → photo с английским query → diffusion-кандидат
+    (богатый арт-дирекшн-промпт). Плоский asset_kind="generate" для стадии images."""
     tr = _build_tr(300)
-    llm = MockLLM([{"points": [_pt(15, 20, q="dell server", style="photo")]}])
+    llm = MockLLM([{"points": [_photo(15, 20, q="dell server",
+                                      concept="сервер dell")]}])
     out = detect_all(tr, _cl(tr),
-                     {**_only("image"), "image_source": "generate"},
+                     {**_ill_only(), "image_source": "generate"},
                      llm, log=_SILENT)
     assert len(out) == 1
-    assert out[0].payload.asset_kind == "generate"
-    assert out[0].payload.gen_prompt_en == "dell server"
+    pl = out[0].payload
+    assert pl.source == "diffusion"
+    assert pl.candidates[0]["prompt"].startswith("dell server")
+    assert pl.asset_kind == "generate"
+    assert pl.gen_prompt_en.startswith("dell server")
 
 
 def test_ill_window_limit_four_points():
     tr = _build_tr(300)
-    llm = MockLLM([{"points": [_pt(10 + 40 * j, 15 + 40 * j)
+    llm = MockLLM([{"points": [_photo(10 + 40 * j, 15 + 40 * j)
                                for j in range(6)]}])
-    out = detect_all(tr, _cl(tr), _only("image"), llm, log=_SILENT)
+    out = detect_all(tr, _cl(tr), _ill_only(), llm, log=_SILENT)
     assert len(out) == 4                              # окно-лимит 4 точки
 
 
@@ -545,12 +564,12 @@ def test_ill_junk_points_dropped():
     tr = _build_tr(300)
     llm = MockLLM([{"points": [
         {"word_start": "10", "word_end": 15, "concept": "к",
-         "image_query_en": "q", "style": "photo"},    # строка-индекс
-        _pt(20, 25, concept="   "),                   # пустой концепт
+         "source": "photo", "intent": "", "image_query_en": "q"},  # строка-индекс
+        _photo(20, 25, concept="   "),                # пустой концепт
         "не словарь",
-        _pt(50, 55),                                  # валидная
+        _photo(50, 55),                               # валидная
     ]}])
-    out = detect_all(tr, _cl(tr), _only("image"), llm, log=_SILENT)
+    out = detect_all(tr, _cl(tr), _ill_only(), llm, log=_SILENT)
     assert len(out) == 1 and out[0].word_end == 55
 
 
@@ -566,9 +585,179 @@ def test_ill_prompt_markers_and_anticringe_verbatim():
     # анти-кринж строка R5 §5 — дословно из плана
     assert "Никаких людей, рукопожатий и офисов." in enrich_llm._ILL_SYSTEM
     assert "(«сервер Dell»)" in enrich_llm._ILL_SYSTEM
+    # V2: классификатор источника + intent (взаимоисключающий роутер §1)
+    assert "schematic" in enrich_llm._ILL_SYSTEM and "photo" in \
+        enrich_llm._ILL_SYSTEM
     item = enrich_llm._ILL_SCHEMA["properties"]["points"]["items"]
     assert item["required"] == ["word_start", "word_end", "concept",
-                                "image_query_en", "style"]
+                                "source", "intent", "image_query_en"]
+
+
+# === 3b. РОУТЕР источника (MONTAGE_V2 §1) ========================================
+def test_route_source_data_forces_schematic_even_when_model_says_photo():
+    """КОД-страховка (c_diff §3): число/% в речи → schematic, даже если модель
+    сказала photo. НИКОГДА в диффузию (кадр 05 = кракозябры)."""
+    src, it = enrich_llm._route_source(
+        "photo", "", "96% серверов на linux", "96 процентов серверов",
+        "linux servers")
+    assert src == "schematic"                         # форс — не photo/diffusion
+    assert it in enrich_llm.SCHEMATIC_INTENTS
+
+
+def test_route_source_structure_word_forces_schematic():
+    src, it = enrich_llm._route_source(
+        "photo", "", "дерево реестра windows", "дерево веток реестра", "tree")
+    assert src == "schematic" and it == "tree"
+
+
+def test_route_source_photo_real_scene_stays_photo():
+    src, it = enrich_llm._route_source(
+        "photo", "", "дата-центр ночью", "огромный дата центр", "data center")
+    assert src == "photo" and it == ""
+
+
+def test_route_source_photo_without_english_query_is_none():
+    src, _ = enrich_llm._route_source("photo", "", "сцена", "что-то", "")
+    assert src == "none"
+    src2, _ = enrich_llm._route_source("photo", "", "сцена", "что-то",
+                                       "сервер делл")  # русский
+    assert src2 == "none"
+
+
+def test_route_source_icon_only_with_explicit_signal():
+    # явный значок → icon
+    src, _ = enrich_llm._route_source("icon", "", "логотип ubuntu", "это ubuntu",
+                                      "")
+    assert src == "icon"
+    # модель сказала icon, но в речи нет слова-значка → НЕ icon (схлоп в none)
+    src2, _ = enrich_llm._route_source("icon", "", "просто абстракция",
+                                       "успех и удобство", "")
+    assert src2 == "none"
+
+
+def test_route_source_abstraction_is_none():
+    src, it = enrich_llm._route_source("none", "", "успех", "это успех", "")
+    assert src == "none" and it == ""
+
+
+def test_route_source_no_diagram_to_diffusion_ever():
+    """Жёсткое правило §8/c_diff §3: data/diagram-сигнал НИКОГДА не уходит в
+    diffusion (photo). Любой структурный/числовой концепт → schematic."""
+    for concept, quote in [("статистика 11 тысяч", "11 тысяч разработчиков"),
+                           ("сравнение linux vs windows", "linux против windows"),
+                           ("шаги установки wsl", "сначала открыть потом команда"),
+                           ("философия unix принципы", "во-первых одна задача")]:
+        src, _ = enrich_llm._route_source("photo", "", concept, quote, "x y")
+        assert src == "schematic", (concept, src)      # не photo/diffusion
+
+
+# === 3c. узкие экстракторы schematic + КАНДИДАТЫ (MONTAGE_V2 §2) =================
+def _ext_q(i: int, k: int = 3) -> str:
+    return " ".join(_tok(j) for j in range(i, i + k))
+
+
+def test_schematic_candidate_built_eagerly_with_validated_fields():
+    """data-точка → schematic-кандидат: узкий экстрактор stat заполняет fields,
+    КОД снапит quote-якоря и валидирует числа из окна. selected=0, none — всегда
+    последним вариантом."""
+    tr = _build_tr(300)
+    # точка «96 процентов» (слова реальные) роутится в schematic/stat.
+    pt = {"word_start": 100, "word_end": 108, "concept": "96 процентов серверов",
+          "source": "schematic", "intent": "stat", "image_query_en": ""}
+    # экстрактор stat: 2 значения с якорями в окне; «96» есть в речи окна? Окно —
+    # синтетические токи без чисел, поэтому value БЕЗ цифр (текстовые) — пройдут.
+    ext = {"eyebrow": "Статистика", "stats": [
+        {"value": "много", "unit": "", "label": "серверов", "quote": _ext_q(100)},
+        {"value": "почти все", "unit": "", "label": "в мире", "quote": _ext_q(103)}]}
+    llm = MockLLM([{"points": [pt]}, ext])
+    out = detect_all(tr, _cl(tr), _ill_only(), llm, log=_SILENT)
+    assert len(out) == 1
+    pl = out[0].payload
+    assert pl.source == "schematic" and pl.intent == "stat"
+    c0 = pl.candidates[0]
+    assert c0["source"] == "schematic" and c0["intent"] == "stat"
+    assert c0["style"] == "minimal"                   # дефолт-тема
+    assert len(c0["fields"]["stats"]) == 2            # оба значения снапнулись
+    assert "quote" not in c0["fields"]["stats"][0]    # служебный quote убран
+    assert pl.candidates[-1]["source"] == "none"      # none ВСЕГДА вариант
+    assert pl.selected == 0
+
+
+def test_schematic_drops_point_when_under_two_values_validate():
+    """<2 снапнутых значения → schematic-кандидата НЕТ (анти-слоп §8). Точка
+    остаётся none (не выдумываем)."""
+    tr = _build_tr(300)
+    pt = {"word_start": 100, "word_end": 108, "concept": "дерево структура",
+          "source": "schematic", "intent": "tree", "image_query_en": ""}
+    # только один узел снапнётся (второй quote — мимо)
+    ext = {"title": "T", "root_label": "R", "nodes": [
+        {"label": "A", "desc": "", "parent": "", "quote": _ext_q(100)},
+        {"label": "B", "desc": "", "parent": "", "quote": "жираф закат вулкан"}]}
+    llm = MockLLM([{"points": [pt]}, ext])
+    out = detect_all(tr, _cl(tr), _ill_only(), llm, log=_SILENT)
+    assert len(out) == 1
+    pl = out[0].payload
+    assert all(c["source"] != "schematic" for c in pl.candidates)
+    assert pl.source == "none"
+
+
+def test_schematic_validates_numbers_against_window():
+    """Выдуманное число в значении (нет в окне речи) → строка дроп (a_code §2.3,
+    политика «числа валидирует код»)."""
+    tr = _build_tr(300)        # токены без чисел → любое число «выдумано»
+    pt = {"word_start": 100, "word_end": 108, "concept": "статистика числа",
+          "source": "schematic", "intent": "stat", "image_query_en": ""}
+    ext = {"eyebrow": "E", "stats": [
+        {"value": "777", "unit": "", "label": "выдумка", "quote": _ext_q(100)},
+        {"value": "888", "unit": "", "label": "выдумка2", "quote": _ext_q(103)}]}
+    llm = MockLLM([{"points": [pt]}, ext])
+    out = detect_all(tr, _cl(tr), _ill_only(), llm, log=_SILENT)
+    # оба числа выдуманы → 0 валидных → schematic дроп → none
+    assert out[0].payload.source == "none"
+
+
+def test_value_in_window_accepts_spoken_number():
+    """Число, реально произнесённое в окне (с нормализацией «11 тысяч»→11000),
+    проходит валидацию; чужое — нет."""
+    from vpipe.models import Word
+    eff = enrich_llm._EffStream()
+    eff.words = [Word("96", 0.0, 0.4), Word("процентов", 0.5, 0.9),
+                 Word("11", 1.0, 1.4), Word("тысяч", 1.5, 1.9)]
+    assert enrich_llm._value_in_window("96%", eff, 0, 4) is True
+    assert enrich_llm._value_in_window("11 000", eff, 0, 4) is True   # 11 тысяч
+    assert enrich_llm._value_in_window("777", eff, 0, 4) is False
+    assert enrich_llm._value_in_window("серверов", eff, 0, 4) is True  # не число
+
+
+def test_candidates_always_include_none_and_selected_zero():
+    """Каждый момент-иллюстрация несёт ≥1 кандидат, none ВСЕГДА доступен,
+    selected=0 (лучший)."""
+    tr = _build_tr(300)
+    llm = MockLLM([{"points": [
+        _photo(15, 20, q="data center", concept="дата-центр"),       # diffusion
+        _pt(150, 155, concept="абстракция успех", q="", source="none",
+            intent="")]}])                                            # none
+    out = detect_all(tr, _cl(tr), _ill_only(), llm, log=_SILENT)
+    assert len(out) == 2
+    for it in out:
+        cands = it.payload.candidates
+        assert len(cands) >= 1
+        assert cands[-1]["source"] == "none"          # none — всегда последним
+        assert it.payload.selected == 0
+
+
+def test_art_direction_prompt_rich_or_empty():
+    p = enrich_llm._art_direction_prompt("server room datacenter")
+    assert p.startswith("server room datacenter")
+    assert "photorealistic" in p and "depth of field" in p
+    assert enrich_llm._art_direction_prompt("") == ""
+    assert enrich_llm._art_direction_prompt("сервер делл") == ""   # русский → ""
+
+
+def test_diagram_rewrite_prefix_killed():
+    """Под нож (§1/§5): _DIAGRAM_REWRITE_PREFIX и diagram→text-free SD удалены."""
+    assert not hasattr(enrich_llm, "_DIAGRAM_REWRITE_PREFIX")
+    assert not hasattr(enrich_llm, "_rewrite_diagram_prompt")
 
 
 # === 4. сбои окон/детекторов ====================================================
@@ -588,7 +777,7 @@ def test_failed_detector_does_not_lose_pass():
     # списки упали целиком (окно), CTA вернул мусор, иллюстрации работают
     llm = MockLLM([RuntimeError("lists down"),
                    {"ctas": "мусор"},
-                   {"points": [_pt(150, 155)]}])
+                   {"points": [_photo(150, 155)]}])
     out = detect_all(tr, _cl(tr), _params(), llm, log=_SILENT)
     assert [it.type for it in out] == [ENR_IMAGE]
 
