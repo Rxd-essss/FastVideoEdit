@@ -109,8 +109,45 @@ def test_ass_path_for_filter_windows():
     assert got == "C\\:/work/sess/burn.ass"
     # POSIX-style absolute path is left as-is (no drive colon to escape).
     assert _ass_path_for_filter("/tmp/x.ass") == "/tmp/x.ass"
-    # Filtergraph delimiters inside the path get escaped.
+    # Filtergraph delimiters inside the path get escaped (quote idiom: below).
     assert _ass_path_for_filter(r"D:\a,b[1];x.ass") == "D\\:/a\\,b\\[1\\]\\;x.ass"
+
+
+def _unquote_single(s: str) -> str:
+    """Minimal shell/ffmpeg single-quote unescaper: '...' spans literal text; a
+    backslash OUTSIDE quotes escapes the next char, so the close-escape-reopen
+    idiom '\\'' collapses back to a literal apostrophe."""
+    out, i, in_q = [], 0, False
+    while i < len(s):
+        c = s[i]
+        if in_q:
+            if c == "'":
+                in_q = False
+            else:
+                out.append(c)
+        elif c == "'":
+            in_q = True
+        elif c == "\\" and i + 1 < len(s):
+            out.append(s[i + 1])
+            i += 1
+        else:
+            out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def test_ass_path_quote_idiom():
+    # #59: an apostrophe inside a single-quoted subtitles='...' value must be the
+    # close-escape-reopen idiom '\'' -- a bare backslash does NOT escape it, so the
+    # old \\' left the quote OPEN and mangled the path, failing the whole burn.
+    got = _ass_path_for_filter("C:/a/Don't panic/burn.ass")
+    assert got == "C\\:/a/Don'\\''t panic/burn.ass"
+    # Wrapped in single quotes it round-trips: the quote layer restores the ' ,
+    # then the subtitles-option layer unescapes the drive colon \: -> : .
+    unq = _unquote_single("'" + got + "'").replace("\\:", ":")
+    assert unq == "C:/a/Don't panic/burn.ass"
+    # A path with no apostrophe is inert under the idiom (no ' introduced).
+    assert "'" not in _ass_path_for_filter("C:/plain/burn.ass")
 
 
 def test_write_ass_karaoke_colors_in_style(tmp_path):

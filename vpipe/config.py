@@ -366,6 +366,13 @@ class RenderCfg(_Base):
     # shortest real speech token (~60-80 ms) so it only removes breath/VAD-edge
     # remnants, never a word. 0 keeps the old behaviour (drop only sub-frame).
     min_segment: float = 0.04
+    # Snap every kept-segment boundary to the source frame grid (round(t*fps)/fps)
+    # BEFORE building the ffmpeg trim graph AND the subtitle/chapter timelines, so
+    # the video (whole-frame trims) and audio (sample-exact atrim) share ONE
+    # quantised timeline -- concat pads no silence at the seams and burned subs /
+    # overlays / chapters never drift on long files. True = correct (default);
+    # False restores the byte-exact legacy (unsnapped) cut offsets.
+    frame_snap: bool = True
 
 
 class AssStyleCfg(_Base):
