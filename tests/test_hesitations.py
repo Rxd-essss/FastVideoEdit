@@ -243,3 +243,82 @@ def test_session_detect_forwards_audio_path_only_when_wav_exists(tmp_path,
     s2 = _detect_stub(tmp_path / "b", wav_present=False)
     serve.Session._detect(s2)
     assert seen["audio_path"] is None
+
+
+# --- #84: word-safe clamp via bisect == old linear scan (perf-only) ----------
+def _old_clamp_detect(gaps, duration, cfg, existing, words):
+    """Reference: the PRE-bisect detect() body with the two O(words) generator
+    scans. The bisect refactor must match this on every input.
+    """
+    dur = max(0.0, float(duration))
+    words = words or []
+    out = []
+    for g_start, g_end in gaps:
+        raw = g_end - g_start
+        if raw < cfg.min_duration or raw >= cfg.max_duration:
+            continue
+        a = g_start + cfg.pad_start
+        b = g_end - cfg.pad_end
+        if words:
+            mid = 0.5 * (g_start + g_end)
+            prev_end = max((w.end for w in words if w.start < mid), default=None)
+            next_start = min((w.start for w in words if w.start >= mid), default=None)
+            if prev_end is not None:
+                a = max(a, prev_end)
+            if next_start is not None:
+                b = min(b, next_start)
+        a = min(max(0.0, a), dur)
+        b = min(max(0.0, b), dur)
+        if (b - a) < cfg.min_duration:
+            continue
+        if _overlaps_existing(a, b, existing, cfg.overlap_threshold):
+            continue
+        out.append((round(a, 3), round(b, 3)))
+    return out
+
+
+def _emitted(out):
+    return [(round(s.start, 3), round(s.end, 3)) for s in out]
+
+
+def test_word_clamp_bisect_equals_linear(monkeypatch):
+    import random
+    rng = random.Random(20260712)
+    cfg = HesitationsCfg(min_duration=0.08, max_duration=0.55,
+                         pad_start=0.04, pad_end=0.04)
+    # ~200 sorted words; some ends overrun the next start (overlapping ASR
+    # timestamps) so the prefix-max branch is exercised, not just words[i-1].end.
+    words = []
+    t = 0.0
+    for _ in range(200):
+        t += rng.uniform(0.05, 0.4)
+        wdur = rng.uniform(0.05, 0.6)         # can exceed the gap to the next word
+        words.append(Word("w", round(t, 3), round(t + wdur, 3)))
+    # ~60 gaps scattered across the same timeline (many land inside word spans)
+    gaps = []
+    for _ in range(60):
+        g0 = rng.uniform(0.0, t)
+        gaps.append((round(g0, 3), round(g0 + rng.uniform(0.05, 0.5), 3)))
+    _patch_gaps(monkeypatch, gaps)
+
+    got = _emitted(detect("x.wav", duration=t + 5.0, cfg=cfg,
+                          existing_segs=[], words=words))
+    ref = _old_clamp_detect(gaps, t + 5.0, cfg, [], words)
+    assert got == ref
+
+
+def test_word_clamp_bisect_overlapping_ends_explicit(monkeypatch):
+    # w0 END (1.30) overruns w1 START (1.00): the bisect prefix-max must keep the
+    # true max end (1.30), NOT a stale words[i-1].end == 1.10. The invariant is
+    # that the bisect clamp yields the IDENTICAL result to the linear reference.
+    # (Here word "a" fills the gap start until 1.30, so both correctly emit
+    # nothing — the point is the two implementations agree.)
+    cfg = HesitationsCfg(min_duration=0.08, max_duration=0.55,
+                         pad_start=0.0, pad_end=0.0)
+    words = [Word("a", 0.50, 1.30), Word("b", 1.00, 1.10),
+             Word("c", 1.80, 2.10)]
+    _patch_gaps(monkeypatch, [(1.20, 1.75)])   # mid = 1.475
+    got = _emitted(detect("x.wav", duration=5.0, cfg=cfg,
+                          existing_segs=[], words=words))
+    ref = _old_clamp_detect([(1.20, 1.75)], 5.0, cfg, [], words)
+    assert got == ref            # bisect clamp identical to the linear reference

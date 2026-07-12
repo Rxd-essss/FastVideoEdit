@@ -204,6 +204,66 @@ _queue_running = False               # editor↔queue GPU mutual-exclusion flag 
 _queue_cancel = threading.Event()    # set by /api/queue/stop to abort the run
 
 
+# --- #94 (UNVERIFIED, opt-in DEFAULT-OFF): debounced transcript flush ---------
+# Rapid single-word proofreading re-serializes the whole multi-MB transcript on
+# every edit. The debounce coalesces a burst into one write, but it is OFF by
+# default: env FVE_TRANSCRIPT_FLUSH_DEBOUNCE_SEC unset/0 -> inline flush on every
+# edit, byte-for-byte with the pre-change behavior. Set it >0 to opt in; the
+# task-start + shutdown/atexit force-flush hooks then bound the loss window.
+_TR_FLUSH_LOCK = threading.Lock()
+_tr_flush_timer: Optional[threading.Timer] = None
+
+
+def _tr_flush_debounce_sec() -> float:
+    """Debounce window in seconds. 0 (default) = disabled = inline flush."""
+    try:
+        return max(0.0, float(
+            os.environ.get("FVE_TRANSCRIPT_FLUSH_DEBOUNCE_SEC", "0") or 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _flush_transcript_now(s) -> None:
+    """Atomic tmp->os.replace of the transcript cache. uuid-unique tmp name so
+    two concurrent writers never collide (audit D-1). No-op without a session/
+    transcript. Never leaves a half-written file under the live name."""
+    if s is None or getattr(s, "transcript", None) is None:
+        return
+    cache_file = s.cache_dir / f"{s.audio_hash}.transcript.json"
+    tmp = cache_file.with_name(f"{cache_file.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        s.transcript.save(tmp)
+        os.replace(tmp, cache_file)
+    finally:
+        tmp.unlink(missing_ok=True)   # no-op после удачного replace
+
+
+def _schedule_transcript_flush(s, delay: float) -> None:
+    """Coalesce a burst of edits: (re)arm a single daemon timer that flushes the
+    captured session after ``delay`` idle seconds."""
+    global _tr_flush_timer
+    with _TR_FLUSH_LOCK:
+        if _tr_flush_timer is not None:
+            _tr_flush_timer.cancel()
+        _tr_flush_timer = threading.Timer(delay, _flush_transcript_now, args=(s,))
+        _tr_flush_timer.daemon = True
+        _tr_flush_timer.start()
+
+
+def _force_flush_pending_transcript(s=None) -> None:
+    """Force a DEBOUNCED-but-unwritten transcript edit to disk NOW. No-op when no
+    timer is pending (i.e. debounce disabled) so default behavior is unchanged.
+    Called on task start and at shutdown/exit."""
+    global _tr_flush_timer
+    with _TR_FLUSH_LOCK:
+        pending = _tr_flush_timer is not None
+        if _tr_flush_timer is not None:
+            _tr_flush_timer.cancel()
+            _tr_flush_timer = None
+    if pending:
+        _flush_transcript_now(s if s is not None else SESSION)
+
+
 def _quarantine_corrupt(path: Path) -> None:
     """Rename a corrupt on-disk state file aside (never delete) so the ctor can
     re-derive it instead of turning /api/open into a raw parser-error 400 (or a
@@ -332,6 +392,10 @@ class Session:
         self.task["stage"] = msg
 
     def start_task(self, name: str, fn) -> None:
+        # #94: any DEBOUNCED transcript edit must land on disk before a long
+        # task (transcribe/detect/render) starts. No-op when debounce is off
+        # (no pending timer) — default byte-for-byte.
+        _force_flush_pending_transcript(self)
         # The batch queue (F3) and the editor must never load models on the 8 GB
         # GPU at once. Check BOTH the queue flag and our own running flag
         # atomically under TASK_LOCK (which also guards _queue_running), then set
@@ -375,6 +439,11 @@ def _cancel_ffmpeg_on_shutdown() -> None:
     safe when nothing is running."""
     try:
         ffmpeg_utils.cancel_all()
+    except Exception:  # noqa: BLE001 — best-effort teardown, never raise on exit
+        pass
+    # #94: persist any debounced transcript edit on graceful ASGI shutdown.
+    try:
+        _force_flush_pending_transcript()
     except Exception:  # noqa: BLE001 — best-effort teardown, never raise on exit
         pass
 
@@ -1569,6 +1638,25 @@ def _render_formats(s: Session, opts: dict, formats: list[str],
     merged: Optional[dict] = None
     errors: list[str] = []
     sidecars_done = False
+    # Perf (#85): the AUTO face-center depends only on (source, whole-file
+    # range) — cutlist_override is None in the formats path, so detect_center
+    # scans the SAME span for every cropped format and returns the SAME cx.
+    # Detect it ONCE here and feed it back explicitly per format so
+    # _run_render_pipeline takes the explicit-float branch instead of re-
+    # scanning per format (removes N-1 face-detection passes). Only when the
+    # client left the center on 'auto' — an explicit user center is respected
+    # untouched. detect_center never raises (0.5 fallback); the guard is belt-
+    # and-suspenders.
+    fixed_center: Optional[str] = None
+    wants_crop = any(f != "source" for f in formats)
+    if wants_crop and str(opts.get("vertical_center", "auto") or "auto") == "auto":
+        try:
+            cx = facecrop_mod.detect_center(
+                s.media.path, s.ff, s.media.duration,
+                samples=s.cfg.render.vertical.samples, start=0.0, end=None)
+            fixed_center = f"{min(1.0, max(0.0, float(cx))):.4f}"
+        except Exception:  # noqa: BLE001 — detection is best-effort (0.5 fallback)
+            fixed_center = None
     for i, f in enumerate(formats):
         if is_cancelled():
             break                                  # cancel между форматами
@@ -1596,6 +1684,10 @@ def _render_formats(s: Session, opts: dict, formats: list[str],
                 "note": "совпадает с исходным форматом — пропущено "
                         "(дубль не рендерим)"})
             continue
+        # Perf (#85): feed the once-detected center so this cropped format
+        # skips its own face-detection pass (same crop, N-1 fewer scans).
+        if fixed_center is not None and f != "source":
+            opts_i["vertical_center"] = fixed_center
         if sidecars_done:
             opts_i.update(subtitles=False, chapters=False, metadata=False)
         if n > 1:
@@ -1703,6 +1795,10 @@ def _queue_process_one(job: QueueJob) -> None:
     #     Re-detect only for a genuinely foreign/stale cutlist (missing or
     #     mismatched `source`).
     _chk()
+    # Free any opt-in cached Whisper model BEFORE the LLM detect / SD / render
+    # stages so a resident large-v3 never collides with qwen3 on the 8 GB card.
+    # No-op unless transcribe.cache_model was enabled (the cache stays empty).
+    transcribe_mod.release_whisper_cache()
     _loaded_cl = getattr(ls, "cutlist", None)
     own_cutlist = (
         _loaded_cl is not None
@@ -2301,7 +2397,11 @@ async def upload(request: Request, name: str = "video.mp4"):
                 if total > MAX_UPLOAD_BYTES:
                     raise HTTPException(413, "Файл слишком большой (>30 ГБ). "
                                              "/ File too large (>30 GB).")
-                f.write(chunk)
+                # #93: f.write is a blocking syscall; on a single-loop uvicorn a
+                # multi-GB upload would otherwise stall every other in-flight
+                # response in bursts (loopback receive outruns disk write).
+                # Offload each write so the event loop stays responsive.
+                await anyio.to_thread.run_sync(f.write, chunk)
         os.replace(tmp, dest)
     except BaseException:
         try:
@@ -2419,19 +2519,17 @@ def put_transcript_word(payload: dict = Body(...)):
     prefix = old[: len(old) - len(old.lstrip())]
     w.word = prefix + new
     segs[si].text = _join_words(words)
-    # Атомарная запись кэша: пишем .tmp и подменяем os.replace — обрыв/краш
-    # посреди записи никогда не оставляет полу-файл под живым именем.
-    # Имя tmp УНИКАЛЬНО на вызов (audit D-1): два параллельных PUT (быстрые
-    # правки соседних слов) с общим .tmp на Windows ловили PermissionError на
-    # os.replace → ложный 500 при уже применённой в памяти правке. С uuid каждый
-    # пишет свой файл, последний replace побеждает с полным состоянием памяти.
-    cache_file = s.cache_dir / f"{s.audio_hash}.transcript.json"
-    tmp = cache_file.with_name(f"{cache_file.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        s.transcript.save(tmp)
-        os.replace(tmp, cache_file)
-    finally:
-        tmp.unlink(missing_ok=True)   # no-op после удачного replace
+    # #94: the in-memory edit above is already applied (GET reads memory). By
+    # default (env FVE_TRANSCRIPT_FLUSH_DEBOUNCE_SEC unset/0) flush the atomic
+    # tmp->os.replace INLINE on every edit — byte-for-byte with the prior
+    # behavior. Opt-in debounce (>0) coalesces a burst of edits into one write;
+    # the task-start + shutdown/atexit force-flush hooks guarantee no edit is
+    # lost. The uuid-unique tmp name (audit D-1) is preserved in both paths.
+    debounce = _tr_flush_debounce_sec()
+    if debounce > 0:
+        _schedule_transcript_flush(s, debounce)
+    else:
+        _flush_transcript_now(s)
     return {"ok": True, "text": w.word, "segment_text": segs[si].text}
 
 
@@ -3691,23 +3789,23 @@ def _run_schematic_candidates(s: Session, items: list, log) -> int:
     if not targets:
         return 0
     try:
-        from vpipe.codegfx.render import render_schematic
+        from vpipe.codegfx.render import render_schematic_cached
     except Exception as e:  # noqa: BLE001 — codegfx ещё не готов / нет Chrome
         log(f"  Код-схема: движок недоступен ({e}) — schematic-кандидаты без "
             "превью (UI покажет none/диффузию).")
         return 0
-    cache_root = Path("cache").resolve()
+    # Perf (#95): route through the idempotent, WxH-aware cache wrapper — it
+    # computes cache/codegfx/<sha1>.png itself and returns the ready PNG WITHOUT
+    # relaunching headless Chrome when a valid one already exists.
     s.stage(f"Монтаж: код-схемы ({len(targets)})…")
     made = 0
     for c, _pl in targets:
         intent = c.get("intent", "")
         style = c.get("style", "minimal")
         fields = c.get("fields") or {}
-        out_png = _codegfx_cache_path(cache_root, intent, style, fields)
         try:
-            out_png.parent.mkdir(parents=True, exist_ok=True)
-            path = render_schematic(intent, fields, style, out_png,
-                                    cfg=cfg_cg, log=log)
+            path = render_schematic_cached(intent, fields, style, cfg=cfg_cg,
+                                           log=log)
         except Exception as e:  # noqa: BLE001 — одна схема не валит остальные
             log(f"  Код-схема «{intent}» упала ({e}).")
             path = None
@@ -4627,6 +4725,66 @@ def _install_connection_reset_filter() -> None:
         logging.getLogger(name).addFilter(flt)
 
 
+def _sweep_uploads(cfg, keep_days: float = 7.0) -> None:
+    """Best-effort GC for work/_uploads (#92): delete files older than
+    ``keep_days`` that are NOT open in the editor and NOT referenced by any
+    queue job. Never raises — a cleanup failure must not block startup."""
+    try:
+        updir = Path(cfg.paths.work_dir) / "_uploads"
+        if not updir.exists():
+            return
+        keep: set[str] = set()
+        s = SESSION
+        if s is not None:
+            try:
+                keep.add(os.path.normcase(str(s.inp.resolve())))
+            except OSError:
+                pass
+        with QUEUE_LOCK:
+            for j in QUEUE:
+                try:
+                    keep.add(os.path.normcase(str(Path(j.path).resolve())))
+                except OSError:
+                    continue
+        cutoff = time.time() - keep_days * 86400.0
+        for p in updir.iterdir():
+            try:
+                if not p.is_file() or p.suffix.lower() == ".part":
+                    continue
+                if os.path.normcase(str(p.resolve())) in keep:
+                    continue
+                if p.stat().st_mtime < cutoff:
+                    p.unlink()
+            except OSError:
+                pass
+    except Exception:  # noqa: BLE001 — never block startup
+        pass
+
+
+def _sweep_img_cache(cfg) -> None:
+    """Opt-in, default-OFF age sweep of the IMAGE caches only (enrich_img /
+    codegfx) (#96). ``cache_img_max_age_days == 0`` (default) => never evict —
+    exact current behavior. Never touches transcript/peaks (correctness caches)
+    or work/ dirs. Best-effort; a cleanup failure must not block startup."""
+    try:
+        max_age = int(getattr(cfg.paths, "cache_img_max_age_days", 0) or 0)
+        if max_age <= 0:
+            return
+        cutoff = time.time() - max_age * 86400
+        for sub in ("enrich_img", "codegfx"):
+            d = Path(cfg.paths.cache_dir) / sub
+            if not d.exists():
+                continue
+            for p in d.rglob("*.png"):
+                try:
+                    if p.stat().st_mtime < cutoff:
+                        p.unlink()
+                except OSError:
+                    pass
+    except Exception:  # noqa: BLE001 — best-effort, never block startup
+        pass
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="FastVideoEdit web editor")
     ap.add_argument("--video", default=None, help="video to open (optional — you can pick one in the UI)")
@@ -4696,6 +4854,13 @@ def main() -> int:
     except Exception:  # noqa: BLE001 — best-effort cleanup, never block startup
         pass
 
+    # GC the multi-GB work/_uploads leak (#92) and run the opt-in image-cache
+    # LRU sweep (#96, default-off). Placed AFTER _load_queue()/open_session so
+    # the keep-set (open session + every queued job) is complete; both are
+    # best-effort and never block startup.
+    _sweep_uploads(cfg)
+    _sweep_img_cache(cfg)
+
     # Pin the Host header (DNS-rebinding defence). Added here, not at module
     # scope, so the TestClient (Host: testserver) isn't rejected by the suite.
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=_allowed_hosts(args.host))
@@ -4730,6 +4895,8 @@ def main() -> int:
     # GPU + a .part lock. Registered HERE (not at import) so import-only test
     # processes don't add a global hook.
     atexit.register(ffmpeg_utils.cancel_all)
+    # #94: also persist any debounced-but-unwritten transcript edit on exit.
+    atexit.register(_force_flush_pending_transcript)
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
     return 0
 

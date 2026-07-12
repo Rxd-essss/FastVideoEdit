@@ -491,7 +491,8 @@ def test_ill_snap_to_segment_start_and_duration_clamp():
     assert it.payload.source == "diffusion"
     assert it.payload.candidates[0]["source"] == "diffusion"
     assert it.payload.candidates[0]["prompt"].startswith("laptop on desk")
-    assert "photorealistic" in it.payload.candidates[0]["prompt"]
+    # #88: кандидат несёт ГОЛЫЙ subject; фото-хвост добавит imagegen (STYLE_SUFFIX)
+    assert it.payload.candidates[0]["prompt"] == "laptop on desk"
     # none ВСЕГДА как вариант
     assert it.payload.candidates[-1]["source"] == "none"
     # обратная совместимость плоского пути: помечен на SD
@@ -773,10 +774,12 @@ def test_candidates_always_include_none_and_selected_zero():
         assert it.payload.selected == 0
 
 
-def test_art_direction_prompt_rich_or_empty():
+def test_art_direction_prompt_bare_subject_or_empty():
+    # #88: фото-хвост (photorealistic/depth of field) добавляет imagegen через
+    # STYLE_SUFFIX — арт-дир возвращает ГОЛЫЙ subject, без дублированного хвоста.
     p = enrich_llm._art_direction_prompt("server room datacenter")
-    assert p.startswith("server room datacenter")
-    assert "photorealistic" in p and "depth of field" in p
+    assert p == "server room datacenter"
+    assert "photorealistic" not in p and "depth of field" not in p
     assert enrich_llm._art_direction_prompt("") == ""
     assert enrich_llm._art_direction_prompt("сервер делл") == ""   # русский → ""
 

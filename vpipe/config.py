@@ -17,6 +17,12 @@ class PathsCfg(_Base):
     out_dir: str = "./out"
     cache_dir: str = "./cache"
     work_dir: str = "./work"
+    # Startup LRU sweep of the IMAGE caches only (enrich_img/codegfx). 0 =
+    # disabled (default; unbounded, as today). >0 deletes PNGs older than N
+    # days by mtime. Never touches transcript/peaks (correctness caches) or
+    # active work dirs. (#96, verdict unverified — validate growth before
+    # picking a non-zero default.)
+    cache_img_max_age_days: int = 0
 
 
 class FfmpegCfg(_Base):
@@ -48,6 +54,10 @@ class TranscribeCfg(_Base):
     vad_min_silence_ms: int = 500
     fallback_models: list[str] = Field(default_factory=lambda: ["medium", "small"])
     cache: bool = True
+    # держать модель Whisper в VRAM между заданиями очереди (эконом на N клипов);
+    # по умолчанию ВЫКЛ — на 8ГБ карте она конфликтует с qwen3 detect/SD. Требует
+    # явной выгрузки перед LLM/рендером (transcribe.release_whisper_cache()).
+    cache_model: bool = False
 
 
 class PausesCfg(_Base):

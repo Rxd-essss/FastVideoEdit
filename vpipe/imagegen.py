@@ -24,6 +24,7 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable, Optional
 
 LogFn = Callable[..., None]
@@ -131,6 +132,68 @@ def _seed_for(query_en: str, seed: int) -> int:
     return int(h[:8], 16) & 0x7FFFFFFF
 
 
+def _sd_cmd_core(binp: str, model: str, prompt: str, negative: str, seed: int,
+                 W: int, H: int, steps: int, cfg_scale: float,
+                 vae: Optional[str], cfg) -> list[str]:
+    """Общий костяк ``sd-cli``-команды: один кадр (``generate_image``) и батч
+    (``_run_sd_batch``) делят ИДЕНТИЧНЫЕ флаги (§5.4, #40) — включая ``--vae`` и
+    ``--max-vram``, чтобы батч-путь НЕ терял VRAM-гард. Вызывающий дописывает
+    ``-o`` (и ``-b N`` для батча)."""
+    cmd = [
+        binp, "-M", "img_gen",
+        "-m", model,
+        "-p", prompt,
+        "-n", negative,
+        "--steps", str(steps),
+        "--cfg-scale", str(cfg_scale),
+        "--sampling-method", SAMPLING_METHOD,
+        "--diffusion-fa",
+        "-W", str(int(W)), "-H", str(int(H)),
+        "-s", str(int(seed)),
+    ]
+    if vae:
+        cmd += ["--vae", vae]           # sdxl_vae_fp16fix: стабильнее цвет (§5.6)
+    if bool(getattr(cfg, "imagegen_vae_on_cpu", False)):
+        cmd.append("--vae-on-cpu")
+    # VRAM-гард (#40): <0 = авто-детект свободной VRAM; 0 = выкл (неограниченно).
+    try:
+        max_vram = float(getattr(cfg, "imagegen_max_vram", -1.0))
+    except (TypeError, ValueError):
+        max_vram = -1.0
+    if max_vram != 0.0:
+        cmd += ["--max-vram", str(max_vram)]
+    return cmd
+
+
+def _plan_frame(query_en: str, style_suffix, seed: int, W: int, H: int, cfg,
+                cache_dir, model: str) -> SimpleNamespace:
+    """Детерминированный план ОДНОГО кадра: итоговый кэш-путь + разрешённые
+    параметры команды. ``generate_image`` и ``generate_candidates`` (батч) зовут
+    ЕГО, чтобы посидовый кэш-ключ совпадал байт-в-байт — тогда повторный прогон
+    батча попадает в all-cached fast-path (0 subprocess). НЕ бросает при валидной
+    модели."""
+    suffix = style_suffix if style_suffix is not None else STYLE_SUFFIX
+    steps = max(1, int(getattr(cfg, "imagegen_steps", DIFFUSION_STEPS)))
+    cfg_scale = float(getattr(cfg, "imagegen_cfg", CFG_SCALE) or CFG_SCALE)
+    real_seed = _seed_for(query_en, seed)
+    prompt = query_en + suffix
+    # Сильнее негатив для сцен с людьми (руки/пальцы — c_diff §2б, кадр 03).
+    negative = NEGATIVE_PROMPT
+    if _PEOPLE_RE.search(prompt):
+        negative += NEGATIVE_PEOPLE
+    vae = _resolve_model(getattr(cfg, "imagegen_vae", "") or "")
+    # АБСОЛЮТНЫЙ путь обязателен: enrich.ImagePayload._abs_path (P2 path-traversal
+    # guard) обнуляет любой ОТНОСИТЕЛЬНЫЙ asset_path при перезагрузке/санитайзе
+    # плана — иначе сгенерированная картинка «отвязывается» от карточки. resolve().
+    cache = (Path(cache_dir) if cache_dir is not None else CACHE_DIR).resolve()
+    # cfg-scale/vae входят в ключ (меняют картинку) через слот model_sig.
+    key = _cache_key(prompt, suffix, negative, real_seed, W, H, steps,
+                     f"{_model_hash(model)}:cfg{cfg_scale}:vae{bool(vae)}")
+    return SimpleNamespace(out_png=cache / f"{key}.png", cache=cache,
+                           prompt=prompt, negative=negative, seed=real_seed,
+                           steps=steps, cfg_scale=cfg_scale, vae=vae)
+
+
 def generate_image(query_en: str, style_suffix: str, seed: int, W: int, H: int,
                    *, cfg, cache_dir: Optional[Path] = None,
                    log: LogFn = _noop) -> Optional[str]:
@@ -161,63 +224,22 @@ def generate_image(query_en: str, style_suffix: str, seed: int, W: int, H: int,
         log("  SD: модель .gguf не настроена (imagegen_model) — фолбэк.")
         return None
 
-    suffix = style_suffix if style_suffix is not None else STYLE_SUFFIX
-    steps = max(1, int(getattr(cfg, "imagegen_steps", DIFFUSION_STEPS)))
-    cfg_scale = float(getattr(cfg, "imagegen_cfg", CFG_SCALE) or CFG_SCALE)
-    real_seed = _seed_for(query_en, seed)
-    prompt = query_en + suffix
-    # Сильнее негатив для сцен с людьми (руки/пальцы — c_diff §2б, кадр 03).
-    negative = NEGATIVE_PROMPT
-    if _PEOPLE_RE.search(prompt):
-        negative += NEGATIVE_PEOPLE
-    vae = _resolve_model(getattr(cfg, "imagegen_vae", "") or "")
-
-    # АБСОЛЮТНЫЙ путь обязателен: enrich.ImagePayload._abs_path (P2 path-traversal
-    # guard) обнуляет любой ОТНОСИТЕЛЬНЫЙ asset_path при перезагрузке/санитайзе
-    # плана — иначе сгенерированная картинка «отвязывается» от карточки (asset_kind
-    # =user, но asset_path пустой → blank-превью, рендер дропает). resolve() здесь.
-    cache = (Path(cache_dir) if cache_dir is not None else CACHE_DIR).resolve()
-    # cfg-scale/vae входят в ключ (меняют картинку): добавлены в model_sig-слот
-    # как часть сигнатуры (старые кэши инвалидируются честно — новые настройки §5).
-    key = _cache_key(prompt, suffix, negative, real_seed, W, H,
-                     steps, f"{_model_hash(model)}:cfg{cfg_scale}:vae{bool(vae)}")
-    out_png = cache / f"{key}.png"
+    # §5-план кадра (кэш-ключ + разрешённые параметры) — общий с батч-путём, чтобы
+    # посидовый кэш совпадал байт-в-байт (см. _plan_frame / generate_candidates).
+    fr = _plan_frame(query_en, style_suffix, seed, W, H, cfg, cache_dir, model)
+    out_png = fr.out_png
     if out_png.is_file() and out_png.stat().st_size > 0:
         return str(out_png)             # идемпотентно: уже сгенерировано
 
-    cache.mkdir(parents=True, exist_ok=True)
+    fr.cache.mkdir(parents=True, exist_ok=True)
     # ВАЖНО: sd-cli выбирает формат по расширению ``-o`` и НЕ понимает ``.tmp``
     # (дописывает ``.png`` -> файл ``<key>.png.tmp.png``). Поэтому временный путь
     # обязан оканчиваться на ``.png``; затем атомарно переименовываем в out_png.
     tmp = out_png.with_name(out_png.stem + ".tmp.png")
-    cmd = [
-        binp, "-M", "img_gen",
-        "-m", model,
-        "-p", prompt,
-        "-n", negative,
-        "--steps", str(steps),
-        "--cfg-scale", str(cfg_scale),
-        "--sampling-method", SAMPLING_METHOD,
-        "--diffusion-fa",
-        "-W", str(int(W)), "-H", str(int(H)),
-        "-s", str(real_seed),
-        "-o", str(tmp),
-    ]
-    if vae:
-        cmd += ["--vae", vae]           # sdxl_vae_fp16fix: стабильнее цвет (§5.6)
-    if bool(getattr(cfg, "imagegen_vae_on_cpu", False)):
-        cmd.append("--vae-on-cpu")
-    # VRAM-гард (#40): sd-cli режет граф под доступную VRAM, когда qwen3 не
-    # успела выгрузиться (8 ГБ карта) — обещанный llm.unload/_wait_ollama_unloaded
-    # фолбэк. <0 = авто-детект свободной VRAM; 0 = выкл (неограниченно).
-    try:
-        max_vram = float(getattr(cfg, "imagegen_max_vram", -1.0))
-    except (TypeError, ValueError):
-        max_vram = -1.0
-    if max_vram != 0.0:
-        cmd += ["--max-vram", str(max_vram)]
-    log(f"  SD: генерация «{query_en}» ({W}x{H}, {steps} шагов, "
-        f"cfg {cfg_scale}, seed {real_seed})…")
+    cmd = _sd_cmd_core(binp, model, fr.prompt, fr.negative, fr.seed, W, H,
+                       fr.steps, fr.cfg_scale, fr.vae, cfg) + ["-o", str(tmp)]
+    log(f"  SD: генерация «{query_en}» ({W}x{H}, {fr.steps} шагов, "
+        f"cfg {fr.cfg_scale}, seed {fr.seed})…")
     try:
         r = subprocess.run(cmd, capture_output=True, text=True,
                            encoding="utf-8", errors="replace",
@@ -249,40 +271,108 @@ def generate_image(query_en: str, style_suffix: str, seed: int, W: int, H: int,
     return str(out_png)
 
 
+def _run_sd_batch(prompt: str, base: int, count: int, W: int, H: int, cfg,
+                  cache_dir, log: LogFn) -> Optional[list[Path]]:
+    """Один процесс sd-cli на N кандидатов (``-b N -s base``): грузит ~4 ГБ GGUF
+    ОДИН раз вместо N (#82). Возвращает упорядоченный список ``count`` временных
+    PNG (сиды base..base+count-1, шаблон ``b_%03d.tmp.png``) или ``None`` при
+    любом сбое/несовпадении числа выходов — вызывающий откатывается на посидовый
+    цикл (корректность > 1 загрузка; -b/%03d-семантика бинаря может отличаться)."""
+    binp = _resolve_sd_bin(getattr(cfg, "imagegen_bin", "tools/sd-cli.exe"))
+    model = _resolve_model(getattr(cfg, "imagegen_model", ""))
+    if not binp or not model:
+        return None
+    fr = _plan_frame(prompt, STYLE_SUFFIX, base, W, H, cfg, cache_dir, model)
+    fr.cache.mkdir(parents=True, exist_ok=True)
+    tmpl = fr.cache / "b_%03d.tmp.png"
+    cmd = _sd_cmd_core(binp, model, fr.prompt, fr.negative, base, W, H,
+                       fr.steps, fr.cfg_scale, fr.vae, cfg) \
+        + ["-b", str(count), "-o", str(tmpl)]
+    log(f"  SD: батч {count} кандидатов «{prompt}» "
+        f"({W}x{H}, {fr.steps} шагов, seed base {base})…")
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace",
+                           timeout=SD_TIMEOUT_S * max(1, count))
+    except (subprocess.TimeoutExpired, OSError) as e:
+        log(f"  SD: батч упал ({e}) — посидовый фолбэк.")
+        return None
+    if r.returncode != 0:
+        tail = " | ".join((r.stderr or r.stdout or "").strip().splitlines()[-3:])
+        log(f"  SD: батч завершился с ошибкой (exit {r.returncode})"
+            + (f": {tail}" if tail else "") + " — посидовый фолбэк.")
+        return None
+    produced: list[Path] = []
+    for i in range(count):
+        f = fr.cache / f"b_{i:03d}.tmp.png"
+        if f.is_file() and f.stat().st_size > 0:
+            produced.append(f)
+    if len(produced) != count:          # наименование/начало-индекс не совпали
+        for f in produced:
+            _unlink(f)
+        return None
+    return produced
+
+
 def generate_candidates(prompt: str, cfg, *, n: Optional[int] = None,
                         cache_dir: Optional[Path] = None,
                         log: LogFn = _noop) -> list[str]:
-    """N кандидатов одного photo-момента (§5.5, c_diff §2г): N разных сидов одного
-    арт-дирекшн-промпта → список путей к PNG (юзер выберет лучший в «Монтаже»).
+    """N кандидатов одного photo-момента (§5.5): N ПОСЛЕДОВАТЕЛЬНЫХ детерминиро-
+    ванных сидов (base..base+N-1, base=хэш промпта) → список путей к PNG (юзер
+    выберет лучший в «Монтаже»).
 
-    N = cfg.imagegen_candidates (дефолт ``DIFFUSION_CANDIDATES``=4). Сиды
-    детерминированы (хэш «prompt#i») — повторный прогон даёт те же 4 кадра (кэш
-    переиспользуется). Каждый кадр через ``generate_image`` (graceful-degrade:
-    упавший сид просто не попадает в список). Пустой/без-бинаря → []. Реальный
-    батч ``-b N`` амортизирует загрузку модели — здесь последовательно (бинарь
-    кэширует модель в рамках процесса при общем прогоне; простота > 1 загрузка)."""
+    N = cfg.imagegen_candidates (дефолт ``DIFFUSION_CANDIDATES``=4). #82: ОДИН
+    батч-процесс sd-cli (``-b N``) грузит ~4 ГБ GGUF один раз вместо N. Идемпо-
+    тентно: если все N уже в кэше — 0 subprocess (fast-path). Батч недоступен/
+    сбой/не то число выходов → откат на посидовый ``generate_image`` (корректность
+    > 1 загрузка; упавший сид просто не попадает в список). Пустой промпт → []."""
     prompt = " ".join((prompt or "").split())
     if not prompt:
         return []
     size = max(64, int(getattr(cfg, "imagegen_size", 768)))
     count = n if (isinstance(n, int) and n > 0) else \
         max(1, int(getattr(cfg, "imagegen_candidates", DIFFUSION_CANDIDATES)))
-    out: list[str] = []
+    binp = _resolve_sd_bin(getattr(cfg, "imagegen_bin", "tools/sd-cli.exe"))
+    model = _resolve_model(getattr(cfg, "imagegen_model", ""))
+    base = _seed_for(prompt, -1)
+    seeds = [(base + i) & 0x7FFFFFFF for i in range(count)]
+    # Плановый итоговый кэш-путь на КАЖДЫЙ сид (ТОТ ЖЕ ключ, что у generate_image).
+    planned = ([(_plan_frame(prompt, STYLE_SUFFIX, s, size, size, cfg,
+                             cache_dir, model).out_png, s) for s in seeds]
+               if model else [])
+    if planned:
+        cached = [str(p) for (p, _s) in planned
+                  if p.is_file() and p.stat().st_size > 0]
+        if len(cached) == count:                 # FAST-PATH: 0 subprocess
+            return list(dict.fromkeys(cached))
+    # Один батч-процесс амортизирует загрузку модели на все N сидов (#82).
+    if binp and model and planned:
+        produced = _run_sd_batch(prompt, base, count, size, size, cfg,
+                                 cache_dir, log)
+        if produced is not None and len(produced) == count:
+            out: list[str] = []
+            for (final_png, _s), src in zip(planned, produced):
+                try:
+                    os.replace(src, final_png)   # b_%03d.tmp.png → <key>.png
+                    out.append(str(final_png))
+                except OSError:
+                    _unlink(src)
+            if out:
+                return list(dict.fromkeys(out))
+    # ФОЛБЭК: посидовый цикл (батч не поддержан/сбой/не то число выходов).
+    out2: list[str] = []
     seen: set[str] = set()
-    for i in range(count):
-        # детерминированный РАЗНЫЙ сид на кандидата: хэш «prompt#i» → стабильно
-        # между прогонами, но 4 разных кадра (не один и тот же сид × 4).
-        seed = _seed_for(f"{prompt}#{i}", -1)
+    for s in seeds:
         try:
-            path = generate_image(prompt, STYLE_SUFFIX, seed, size, size,
-                                  cfg=cfg, cache_dir=cache_dir, log=log)
+            p = generate_image(prompt, STYLE_SUFFIX, s, size, size,
+                               cfg=cfg, cache_dir=cache_dir, log=log)
         except Exception as e:  # noqa: BLE001 — один сид не валит остальные
-            log(f"  SD: кандидат {i} упал ({e}).")
-            path = None
-        if path and path not in seen:
-            seen.add(path)
-            out.append(path)
-    return out
+            log(f"  SD: кандидат {s} упал ({e}).")
+            p = None
+        if p and p not in seen:
+            seen.add(p)
+            out2.append(p)
+    return out2
 
 
 def _unlink(p: Path) -> None:

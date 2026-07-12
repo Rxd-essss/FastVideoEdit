@@ -347,6 +347,7 @@ def _install_fake_codegfx(monkeypatch, render_fn):
     pkg.__path__ = []                                # пакет
     mod = types.ModuleType("vpipe.codegfx.render")
     mod.render_schematic = render_fn
+    mod.render_schematic_cached = render_fn   # #95: images stage imports the cached wrapper
     monkeypatch.setitem(sys.modules, "vpipe.codegfx", pkg)
     monkeypatch.setitem(sys.modules, "vpipe.codegfx.render", mod)
 
@@ -477,7 +478,9 @@ def test_images_stage_renders_schematic_via_codegfx(client, monkeypatch,
     out_png = tmp_path / "sch.png"
     out_png.write_bytes(b"\x89PNG")
 
-    def fake_render(intent, fields, style, out, *, cfg=None, log=None):
+    def fake_render(intent, fields, style, cfg=None, *, cache_dir=None, log=None):
+        # #95: render_schematic_cached picks the path itself (no `out` arg) and
+        # returns it — the images stage reads asset_path/preview from the return.
         seen["calls"].append((intent, style, dict(fields)))
         return str(out_png)
 

@@ -46,4 +46,8 @@ Thumbs.db
 /tools/*.dll
 /tools/*.gguf
 /tools/*.safetensors
+# Repo-local SD model/VAE (sdxl-turbo-Q4_0.gguf, sdxl_vae_fp16fix.safetensors):
+# immune to temp-dir cleanup (#89). config.yaml (LOCAL-ONLY) points imagegen_model
+# / imagegen_vae here; keep the big binaries out of git.
+/models/
 /MONTAGE_V2_PLAN.md

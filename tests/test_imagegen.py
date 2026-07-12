@@ -74,6 +74,15 @@ def test_resolve_model(monkeypatch, tmp_path):
     assert imagegen._resolve_model(str(tmp_path / "no.gguf")) is None
 
 
+def test_resolve_model_repo_root_relative(monkeypatch, tmp_path):
+    """#89: модель живёт в repo-local models/ (gitignored) — резолвится через
+    _REPO_ROOT, иммунна к чистке D:/tmp (зеркало resolve_sd_bin для models/)."""
+    monkeypatch.setattr(imagegen, "_REPO_ROOT", tmp_path)
+    (tmp_path / "models").mkdir()
+    m = _touch(tmp_path / "models" / "sdxl-turbo-Q4_0.gguf")
+    assert imagegen._resolve_model("models/sdxl-turbo-Q4_0.gguf") == str(m)
+
+
 # === 2. детерминированный сид ===================================================
 def test_seed_for_deterministic_hash_and_passthrough():
     assert imagegen._seed_for("ubuntu linux desktop", 42) == 42      # >=0 как есть
@@ -402,26 +411,92 @@ def test_generate_max_vram_disabled_when_zero(monkeypatch, tmp_path):
     assert "--max-vram" not in seen["cmd"]
 
 
-def test_generate_candidates_n4_distinct_seeds(monkeypatch, tmp_path):
-    """generate_candidates → N=4 кадра разными (детерминированными) сидами."""
-    seeds_seen = []
+def test_generate_candidates_batch_single_process(monkeypatch, tmp_path):
+    """#82: N кандидатов = ОДИН sd-cli-процесс (`-b N -s base`), не N загрузок
+    ~4 ГБ модели. Мокаем subprocess: ровно один вызов; флаги -b N / -s base /
+    -o %03d / --max-vram; пишем N фейковых PNG по %03d-шаблону → N путей назад."""
+    from pathlib import Path
+    _touch(tmp_path / "sd-cli.exe")
+    _touch(tmp_path / "m.gguf", b"M" * 100)
+    cfg = _cfg(tmp_path)
+    cache = tmp_path / "cache"
+    calls = {"n": 0}
+    base = imagegen._seed_for("data center aisle", -1)
 
-    def fake_gen(prompt, suffix, seed, W, H, *, cfg, cache_dir=None, log=None):
-        seeds_seen.append(seed)
-        return str(tmp_path / f"s{seed}.png")
+    def fake_run(cmd, **kw):
+        calls["n"] += 1
+        assert cmd[cmd.index("-b") + 1] == "4"             # батч на 4 сида
+        assert cmd[cmd.index("-s") + 1] == str(base)       # детерминированный base
+        assert "--max-vram" in cmd                         # VRAM-гард не потерян
+        outp = cmd[cmd.index("-o") + 1]
+        assert "%03d" in outp                              # image-sequence шаблон
+        for i in range(4):
+            Path(outp % i).write_bytes(b"\x89PNG fake")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-    monkeypatch.setattr(imagegen, "generate_image", fake_gen)
-    paths = imagegen.generate_candidates("data center aisle", _cfg(tmp_path),
-                                         log=_SILENT)
-    assert len(paths) == 4                             # cfg.imagegen_candidates
-    assert len(set(seeds_seen)) == 4                   # 4 РАЗНЫХ сида
-    # детерминизм: повторный прогон — те же сиды (кэш переиспользуется)
-    seeds2 = []
-    monkeypatch.setattr(imagegen, "generate_image",
-                        lambda *a, **k: (seeds2.append(a[2]),
-                                         str(tmp_path / f"s{a[2]}.png"))[1])
-    imagegen.generate_candidates("data center aisle", _cfg(tmp_path), log=_SILENT)
-    assert seeds2 == seeds_seen
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    paths = imagegen.generate_candidates("data center aisle", cfg,
+                                         cache_dir=cache, log=_SILENT)
+    assert calls["n"] == 1                                 # ОДИН процесс, не 4
+    assert len(paths) == 4 and len(set(paths)) == 4
+    for p in paths:
+        assert Path(p).is_file() and p.endswith(".png")
+    # временные b_%03d.tmp.png переименованы в кэш-пути, не висят
+    assert not list(Path(cache).resolve().glob("b_*.tmp.png"))
+
+
+def test_generate_candidates_all_cached_no_subprocess(monkeypatch, tmp_path):
+    """Идемпотентность: если все N кандидатов уже в кэше — 0 subprocess (#82)."""
+    from pathlib import Path
+    _touch(tmp_path / "sd-cli.exe")
+    _touch(tmp_path / "m.gguf", b"M" * 100)
+    cfg = _cfg(tmp_path)
+    cache = tmp_path / "cache"
+
+    def writing_run(cmd, **kw):
+        outp = cmd[cmd.index("-o") + 1]
+        for i in range(4):
+            Path(outp % i).write_bytes(b"\x89PNG fake")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", writing_run)
+    first = imagegen.generate_candidates("linux server room", cfg,
+                                         cache_dir=cache, log=_SILENT)
+    assert len(first) == 4
+
+    def boom(cmd, **kw):
+        raise AssertionError("subprocess must NOT run when all cached")
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    again = imagegen.generate_candidates("linux server room", cfg,
+                                         cache_dir=cache, log=_SILENT)
+    assert again == first                                 # fast-path, тот же список
+
+
+def test_generate_candidates_batch_failure_falls_back(monkeypatch, tmp_path):
+    """Батч отвалился (или его -b/%03d-семантика иная) → посидовый generate_image
+    фолбэк (корректность > 1 загрузка). Мок: -b → non-zero, одиночный → пишет PNG."""
+    from pathlib import Path
+    _touch(tmp_path / "sd-cli.exe")
+    _touch(tmp_path / "m.gguf", b"M" * 100)
+    cfg = _cfg(tmp_path)
+    cache = tmp_path / "cache"
+    seen = {"batch": 0, "single": 0}
+
+    def fake_run(cmd, **kw):
+        if "-b" in cmd:                                   # батч → падаем
+            seen["batch"] += 1
+            return SimpleNamespace(returncode=1, stdout="", stderr="boom")
+        seen["single"] += 1                               # посидовый → успех
+        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"\x89PNG")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    paths = imagegen.generate_candidates("edge network node", cfg,
+                                         cache_dir=cache, log=_SILENT)
+    assert seen["batch"] == 1                             # попробовали батч один раз
+    assert seen["single"] == 4                            # откатились на 4 одиночных
+    assert len(paths) == 4 and len(set(paths)) == 4
 
 
 def test_generate_candidates_empty_prompt_returns_empty(tmp_path):

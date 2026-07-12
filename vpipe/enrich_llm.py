@@ -1159,19 +1159,19 @@ def _extract_schematic(intent: str, eff: _EffStream, lo: int, hi: int, llm,
 # LLM пишет БОГАТЫЙ промпт (subject+свет+линза+grade); фото-суффикс/негатив — в
 # imagegen.py. Здесь — лёгкий код-обогатитель голого query_en, когда отдельного
 # LLM-вызова за арт-дирекшном делать не хочется (дёшево, без сети). Доказано
-# (c_diff §1/§2): голый query = слоп; «cinematic… depth of field… photorealistic»
-# = кадр. Суффикс STYLE_SUFFIX добавит imagegen — здесь только subject-обогащение.
-_ARTDIR_SUFFIX = (", cinematic lighting, shallow depth of field, "
-                  "photorealistic, professional photography, ultra detailed")
+# (c_diff §1/§2): голый query = слоп; фото-хвост (cinematic/depth of field/
+# photorealistic + grade) добавляет imagegen.generate_image через STYLE_SUFFIX.
+# Здесь его НЕ дублируем (#88: раньше суффикс шёл ДВАЖДЫ — арт-дир + STYLE_SUFFIX).
 
 
 def _art_direction_prompt(query_en: str) -> str:
-    """Голый английский query_en → БОГАТЫЙ арт-дирекшн-промпт (§5). Код-путь
-    (без LLM): subject как есть + кинематографичный хвост. Пусто/русский → ""."""
+    """Голый английский query_en → subject для диффузии (§5). Фото-хвост
+    (свет/линза/grade) добавляет imagegen.generate_image через STYLE_SUFFIX —
+    здесь НЕ дублируем его (#88). Пусто/русский → ""."""
     q = " ".join((query_en or "").split())
     if not q or _CYRILLIC.search(q):
         return ""
-    return q + _ARTDIR_SUFFIX
+    return q
 
 
 # === §3.3 детектор-классификатор иллюстраций + сборка кандидатов =================

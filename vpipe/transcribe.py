@@ -245,21 +245,48 @@ def _model_ladder(cfg: TranscribeCfg) -> list[str]:
     return ladder
 
 
+# Optional, DEFAULT-OFF cross-call model cache (TranscribeCfg.cache_model). A
+# batch queue of same-model clips otherwise pays one cold WhisperModel build per
+# clip; with the flag on the model stays resident and is reused. It MUST be
+# evicted before any VRAM-competing stage (LLM detect, SD, render) — hence the
+# release hook below, wired into the queue worker before detection. When the
+# flag is off the dict stays empty and every path is byte-for-byte as before.
+_MODEL_CACHE: dict = {}   # (size, device, ctype) -> WhisperModel
+
+
+def release_whisper_cache() -> None:
+    """Evict any cached WhisperModel + free VRAM. Safe no-op when the cache is
+    empty (i.e. cache_model was never enabled), so callers can invoke it before
+    every VRAM-competing stage unconditionally without changing default timing.
+    """
+    if _MODEL_CACHE:
+        _MODEL_CACHE.clear()
+        _free_gpu()
+
+
 def _run_once(audio_path: str, size: str, device: str, ctype: str,
               cfg: TranscribeCfg, duration: float, audio_hash: str,
               log, on_progress=None) -> Transcript:
     log(f"  loading whisper '{size}' on {device} ({ctype}) ...")
-    # First run only: announce the silent HF download + progress watcher.
-    # No-op (None) when the model is already in the local cache.
-    stop_watch = _start_download_watch(size, log)
-    try:
-        model = _load_model(size, device, ctype, log)
-    finally:
-        if stop_watch is not None:
-            try:
-                stop_watch()
-            except Exception:
-                pass  # never let the watcher mask the real outcome
+    # Optional (default-OFF) cross-call cache: reuse a resident model on a hit so
+    # a batch of same-model clips skips repeated CTranslate2 init + VRAM upload.
+    cache_on = bool(getattr(cfg, "cache_model", False))
+    _key = (size, device, ctype)
+    model = _MODEL_CACHE.get(_key) if cache_on else None
+    if model is None:
+        # First run only: announce the silent HF download + progress watcher.
+        # No-op (None) when the model is already in the local cache.
+        stop_watch = _start_download_watch(size, log)
+        try:
+            model = _load_model(size, device, ctype, log)
+        finally:
+            if stop_watch is not None:
+                try:
+                    stop_watch()
+                except Exception:
+                    pass  # never let the watcher mask the real outcome
+        if cache_on:
+            _MODEL_CACHE[_key] = model
     try:
         log(f"  transcribe attempt: model='{size}' device={device} ({ctype})")
         seg_iter, info = model.transcribe(
@@ -292,8 +319,11 @@ def _run_once(audio_path: str, size: str, device: str, ctype: str,
                           device_used=device,
                           audio_hash=audio_hash, segments=segments)
     finally:
-        del model
-        _free_gpu()
+        # When caching is on the cache owns the model's lifetime; otherwise free
+        # it immediately so it never shares the 8 GB card with the next stage.
+        if not cache_on:
+            del model
+            _free_gpu()
 
 
 def transcribe_audio(audio_path: str | Path, cfg: TranscribeCfg,
