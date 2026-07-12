@@ -91,3 +91,60 @@ def test_word_clip_dropped_when_clamp_collapses(monkeypatch):
     words = [Word("слово", 0.4, 1.2, 0.9), Word("дальше", 1.6, 2.2, 0.9)]
     safe = H.detect("x.wav", 3.0, _cfg(), [], words=words)
     assert safe == []      # nothing safe to cut here -> no word-clipping cut
+
+
+# --- R1: shared effective-cutlist helper (encoder == subs == chapters) --------
+def test_effective_cut_drops_sliver_and_merges_removed():
+    """A 30 ms kept sliver between two near-adjacent cuts is dropped, and the
+    effective removed set MERGES over it so its complement is exactly the kept
+    segments render() encodes — no boundary is left for subs to drift on."""
+    from types import SimpleNamespace
+    from vpipe.models import ACTION_REMOVE, TYPE_MANUAL, CutList, CutSegment
+    from vpipe.render import effective_cut, sliver_min_seg
+    from vpipe.timeline import Timeline
+
+    media = SimpleNamespace(fps=30.0, duration=20.0)          # frame ~= 0.04 s
+    cfg = SimpleNamespace(render=SimpleNamespace(min_segment=0.0))
+    cl = CutList(source="x", duration=20.0, segments=[
+        CutSegment(id="a", start=10.0, end=12.0, type=TYPE_MANUAL,
+                   action=ACTION_REMOVE, enabled=True),
+        CutSegment(id="b", start=12.03, end=15.0, type=TYPE_MANUAL,
+                   action=ACTION_REMOVE, enabled=True),
+    ])
+    assert abs(sliver_min_seg(media, cfg) - 0.04) < 1e-9
+
+    kept, removed_eff = effective_cut(cl, media, cfg)
+    # the [12, 12.03] sliver is gone; the removed intervals merge into one span
+    assert kept == [(0.0, 10.0), (15.0, 20.0)]
+    assert removed_eff == [(10.0, 15.0)]
+    # render()'s reported duration == sum of kept == complement of removed_eff
+    tl_eff = Timeline(removed_eff, media.duration)
+    assert tl_eff.new_duration() == sum(b - a for a, b in kept) == 15.0
+
+
+def test_effective_cut_no_drift_vs_raw_removed():
+    """A word after the sliver remaps to the render-consistent time under
+    removed_eff; the RAW (unfiltered) removed set would place it 30 ms late."""
+    from types import SimpleNamespace
+    from vpipe.cutlist import resolve
+    from vpipe.models import ACTION_REMOVE, TYPE_MANUAL, CutList, CutSegment
+    from vpipe.render import effective_cut
+    from vpipe.timeline import Timeline
+
+    media = SimpleNamespace(fps=30.0, duration=20.0)
+    cfg = SimpleNamespace(render=SimpleNamespace(min_segment=0.0))
+    cl = CutList(source="x", duration=20.0, segments=[
+        CutSegment(id="a", start=10.0, end=12.0, type=TYPE_MANUAL,
+                   action=ACTION_REMOVE, enabled=True),
+        CutSegment(id="b", start=12.03, end=15.0, type=TYPE_MANUAL,
+                   action=ACTION_REMOVE, enabled=True),
+    ])
+    _, removed_eff = effective_cut(cl, media, cfg)
+    raw_removed, _ = resolve(cl)
+
+    t = 16.0
+    eff = Timeline(removed_eff, media.duration).remap(t)
+    raw = Timeline(raw_removed, media.duration).remap(t)
+    assert eff == 11.0                       # matches the encoded video
+    assert abs(raw - 11.03) < 1e-9           # old raw-removed path: 30 ms late
+    assert eff != raw

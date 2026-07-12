@@ -1241,7 +1241,13 @@ def _run_render_pipeline(s: Session, cfg, scale_h, fps, out_dir: Path,
     legacy behavior: sidecars share ``base`` with the mp4."""
     cl = cutlist_override or s.cutlist
     tr = s.transcript
-    removed, _ = resolve(cl)
+    removed, _ = resolve(cl)                     # raw — facecrop outer span only
+    # R1: the SAME sliver-filtered removed set render() actually encodes. Every
+    # burned/sidecar subtitle, chapter, metadata and enrich Timeline below is
+    # built from removed_eff so its timestamps match the rendered video — a
+    # dropped sub-min_segment sliver otherwise desyncs every following cue and
+    # the error accumulates over the length of the video.
+    _, removed_eff = render_mod.effective_cut(cl, s.media, cfg)
 
     # C: vertical 9:16 Shorts crop. Detect the face X-center (center='auto') once
     # here — render() stays pure and just receives the finished crop,scale filter.
@@ -1288,7 +1294,7 @@ def _run_render_pipeline(s: Session, cfg, scale_h, fps, out_dir: Path,
     if cfg.subtitles.burn.enabled and tr is not None:
         try:
             on_stage("Подготовка вшитых субтитров…")
-            tl_ass = Timeline(removed, s.media.duration)
+            tl_ass = Timeline(removed_eff, s.media.duration)
             words_final = remap_words(tr.all_words(), tl_ass)
             cues_ass = subs_mod.build_cues(
                 words_final, s.matcher, cfg.subtitles, cfg.masking,
@@ -1330,7 +1336,7 @@ def _run_render_pipeline(s: Session, cfg, scale_h, fps, out_dir: Path,
                 ms = int(cfg.render.enrich.min_score or 0)
                 if ms > 0:           # автопак: score>=70 ПОВЕРХ enabled (§5)
                     plan.items = [it for it in plan.items if it.score >= ms]
-                tl_enr = Timeline(removed, s.media.duration)
+                tl_enr = Timeline(removed_eff, s.media.duration)
                 out_w, out_h = _final_render_dims(s, scale_h, vert_dims)
                 re_plan = enrich_mod.plan_render(
                     plan, tl_enr, tr.all_words() if tr is not None else None,
@@ -1365,12 +1371,40 @@ def _run_render_pipeline(s: Session, cfg, scale_h, fps, out_dir: Path,
         edge_fade=edge_fade,
         should_cancel=lambda: bool(s.task.get("cancelled")), **enrich_kw)
 
+    # R1 render-output-validate: the mp4 is the irreplaceable artifact, but
+    # ffmpeg can exit 0 and still write a SHORT file (crash-interrupted source,
+    # VFR metadata overstating the decodable stream). Report a MEASURED duration
+    # and fail loudly on a gross shortfall instead of toasting a truncated render
+    # as done. A probe failure must NOT lose the mp4 (best-effort — mirrors the
+    # burn/enrich try). ``expected`` is render()'s EFFECTIVE (post-sliver) value,
+    # so with R1 the comparison is exact and the tolerance only covers muxer
+    # rounding. One-sided (fails only when SHORTER) so container padding never
+    # false-alarms.
+    expected = float(rr.get("new_duration") or 0.0)
+    probed = None
+    out_mp4 = rr.get("out")
+    if s.ff is not None and out_mp4 and expected > 0:
+        try:
+            fmt = s.ff.probe(out_mp4).get("format", {})
+            probed = float(fmt.get("duration", 0.0) or 0.0)
+        except Exception:  # noqa: BLE001 — probe is best-effort, never lose the mp4
+            probed = None
+    if probed is not None:
+        frame = (1.0 / s.media.fps) if s.media.fps else 0.04
+        if probed + 0.5 + frame < expected:
+            raise RuntimeError(
+                f"Рендер оборвался: выходной файл {probed:.1f} с короче "
+                f"ожидаемых {expected:.1f} с (ffmpeg завершился с кодом 0, но "
+                f"записал меньше). Файл оставлен для проверки: {out_mp4}. / "
+                f"Render truncated: output {probed:.1f}s vs expected "
+                f"{expected:.1f}s.")
+
     sr: dict = {}
     subtitles_ok = not cfg.subtitles.enabled
     if cfg.subtitles.enabled:
         try:
             on_stage("Субтитры…")
-            sr = subs_mod.generate(tr, removed, cfg.subtitles, cfg.masking,
+            sr = subs_mod.generate(tr, removed_eff, cfg.subtitles, cfg.masking,
                                    s.matcher, sidecar_base or base,
                                    log=lambda *_: None)
             subtitles_ok = True
@@ -1382,7 +1416,7 @@ def _run_render_pipeline(s: Session, cfg, scale_h, fps, out_dir: Path,
     if cfg.chapters.enabled:
         try:
             on_stage("Главы…")
-            cr = chapters_mod.generate(tr, removed, cfg.chapters,
+            cr = chapters_mod.generate(tr, removed_eff, cfg.chapters,
                                        out_dir / "chapters.txt", llm=s.llm,
                                        matcher=s.matcher, mask=cfg.masking,
                                        log=lambda *_: None, on_stage=on_stage)
@@ -1402,7 +1436,7 @@ def _run_render_pipeline(s: Session, cfg, scale_h, fps, out_dir: Path,
             on_stage("Метаданные…")
             chapters_txt = out_dir / "chapters.txt"
             mr = metadata_mod.generate(
-                tr, removed, cfg.metadata, s.llm,
+                tr, removed_eff, cfg.metadata, s.llm,
                 chapters_path=chapters_txt if chapters_txt.exists() else None,
                 matcher=s.matcher, mask=cfg.masking, log=lambda *_: None)
             if mr.get("title") or mr.get("description"):
@@ -1417,10 +1451,11 @@ def _run_render_pipeline(s: Session, cfg, scale_h, fps, out_dir: Path,
         except Exception as e:  # noqa: BLE001 — keep the rendered mp4
             mr = {"error": str(e)}
 
-    tl = Timeline(removed, s.media.duration)
+    tl = Timeline(removed_eff, s.media.duration)
     return {
         "mp4": rr.get("out"), "encoder": rr.get("encoder"),
         "new_duration": round(tl.new_duration(), 1),
+        "new_duration_probed": round(probed, 1) if probed is not None else None,
         "old_duration": round(s.media.duration, 1),
         "out_dir": str(out_dir.resolve()),
         "srt": sr.get("srt"), "vtt": sr.get("vtt"),

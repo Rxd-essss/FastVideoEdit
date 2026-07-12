@@ -283,3 +283,82 @@ def test_resolve_clips_censor_to_surviving_part_at_clip_boundary():
     assert any(c is c_inside for c in censors)
     # обрезанные сохраняют id родителя (один выживший кусок -> без суффикса)
     assert {c.id for c in censors} == {"c1", "c2", "c4"}
+
+
+# --- R1: subs/chapters/metadata built from the sliver-filtered effective cut ---
+def test_subs_built_from_effective_cutlist_no_drift(monkeypatch, tmp_path):
+    """Two cuts 30 ms apart leave a sub-min_segment kept sliver render() drops.
+    subs must be generated from the MERGED effective removed set (cue timing
+    then matches the video), not the raw two-interval set that drifts."""
+    s = _mk_session(tmp_path, duration=20.0, cuts=[
+        CutSegment(id="a", start=10.0, end=12.0, type=TYPE_MANUAL,
+                   action=ACTION_REMOVE, enabled=True),
+        CutSegment(id="b", start=12.03, end=15.0, type=TYPE_MANUAL,
+                   action=ACTION_REMOVE, enabled=True),
+    ])
+    _patch_render(monkeypatch)
+    seen: dict = {}
+    monkeypatch.setattr(
+        serve.subs_mod, "generate",
+        lambda tr, removed, *a, **k: seen.update(removed=list(removed))
+        or {"cues": 0})
+    opts = {"subtitles": True, "chapters": False, "metadata": False}
+    cfg, scale_h, fps, out_dir, base = serve._resolve_render_opts(s, opts)
+    res = serve._run_render_pipeline(s, cfg, scale_h, fps, out_dir, base,
+                                     _SILENT, _SILENT)
+    # merged effective set (30 ms sliver folded away), NOT [(10,12),(12.03,15)]
+    assert seen["removed"] == [(10.0, 15.0)]
+    # reported duration is the effective (post-sliver) one
+    assert res["new_duration"] == 15.0
+
+
+# --- R1 render-output-validate: ffprobe the mp4, fail on a gross shortfall -----
+def _stub_ff_probe(duration):
+    return SimpleNamespace(probe=lambda path: {"format": {"duration": duration}})
+
+
+def _patch_render_dur(monkeypatch, new_duration):
+    def fake_render(ff, media, cl, cfg, out, work_dir, **kw):
+        Path(out).write_bytes(b"x")          # a real file exists to be "probed"
+        return {"out": str(out), "encoder": "fake", "new_duration": new_duration}
+    monkeypatch.setattr(serve.render_mod, "render", fake_render)
+
+
+def test_truncated_output_raises(monkeypatch, tmp_path):
+    import pytest
+    s = _mk_session(tmp_path)
+    s.ff = _stub_ff_probe(5.0)               # mp4 decodes to only 5 s …
+    _patch_render_dur(monkeypatch, new_duration=20.0)   # … but 20 s expected
+    cfg, scale_h, fps, out_dir, base = serve._resolve_render_opts(
+        s, dict(_BASE_OPTS))
+    with pytest.raises(RuntimeError) as ei:
+        serve._run_render_pipeline(s, cfg, scale_h, fps, out_dir, base,
+                                   _SILENT, _SILENT)
+    msg = str(ei.value)
+    assert "5.0" in msg and "20.0" in msg
+
+
+def test_matching_output_ok_reports_probed(monkeypatch, tmp_path):
+    s = _mk_session(tmp_path)
+    s.ff = _stub_ff_probe(20.0)
+    _patch_render_dur(monkeypatch, new_duration=20.0)
+    cfg, scale_h, fps, out_dir, base = serve._resolve_render_opts(
+        s, dict(_BASE_OPTS))
+    res = serve._run_render_pipeline(s, cfg, scale_h, fps, out_dir, base,
+                                     _SILENT, _SILENT)
+    assert res["new_duration_probed"] == 20.0
+    assert res["succeeded"]["render"] is True
+
+
+def test_probe_failure_keeps_mp4(monkeypatch, tmp_path):
+    def boom(path):
+        raise RuntimeError("ffprobe blew up")
+    s = _mk_session(tmp_path)
+    s.ff = SimpleNamespace(probe=boom)
+    _patch_render_dur(monkeypatch, new_duration=20.0)
+    cfg, scale_h, fps, out_dir, base = serve._resolve_render_opts(
+        s, dict(_BASE_OPTS))
+    res = serve._run_render_pipeline(s, cfg, scale_h, fps, out_dir, base,
+                                     _SILENT, _SILENT)
+    assert res["new_duration_probed"] is None
+    assert res["mp4"] is not None

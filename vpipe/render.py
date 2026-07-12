@@ -28,7 +28,7 @@ from .ffmpeg_utils import (FFmpeg, FFmpegError, _register_proc,
                            _unregister_proc)
 from .models import CutList
 from .probe import MediaInfo
-from .timeline import Timeline
+from .timeline import Timeline, merge_intervals
 
 
 class RenderCancelled(RuntimeError):
@@ -908,6 +908,41 @@ def _enrich_video_chain(src_lbl: str, vpre: list[str],
     return ";".join(stmts)
 
 
+def sliver_min_seg(media: MediaInfo, cfg: Config) -> float:
+    """Minimum kept-segment length render() will actually encode.
+
+    A kept segment shorter than ~1.2 video frames (a zero-width trim breaks
+    concat) OR shorter than ``cfg.render.min_segment`` is a sliver — a
+    breath/VAD-edge blip between two near-adjacent cuts. Shared so the encoder
+    and every subtitle/chapter/metadata/enrich Timeline agree on the boundary.
+    """
+    frame = (1.2 / media.fps) if media.fps > 0 else 0.04
+    return max(frame, float(getattr(cfg.render, "min_segment", 0.0) or 0.0))
+
+
+def effective_cut(cl: CutList, media: MediaInfo, cfg: Config
+                  ) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+    """THE cutlist render() actually executes. Returns ``(kept, removed_eff)``.
+
+    ``kept`` is the sliver-filtered list of kept segments; ``removed_eff`` is the
+    merged removed set whose complement over ``[0, media.duration]`` is EXACTLY
+    ``kept`` (each dropped sliver is folded into the removed intervals it sits
+    between — its endpoints are already removed-interval endpoints, so they merge
+    with gap 0). Every burned/sidecar subtitle, chapter, metadata and enrich
+    Timeline MUST be built from ``removed_eff`` so its timestamps match the
+    encoded video; otherwise each dropped sliver desyncs every following cue and
+    the error accumulates over the length of the video (R1).
+    """
+    removed, _ = resolve(cl)
+    tl = Timeline(removed, media.duration)
+    min_seg = sliver_min_seg(media, cfg)
+    all_kept = tl.kept_segments()
+    kept = [(a, b) for (a, b) in all_kept if (b - a) >= min_seg]
+    dropped = [(a, b) for (a, b) in all_kept if (b - a) < min_seg]
+    removed_eff = merge_intervals(list(tl.removed) + dropped)
+    return kept, removed_eff
+
+
 def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
            out_path: str | Path, work_dir: str | Path,
            on_progress=None, log=print,
@@ -976,19 +1011,19 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
             raise RenderCancelled("cancelled")
 
     removed, censors = resolve(cl)
-    tl = Timeline(removed, media.duration)
-    new_dur = tl.new_duration()
     # Drop kept slivers shorter than ~1 video frame (a zero-width trim breaks
     # concat) OR shorter than min_segment — a tiny breath/VAD-edge blip between
     # two near-adjacent cuts that would just stutter. min_segment stays below the
-    # shortest real word, so this merges cuts without dropping speech.
-    frame = (1.2 / media.fps) if media.fps > 0 else 0.04
-    min_seg = max(frame, float(getattr(cfg.render, "min_segment", 0.0) or 0.0))
-    all_kept = tl.kept_segments()
-    kept = [(a, b) for (a, b) in all_kept if (b - a) >= min_seg]
+    # shortest real word, so this merges cuts without dropping speech. effective_cut
+    # is the SINGLE source of truth: serve builds every subtitle/chapter/metadata/
+    # enrich Timeline from the same removed_eff, so overlays never drift (R1).
+    kept, removed_eff = effective_cut(cl, media, cfg)
+    tl = Timeline(removed_eff, media.duration)   # total_removed / new_duration are
+    new_dur = tl.new_duration()                  #   now the EFFECTIVE (post-sliver) values
+    all_kept = Timeline(removed, media.duration).kept_segments()
     if len(kept) < len(all_kept):
         log(f"  dropped {len(all_kept) - len(kept)} tiny kept sliver(s) "
-            f"(< {min_seg*1000:.0f} ms) — merged near-adjacent cuts.")
+            f"— merged near-adjacent cuts.")
     if not kept:
         raise RuntimeError("Every part of the video is marked for removal — nothing to render.")
 
