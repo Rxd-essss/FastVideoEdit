@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -127,6 +128,12 @@ class FFmpeg:
         self.ffmpeg = resolve_bin(cfg.ffmpeg_bin, "ffmpeg")
         self.ffprobe = resolve_bin(cfg.ffprobe_bin, "ffprobe")
         self._caps: dict[str, set[str]] = {}
+        # Seconds of total silence on both ffmpeg pipes before the no-progress
+        # watchdog kills a presumed-hung render (see _run_proc). 0 disables it.
+        self.stall_timeout = float(getattr(cfg, "stall_timeout", 180.0) or 0.0)
+        # Seconds of total silence on both ffmpeg pipes before the no-progress
+        # watchdog kills a presumed-hung render (see _run_proc). 0 disables it.
+        self.stall_timeout = float(getattr(cfg, "stall_timeout", 180.0) or 0.0)
 
     # --- capability probing --------------------------------------------------
     def _list(self, kind: str) -> set[str]:
@@ -200,6 +207,32 @@ class FFmpeg:
                                 text=True, encoding="utf-8", errors="replace", bufsize=1)
         _register_proc(proc)
 
+        # No-progress watchdog: if ffmpeg goes silent on BOTH pipes for
+        # ``stall_timeout`` seconds it is presumed hung (an NVENC/TDR lockup, a
+        # dropped network-drive input, a starved filtergraph) and terminated, so
+        # the worker thread — and with it every mutating endpoint _guard_no_task
+        # would 409 — stops waiting forever. Armed only when a positive window
+        # AND a known ``total`` are set, so capability probes (-encoders/-filters)
+        # and any zero-total call are never watched. ANY line on either pipe
+        # resets the timer (progress OR stderr, so a caller that passes ``total``
+        # without ``on_progress`` — e.g. the loudnorm measure pass — is not
+        # false-killed), and a healthy encode ticks sub-second, so the generous
+        # default never trips a real render.
+        last_progress = [time.monotonic()]
+        stalled = [False]
+        win = getattr(self, "stall_timeout", 0.0) or 0.0
+
+        def _watchdog() -> None:
+            while proc.poll() is None:
+                if time.monotonic() - last_progress[0] > win:
+                    stalled[0] = True
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                    return
+                time.sleep(min(2.0, win / 2.0))
+
         # Keep the first ~20 lines (config/setup errors land here) AND the last
         # ~40 lines (the actual failure) so diagnostics are not truncated to one
         # end of a long ffmpeg log.
@@ -209,6 +242,7 @@ class FFmpeg:
         def drain_stderr() -> None:
             assert proc.stderr is not None
             for line in proc.stderr:
+                last_progress[0] = time.monotonic()
                 if len(stderr_head) < 20:
                     stderr_head.append(line)
                 stderr_tail.append(line)
@@ -218,9 +252,13 @@ class FFmpeg:
         t = threading.Thread(target=drain_stderr, daemon=True)
         t.start()
 
+        if win > 0 and total:
+            threading.Thread(target=_watchdog, daemon=True).start()
+
         try:
             assert proc.stdout is not None
             for line in proc.stdout:
+                last_progress[0] = time.monotonic()
                 line = line.strip()
                 if line.startswith("out_time_us=") and total and on_progress:
                     try:
@@ -234,6 +272,14 @@ class FFmpeg:
             t.join(timeout=1.0)
         finally:
             _unregister_proc(proc)
+
+        # A watchdog kill terminates the process, so proc.returncode is non-zero;
+        # surface the stall as its own clear error BEFORE the generic exit-code
+        # dump below, which would otherwise mask it with a truncated stderr tail.
+        if stalled[0]:
+            raise FFmpegError(
+                f"{desc}: нет прогресса дольше {int(win)} c — процесс остановлен "
+                f"(возможно, зависание кодировщика или потерян вход).")
 
         if proc.returncode != 0:
             head = "".join(stderr_head).strip()

@@ -22,6 +22,20 @@ class PathsCfg(_Base):
 class FfmpegCfg(_Base):
     ffmpeg_bin: str = "ffmpeg"
     ffprobe_bin: str = "ffprobe"
+    # No-progress watchdog window (seconds). If a render emits nothing on either
+    # ffmpeg pipe for this long it is presumed hung (NVENC/TDR lockup, dropped
+    # network-drive input, starved filtergraph) and terminated so the worker
+    # thread and every mutating endpoint stop waiting forever. Deliberately
+    # generous — a healthy encode ticks progress sub-second, so this never trips
+    # a real render. 0 disables the watchdog (legacy: run until ffmpeg exits).
+    stall_timeout: float = 180.0
+    # No-progress watchdog window (seconds). If a render emits nothing on either
+    # ffmpeg pipe for this long it is presumed hung (NVENC/TDR lockup, dropped
+    # network-drive input, starved filtergraph) and terminated so the worker
+    # thread and every mutating endpoint stop waiting forever. Deliberately
+    # generous — a healthy encode ticks progress sub-second, so this never trips
+    # a real render. 0 disables the watchdog (legacy: run until ffmpeg exits).
+    stall_timeout: float = 180.0
 
 
 class TranscribeCfg(_Base):

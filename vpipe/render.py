@@ -14,18 +14,32 @@ import os
 import re
 import shutil
 import subprocess
+import time
+import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from .censor import build_censor_graph
 from .config import Config
 from .cutlist import resolve
 from .enrich import (MAX_ANIMS, MAX_STILLS, AnimOverlay, RenderEnrich,
                      StillOverlay, ZoomWindow)
-from .ffmpeg_utils import FFmpeg, FFmpegError
+from .ffmpeg_utils import (FFmpeg, FFmpegError, _register_proc,
+                           _unregister_proc)
 from .models import CutList
 from .probe import MediaInfo
 from .timeline import Timeline
+
+
+class RenderCancelled(RuntimeError):
+    """Raised inside :func:`render` (and its pass helpers) when the caller's
+    ``should_cancel()`` turns True at a pass boundary.
+
+    A dedicated type — not a bare RuntimeError — so a user cancel is
+    distinguishable from a genuine failure. In practice the serve worker keys
+    off ``task['cancelled']`` and reports «cancelled» for either, so this simply
+    propagates as a clean cancel instead of an ffmpeg error dump.
+    """
 
 
 def _f(x: float) -> str:
@@ -405,6 +419,7 @@ def measure_loudness(ff: FFmpeg, cfg: Config, inputs: list[str], asrc_idx: str,
                      kept: Optional[list[tuple[float, float]]], *,
                      cut_fade: float = 0.0, total: Optional[float] = None,
                      music_idx: Optional[int] = None, music_dur: float = 0.0,
+                     should_cancel: Optional[Callable[[], bool]] = None,
                      log=print) -> Optional[dict]:
     """Loudnorm measurement pass: replay the FINAL audio into ``-f null``.
 
@@ -458,6 +473,10 @@ def measure_loudness(ff: FFmpeg, cfg: Config, inputs: list[str], asrc_idx: str,
     try:
         stderr = ff.run(args, total=total, desc="loudnorm measure")
     except Exception as e:  # noqa: BLE001 — measurement is strictly best-effort
+        if should_cancel is not None and should_cancel():
+            # A cancel killed the measurement ffmpeg — propagate it instead of
+            # swallowing into a one-pass fallback that then starts the encode.
+            raise RenderCancelled("cancelled")
         log(f"  loudnorm 2pass: измерение не удалось ({e}) — "
             "включаю обычный однопроходный режим.")
         return None
@@ -476,11 +495,14 @@ def _faststart(cfg: Config) -> list[str]:
 
 
 def censor_audio(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
-                 work_dir: str | Path, on_progress=None, log=print) -> Optional[str]:
+                 work_dir: str | Path, on_progress=None, log=print,
+                 should_cancel: Optional[Callable[[], bool]] = None) -> Optional[str]:
     """Stage 1: write a lossless FLAC with profanity censored. None if no-op."""
     _, censors = resolve(cl)
     if not censors:
         return None
+    if should_cancel is not None and should_cancel():
+        raise RenderCancelled("cancelled")
     has_rb = ff.has_filter("rubberband")
     graph = build_censor_graph(censors, cfg.censor, media.duration,
                                media.sample_rate, has_rb)
@@ -546,7 +568,8 @@ def _cleanup_dfn_temp(work_dir: str | Path) -> None:
 
 def enhance_audio(ff: FFmpeg, src: str, cfg: Config, work_dir: str | Path,
                   log=print, on_progress=None,
-                  total: Optional[float] = None) -> Optional[str]:
+                  total: Optional[float] = None,
+                  should_cancel: Optional[Callable[[], bool]] = None) -> Optional[str]:
     """Stage 1.5: neural speech denoise via the DeepFilterNet 3 CLI.
 
     Modelled on :func:`censor_audio`: consumes ``src`` (the censored FLAC when
@@ -588,6 +611,9 @@ def enhance_audio(ff: FFmpeg, src: str, cfg: Config, work_dir: str | Path,
                 "-c:a", "pcm_s16le", str(in_wav)],
                total=total, on_progress=on_progress, desc="extract wav (DFN)")
     except Exception as e:  # noqa: BLE001 — enhancement is strictly best-effort
+        if should_cancel is not None and should_cancel():
+            _cleanup_dfn_temp(wd)     # drop the partial wav, then propagate cancel
+            raise RenderCancelled("cancelled")
         log(f"  DeepFilterNet: извлечение WAV не удалось ({e}) — использую afftdn.")
         _cleanup_dfn_temp(wd)   # a partial dfn_in.wav must not pile up (audit C-1)
         return None
@@ -596,16 +622,60 @@ def enhance_audio(ff: FFmpeg, src: str, cfg: Config, work_dir: str | Path,
         ["-D", "-o", str(out_dir), str(in_wav)]
     log("  DeepFilterNet: нейроденойз (CPU"
         + (", post-filter" if post_filter else "") + ")…")
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True,
-                           encoding="utf-8", errors="replace")
-    except OSError as e:
-        log(f"  DeepFilterNet: запуск не удался ({e}) — использую afftdn.")
-        _cleanup_dfn_temp(wd)
-        return None
-    if r.returncode != 0:
-        tail = " | ".join((r.stderr or r.stdout or "").strip().splitlines()[-3:])
-        log(f"  DeepFilterNet: exe завершился с ошибкой (exit {r.returncode})"
+    if should_cancel is None:
+        # Legacy blocking path — byte-for-byte the pre-Wave1 behaviour for the
+        # non-serve callers (clips/tests) that don't thread a cancel flag.
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace")
+        except OSError as e:
+            log(f"  DeepFilterNet: запуск не удался ({e}) — использую afftdn.")
+            _cleanup_dfn_temp(wd)
+            return None
+        rc, out, err = r.returncode, r.stdout, r.stderr
+    else:
+        # Cancellable path: run the (multi-minute, CPU-only) CLI as a REGISTERED
+        # Popen so cancel_all() can terminate it like any ffmpeg, polled on a
+        # short timeout to honour should_cancel at a real boundary AND nudge the
+        # bar — DFN emits no progress fraction, so the bar would otherwise sit
+        # frozen for the whole stage. communicate(timeout=) sidesteps the
+        # classic pipe-fill deadlock of reading the streams by hand.
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True,
+                                    encoding="utf-8", errors="replace")
+        except OSError as e:
+            log(f"  DeepFilterNet: запуск не удался ({e}) — использую afftdn.")
+            _cleanup_dfn_temp(wd)
+            return None
+        _register_proc(proc)
+        start = time.monotonic()
+        out = err = ""
+        try:
+            while True:
+                try:
+                    out, err = proc.communicate(timeout=2.0)
+                    break
+                except subprocess.TimeoutExpired:
+                    el = time.monotonic() - start
+                    if on_progress is not None:
+                        # Bounded 0..0.95 within the DFN slice — motion, never «done».
+                        on_progress(min(0.95, el / max(total or el, el + 1.0)))
+                    if should_cancel():
+                        proc.terminate()
+                        try:
+                            proc.communicate(timeout=5.0)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                            proc.communicate()
+                        _cleanup_dfn_temp(wd)
+                        raise RenderCancelled("cancelled")
+        finally:
+            _unregister_proc(proc)
+        rc = proc.returncode
+    if rc != 0:
+        tail = " | ".join((err or out or "").strip().splitlines()[-3:])
+        log(f"  DeepFilterNet: exe завершился с ошибкой (exit {rc})"
             + (f": {tail}" if tail else "") + " — использую afftdn.")
         _cleanup_dfn_temp(wd)
         return None
@@ -845,7 +915,8 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
            ass_path: Optional[str] = None,
            crop_filter: Optional[str] = None,
            edge_fade: float = 0.0,
-           enrich: Optional[RenderEnrich] = None) -> dict:
+           enrich: Optional[RenderEnrich] = None,
+           should_cancel: Optional[Callable[[], bool]] = None) -> dict:
     """Run both stages and write the final mp4. Returns a small summary dict.
 
     ``scale_h``/``fps`` override the output resolution height / frame rate; None
@@ -882,6 +953,28 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
     vpost mechanism; ``None`` (or an all-empty plan) keeps every graph and
     fast-path byte-for-byte unchanged. The audio graph is NEVER touched.
     """
+    def _ck() -> None:
+        """Abort at a pass boundary when the caller asked to cancel.
+
+        Raises RenderCancelled (a RuntimeError). The serve worker already reports
+        «cancelled» for any exception raised while task['cancelled'] is set, so
+        this surfaces as a clean cancel rather than an error dump. Called only at
+        pass boundaries — never inside tight per-segment loops — to avoid noise.
+        """
+        if should_cancel is not None and should_cancel():
+            raise RenderCancelled("cancelled")
+
+    def _ck() -> None:
+        """Abort at a pass boundary when the caller asked to cancel.
+
+        Raises RenderCancelled (a RuntimeError). The serve worker already reports
+        «cancelled» for any exception raised while task['cancelled'] is set, so
+        this surfaces as a clean cancel rather than an error dump. Called only at
+        pass boundaries — never inside tight per-segment loops — to avoid noise.
+        """
+        if should_cancel is not None and should_cancel():
+            raise RenderCancelled("cancelled")
+
     removed, censors = resolve(cl)
     tl = Timeline(removed, media.duration)
     new_dur = tl.new_duration()
@@ -926,8 +1019,10 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
     censor_prog = _censor_prog if will_censor else None
 
     # Censoring needs an audio track; skip it entirely for video-only sources.
+    _ck()   # honour a cancel that landed before Stage 1 (censor) begins.
     censored = (censor_audio(ff, media, cl, cfg, work_dir,
-                             on_progress=censor_prog, log=log)
+                             on_progress=censor_prog, log=log,
+                             should_cancel=should_cancel)
                 if has_audio else None)
 
     # Stage 1.5 (opt-in): neural denoise of the censored/original audio via the
@@ -943,9 +1038,11 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
 
             def enh_prog(p, _op=on_progress, _s=e_start):
                 _op(_s + 0.10 * min(1.0, max(0.0, p)))
+        _ck()   # abort before the (long, CPU-only) DFN neural denoise begins.
         enhanced = enhance_audio(ff, censored or media.path, cfg, work_dir,
                                  log=log, on_progress=enh_prog,
-                                 total=media.duration)
+                                 total=media.duration,
+                                 should_cancel=should_cancel)
         if enhanced is None:
             log("  DeepFilterNet недоступен — использую afftdn.")
             cfg = cfg.model_copy(deep=True)
@@ -1077,11 +1174,12 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
     measured: Optional[dict] = None
     if has_audio and _wants_loudnorm_2pass(cfg):
         m_fade = max(0.0, float(getattr(cfg.render, "cut_fade", 0.0) or 0.0))
+        _ck()   # abort before the (audio-only, seconds-long) measurement pass.
         measured = measure_loudness(ff, cfg, inputs, asrc_idx,
                                     kept if removed else None,
                                     cut_fade=m_fade, total=new_dur,
                                     music_idx=music_idx, music_dur=out_adur,
-                                    log=log)
+                                    should_cancel=should_cancel, log=log)
     # Audio post-chain (denoise). Empty list when disabled -> the audio path stays
     # byte-for-byte identical to before (copy / passthrough fast-paths preserved).
     apost = build_apost(cfg, loudnorm_measured=measured) if has_audio else []
@@ -1129,6 +1227,8 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
                     "-c:v", "copy", "-c:a", "copy", *_faststart(cfg), out_path]
         # finally: the ~220 MB DFN temp wavs must not survive a failed/cancelled
         # encode either (audit C-1) — same in the other two _run_atomic branches.
+        _ck()   # last chance to abort before the encode/remux launches.
+        _ck()   # last chance to abort before the encode/remux launches.
         try:
             _run_atomic(ff, args, out_path, total=media.duration,
                         on_progress=encode_prog, desc="remux")
@@ -1172,6 +1272,7 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
             args = [*inputs, "-filter_complex", vgraph, "-map", "[outv]",
                     "-an", *venc, *_faststart(cfg), out_path]
         log(f"  re-encoding (no cuts, {vpost_s or 'reencode'}) -> {enc_name}")
+        _ck()   # last chance to abort before the (multi-hour) encode launches.
         try:
             _run_atomic(ff, args, out_path, total=media.duration,
                         on_progress=encode_prog, desc="render")
@@ -1244,6 +1345,7 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
         args = [*inputs, "-filter_complex", graph, "-map", "[outv]",
                 "-an", *venc, *_faststart(cfg), out_path]
     log(f"  encoding {len(kept)} kept segment(s) -> {new_dur:.1f}s ({enc_name})")
+    _ck()   # last chance to abort before the (multi-hour) encode launches.
     try:
         _run_atomic(ff, args, out_path, total=new_dur,
                     on_progress=encode_prog, desc="render")
