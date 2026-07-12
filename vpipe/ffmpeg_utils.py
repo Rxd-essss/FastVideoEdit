@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 from pathlib import Path
 from typing import Callable, Optional
@@ -16,6 +17,40 @@ from .config import FfmpegCfg
 
 class FFmpegError(RuntimeError):
     pass
+
+
+# A many-cut / censor-dense -filter_complex overflows the Windows 32767-char
+# CreateProcess limit (~196 chars per kept segment). Any graph longer than this
+# is written to a temp file and passed via -filter_complex_script so it never
+# touches the command line. Small graphs pass through byte-for-byte unchanged so
+# short renders keep their exact argv (and every FakeFF test still sees an inline
+# -filter_complex). Keep this ABOVE the largest single-statement graph the
+# enrich/music fast-paths build, or those would start spilling too (harmless but
+# would change their argv).
+_FILTERGRAPH_INLINE_MAX = 8000
+
+
+def _spill_filtergraph(cmd: "list[str]") -> "tuple[list[str], Optional[str]]":
+    """If cmd carries an oversized inline -filter_complex, spill it to a temp
+    file and swap in -filter_complex_script. Returns (new_cmd, temp_path|None).
+
+    Only the local command is rewritten; the caller's ``args`` list is never
+    touched, so the FFmpegError diagnostic and FakeFF tests still read the
+    inline graph from ``args``.
+    """
+    try:
+        i = cmd.index("-filter_complex")
+    except ValueError:
+        return cmd, None
+    graph = cmd[i + 1] if i + 1 < len(cmd) else ""
+    if len(graph) <= _FILTERGRAPH_INLINE_MAX:
+        return cmd, None
+    fd, path = tempfile.mkstemp(suffix=".ffscript", prefix="fve_fc_")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(graph)
+    out = list(cmd)
+    out[i:i + 2] = ["-filter_complex_script", path]
+    return out, path
 
 
 # --- running-process registry -----------------------------------------------
@@ -146,6 +181,21 @@ class FFmpeg:
         """
         cmd = [self.ffmpeg, "-hide_banner", "-nostdin", "-y",
                "-progress", "pipe:1", "-nostats", *args]
+        # Spill an oversized -filter_complex to a temp file (Windows 32k argv
+        # limit). No-op for normal graphs; the temp file is removed in the outer
+        # finally below even on error/cancel.
+        cmd, _fc_script = _spill_filtergraph(cmd)
+        try:
+            return self._run_proc(cmd, args, total, on_progress, desc)
+        finally:
+            if _fc_script:
+                try:
+                    os.remove(_fc_script)
+                except OSError:
+                    pass
+
+    def _run_proc(self, cmd: list[str], args: list[str], total: Optional[float],
+                  on_progress: Optional[Callable[[float], None]], desc: str) -> str:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, encoding="utf-8", errors="replace", bufsize=1)
         _register_proc(proc)

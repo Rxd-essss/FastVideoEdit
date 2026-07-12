@@ -22,7 +22,7 @@ from .config import Config
 from .cutlist import resolve
 from .enrich import (MAX_ANIMS, MAX_STILLS, AnimOverlay, RenderEnrich,
                      StillOverlay, ZoomWindow)
-from .ffmpeg_utils import FFmpeg
+from .ffmpeg_utils import FFmpeg, FFmpegError
 from .models import CutList
 from .probe import MediaInfo
 from .timeline import Timeline
@@ -128,6 +128,25 @@ def _run_atomic(ff: FFmpeg, args: list[str], out_path: str, *,
         except OSError:
             pass
         raise
+    # ffmpeg can exit 0 yet write a SHORT file (interrupted source, VFR metadata
+    # overstating the decodable stream). Reject a GROSS shortfall so a truncated
+    # render is never atomically promoted to the final name and reported as done.
+    # Only >10% AND >0.5s missing counts — normal keyframe/container rounding
+    # lands within a frame of `total` and must never trip this. A probe that
+    # itself fails is swallowed so a broken ffprobe never fails a good render.
+    if total and total > 0:
+        try:
+            got = float(ff.probe(tmp).get("format", {}).get("duration", 0.0) or 0.0)
+        except Exception:      # noqa: BLE001
+            got = 0.0
+        if got > 0.0 and got < total - max(0.5, 0.10 * total):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise FFmpegError(
+                f"{desc}: output truncated — got {got:.1f}s of an expected "
+                f"{total:.1f}s. The render was rejected (no file written).")
     os.replace(tmp, out_path)
 
 
