@@ -177,7 +177,7 @@ function clearSaveError() { if (errorToastEl && errorToastEl.parentNode) errorTo
 
 // Warn before leaving with unsaved or in-flight changes.
 window.addEventListener('beforeunload', (e) => {
-  if (st.dirty || st.saving) { e.preventDefault(); e.returnValue = ''; return '' }
+  if (st.dirty || st.saving || st.metaDirty) { e.preventDefault(); e.returnValue = ''; return '' }
 })
 
 init()
@@ -247,6 +247,7 @@ async function init() {
   if (s.has_transcript) await loadData()
   loadClipsFromCache()   // F4: панель клипов из out/<stem>.clips.json — без LLM
   loadEnrichFromCache()  // P4: вкладка «Монтаж» из out/<stem>.enrich.json — без LLM
+  if (s.has_transcript) { loadChaptersFromCache(); loadMetadataFromCache() }  // #36: восстановить Главы/Мета из кэша сервера (пусто без транскрипта)
   if (s.task && s.task.running) followTask(s.task.name)
 
   video.addEventListener('timeupdate', () => { if (video.paused) onFrame() })
@@ -993,6 +994,7 @@ function renderMetadata(meta) {
   set('#metaDesc', desc)
   set('#metaTags', tags)
   set('#metaHook', hook)
+  st.metaDirty = false   // #36: свежая генерация/восстановление — это не «несохранённая ручная правка»
   const len = $('#metaTitleLen')
   if (len) len.textContent = title ? `(${title.length}/100)` : ''
   updateTabBadge('meta', !!(title || desc || tags || hook))
@@ -1095,25 +1097,23 @@ function saveClipsOpts() {
 // false и сам, но шлём честно — контракт виден в запросе.
 function clipsRenderOpts() {
   const o = clipsOptsLoad()
-  const d = st.rdefaults || {}
-  const opts = {
-    ...currentRenderOpts(),
-    subtitles: false, chapters: false, metadata: false,
-    vertical: !!o.vertical,
-    denoise_loudnorm: !!d.denoise_loudnorm,
-    loudnorm_mode: d.loudnorm_mode === '2pass' ? '2pass' : 'dynamic',
-    out_dir: o.out_dir || st.outDir || '',
-  }
-  if (d.cut_fade != null) opts.cut_fade = d.cut_fade
+  if (!st._rSeeded) seedRenderModal()   // засеять поля модалки, если её не открывали (паттерн openAutopackModal)
+  const opts = collectRenderOpts()      // ЖИВЫЕ кодек/качество/цензура/громкость/cut_fade/шумоподавление из «Настроек рендера»
+  // Клипы — отдельный артефакт: без глав/меты/субтитр-сайдкаров, без
+  // мультиформатов основного видео/музыки/обогащения/имени файла (сервер их и
+  // так гасит для клипов — просто не шлём конфликтующие значения).
+  opts.subtitles = false; opts.chapters = false; opts.metadata = false
+  delete opts.formats; delete opts.music; delete opts.enrich; delete opts.filename
+  opts.vertical = !!o.vertical
+  opts.out_dir = o.out_dir || st.outDir || ''
   if (o.vertical) {
     opts.vertical_target = '1080x1920'
     opts.vertical_center = o.center === 'manual' ? o.center_pos : 'auto'
+    delete opts.scale_h   // vertical_target задаёт геометрию; лишний scale_h из модалки конфликтует
   }
   if (o.burn) {
     opts.burn_subtitles = true
-    // C1: стиль капшенов клипа = пресет, выбранный в настройках рендера
-    // (localStorage). «Свой» тут не воспроизводим — полей стиля в модалке
-    // клипов нет, так что честный фолбэк — серверные умолчания (как раньше).
+    // Стиль капшенов остаётся пресетом из модалки рендера (в модалке клипов полей стиля нет).
     const p = capPresetFind(capPresetSaved())
     opts.burn_style = p ? { ...p.style } : { karaoke: true }
   } else opts.burn_subtitles = false
@@ -1141,6 +1141,23 @@ async function loadClipsFromCache() {
   try { const r = await fetch('/api/clips'); if (!r.ok) return; j = await r.json() } catch { return }
   // silent: кэш — не новость; тело + тихий счётчик, БЕЗ пульса/точки/переключения.
   if (j && Array.isArray(j.clips) && j.clips.length && !j.stale) renderClips(j.clips, { silent: true })
+}
+
+// #36: восстановление вкладок «Главы»/«Мета» при перезагрузке из персистентных
+// preview-файлов (GET /api/chapters, /api/metadata). Тихо: кэш — не новость.
+async function loadChaptersFromCache() {
+  try {
+    const r = await fetch('/api/chapters'); if (!r.ok) return
+    const j = await r.json()
+    if (j && Array.isArray(j.chapters) && j.chapters.length) renderChapters(j.chapters)
+  } catch {}
+}
+async function loadMetadataFromCache() {
+  try {
+    const r = await fetch('/api/metadata'); if (!r.ok) return
+    const j = await r.json()
+    if (j && j.metadata) renderMetadata(j.metadata)
+  } catch {}
 }
 
 function renderClips(clips, opts = {}) {
@@ -2439,8 +2456,12 @@ async function reloadCutlist() {
 const QUAL_DEFAULT = { nvenc: 19, x264: 17 }
 function qualLabel(encoder) { return encoder === 'x264' ? 'CRF' : 'QP' }
 function seedQuality(encoder, q) {
-  const val = (q != null) ? q : (QUAL_DEFAULT[encoder] != null ? QUAL_DEFAULT[encoder] : 19)
-  $('#rQuality').value = val
+  const d = st.rdefaults || {}
+  const cfgQ = (encoder === 'x264') ? d.quality_x264 : d.quality_nvenc
+  let val = (q != null) ? q : (cfgQ != null ? cfgQ : (QUAL_DEFAULT[encoder] != null ? QUAL_DEFAULT[encoder] : 19))
+  const el = $('#rQuality'); const lo = +el.min || 14, hi = +el.max || 30
+  val = Math.max(lo, Math.min(hi, val))
+  el.value = val
   $('#rQualVal').textContent = `${qualLabel(encoder)} ${val}`
 }
 
@@ -2490,13 +2511,13 @@ function seedRenderModal() {
   const d = st.rdefaults || {}, m = st.media || {}
   const enc = d.encoder || 'nvenc'
   $('#rEncoder').value = enc
-  seedQuality(enc, (d.quality != null) ? d.quality : null)
+  seedQuality(enc, null)
   $('#rAudio').value = d.audio_bitrate || '320k'
   $('#rCensor').value = d.censor_method || 'partial'
   $('#rScale').options[0].textContent = `Как у источника (${m.width || '?'}×${m.height || '?'})`
   $('#rFps').options[0].textContent = `Как у источника (${m.fps ? Math.round(m.fps) : '?'})`
   $('#rScale').value = ''; $('#rFps').value = ''
-  $('#rSubs').checked = true; $('#rChapters').checked = true
+  $('#rSubs').checked = d.subtitles !== false; $('#rChapters').checked = d.chapters !== false
   if ($('#rBurn')) {
     $('#rBurn').checked = false
     $('#rBurnOpts').classList.add('hidden')
@@ -2566,7 +2587,15 @@ function seedRenderModal() {
 
 function openRenderModal() {
   if (!st.hasSession) return
-  seedRenderModal()
+  // Сеем поля ОДИН раз за сессию (st._rSeeded), чтобы правки юзера (кодек/шум/…)
+  // переживали переоткрытие. На повторных открытиях освежаем только
+  // per-file/динамику: имя файла, папку вывода и доступность обогащения.
+  if (!st._rSeeded) seedRenderModal()
+  else {
+    $('#rFilename').value = ($('#filename').textContent || 'output').replace(/\.[^.]+$/, '')
+    $('#rOutDir').value = st.outDir || ''
+    updateEnrichRenderCheckbox()
+  }
   openOverlay('#renderModal')
 }
 
@@ -3370,33 +3399,36 @@ const ENR_INTENT_RU = {
   map: 'карта', callout: 'выноска',
 }
 
-// Нормализованный объект visual для предложения. Берём payload.visual как
-// источник истины (§6). Если его нет (бэкенд ещё на старой схеме) — строим
-// клиентский шим из плоского payload, БЕЗ выдумывания превью: candidates даём
-// только когда у точки реально есть готовый ассет (asset_path).
+// Нормализованный объект visual для предложения. Источник правды — ПЛОСКАЯ схема
+// бэкенда: payload.candidates[] + payload.selected (ImagePayload.to_dict). Каждый
+// кандидат: {source, style, preview, intent, …}. Плоские source/schematic_style —
+// фолбэк для старых планов без candidates (тогда строим шим из asset_kind/path,
+// БЕЗ выдумывания превью: candidate только при реальном готовом ассете).
 function enrichVisual(it) {
   const p = it.payload || {}
-  if (p.visual && typeof p.visual === 'object') {
-    const v = p.visual
-    const cands = Array.isArray(v.candidates) ? v.candidates.filter((c) => c && (c.preview || c.id != null)) : []
+  if (Array.isArray(p.candidates) && p.candidates.length) {
+    const cands = p.candidates.filter((c) => c && (c.preview || c.asset_path))
+    const want = Number.isInteger(p.selected) ? p.selected : 0
+    const sel = Math.max(0, Math.min(want, Math.max(0, cands.length - 1)))
+    const chosenC = cands[sel] || {}
     return {
-      source: v.source || 'none',
-      intent: v.intent || null,
+      source: chosenC.source || p.source || 'none',
+      intent: chosenC.intent || p.intent || null,
       candidates: cands,
-      chosen: Number.isInteger(v.chosen) ? Math.max(0, Math.min(v.chosen, Math.max(0, cands.length - 1))) : 0,
-      schematic_style: v.schematic_style || v.style || null,
+      chosen: sel,
+      schematic_style: chosenC.style || p.schematic_style || null,
     }
   }
-  // --- шим из легаси-payload (asset_kind/asset_path) ---
+  // --- шим из плоского payload (asset_kind/asset_path) ---
   let source = 'none'
   if (p.asset_kind === 'generate') source = 'diffusion'
   else if (p.asset_kind === 'user') source = 'stock'
   else if (p.asset_kind === 'emoji') source = 'icon'
   const cands = []
   if (p.asset_path && (p.asset_kind === 'generate' || p.asset_kind === 'user')) {
-    cands.push({ kind: source === 'diffusion' ? 'seed' : 'asset', id: 0, preview: p.asset_path })
+    cands.push({ source, preview: p.asset_path })
   }
-  return { source, intent: null, candidates: cands, chosen: 0, schematic_style: null }
+  return { source, intent: null, candidates: cands, chosen: 0, schematic_style: p.schematic_style || null }
 }
 
 // Превью-URL кандидата → src для <img>. Бэкенд кладёт относительное имя ассета,
@@ -3484,10 +3516,10 @@ function enrichCandTile(it, v, idx) {
   const tile = document.createElement('button'); tile.type = 'button'
   tile.className = 'enrCandTile' + (idx === v.chosen ? ' chosen' : '')
   tile.setAttribute('aria-pressed', String(idx === v.chosen))
-  const src = enrichPreviewSrc(c.preview)
+  const src = enrichPreviewSrc(c.preview || c.asset_path)
   if (src) {
     const img = document.createElement('img'); img.className = 'enrCandImg'; img.loading = 'lazy'
-    img.alt = (c.kind === 'theme' ? (ENR_THEME_RU[c.id] || 'тема') : 'вариант ' + (idx + 1))
+    img.alt = (c.source === 'schematic' ? (ENR_THEME_RU[c.style] || 'схема') : 'вариант ' + (idx + 1))
     img.src = src
     // Битый/неотданный ассет — честный плейсхолдер, без молчаливой «дыры».
     img.onerror = () => { img.remove(); tile.classList.add('broken'); tile.innerHTML = icon('image') }
@@ -3495,9 +3527,9 @@ function enrichCandTile(it, v, idx) {
   } else {
     tile.classList.add('broken'); tile.innerHTML = icon('image')
   }
-  // Метка темы (для schematic) — какой стиль на этом кандидате.
-  if (c.kind === 'theme' && c.id) {
-    const tag = document.createElement('span'); tag.className = 'enrCandTag'; tag.textContent = ENR_THEME_RU[c.id] || c.id
+  // Метка стиля (для schematic) — какая тема код-схемы на этом кандидате.
+  if (c.source === 'schematic' && c.style) {
+    const tag = document.createElement('span'); tag.className = 'enrCandTag'; tag.textContent = ENR_THEME_RU[c.style] || c.style
     tile.appendChild(tag)
   }
   if (idx === v.chosen) { const ch = document.createElement('span'); ch.className = 'enrCandCheck'; ch.innerHTML = icon('check'); tile.appendChild(ch) }
@@ -3518,31 +3550,42 @@ function enrichSrcCaption(it, v) {
   return cap
 }
 
-// Выбор кандидата: сохраняем visual.chosen (+ финальный asset_path = chosen).
-// Контракт выбора неясен (бэкенд ещё на старой схеме) — реализуем через
-// существующий POST /api/enrich/save полем payload.visual.chosen; см. отчёт.
-function enrichChooseCandidate(id, idx) {
+// Выбор кандидата (MONTAGE_V2 §3): мутируем payload.selected через ЦЕЛЕВОЙ
+// POST /api/enrich/select {id, idx} — сервер ставит selected И пересинхронизирует
+// плоские asset_kind/asset_path/source под выбранный вариант (именно он уходит в
+// рендер). Оптимистично показываем выбор; при сбое сети/HTTP откатываем.
+async function enrichChooseCandidate(id, idx) {
   const it = enrichLocal(id); if (!it) return
   const v = enrichVisual(it)
   if (idx < 0 || idx >= v.candidates.length || idx === v.chosen) return
-  const chosen = v.candidates[idx] || {}
-  // Полный visual (с candidates) — бэкенд мержит payload ПЛОСКО, потому шлём весь
-  // объект, чтобы не потерять список кандидатов при сохранении.
-  const visual = { ...(it.payload && it.payload.visual ? it.payload.visual : {}),
-    source: v.source, candidates: v.candidates, chosen: idx }
-  if (chosen.preview) visual.asset_path = chosen.preview
-  if (chosen.kind === 'theme' && chosen.id) visual.schematic_style = chosen.id
-  it.payload = { ...(it.payload || {}), visual }
-  // Легаси-щит: текущий render.py читает payload.asset_path — пусть выбранный
-  // кандидат уходит в рендер и на старом бэкенде (для diffusion/stock-ассетов).
-  const patch = { visual }
-  if (chosen.preview && (v.source === 'diffusion' || v.source === 'stock')) {
-    it.payload.asset_path = chosen.preview; patch.asset_path = chosen.preview
-  }
+  const prevSel = Number.isInteger(it.payload && it.payload.selected) ? it.payload.selected : v.chosen
+  it.payload = { ...(it.payload || {}), selected: idx }
   // Стрип следует за выбором (окно прокрутки центрируется на выбранном).
   st.enrichCandPage[id] = Math.max(0, Math.min(idx, Math.max(0, v.candidates.length - 2)))
-  enrichQueueSave(id, { payload: patch })
   renderEnrich({ silent: true })
+  let res
+  try {
+    res = await fetch('/api/enrich/select', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id, idx }),
+    })
+  } catch (e) {
+    it.payload = { ...(it.payload || {}), selected: prevSel }
+    renderEnrich({ silent: true })
+    toast('Сеть: не удалось выбрать вариант (' + e.message + ')', 'error')
+    return
+  }
+  if (!res.ok) {
+    it.payload = { ...(it.payload || {}), selected: prevSel }
+    renderEnrich({ silent: true })
+    await failToast(res, 'Не удалось выбрать вариант')
+    return
+  }
+  let j; try { j = await res.json() } catch { j = null }
+  if (j && Number.isInteger(j.selected)) it.payload.selected = j.selected
+  if (j && j.source) it.payload.source = j.source
+  // Полный GET — плоские поля/статусы соседей станут консистентны.
+  loadEnrichFromCache()
 }
 
 // Кнопки смены СТИЛЯ схемы (§2.4: minimal/neon/business/whiteboard). Выбор темы =
@@ -3553,7 +3596,7 @@ function enrichStyleSwitch(it, v) {
   const lbl = document.createElement('div'); lbl.className = 'enrEditLbl muted'
   lbl.textContent = 'Стиль схемы' + (v.intent ? ` (${ENR_INTENT_RU[v.intent] || v.intent})` : '')
   wrap.appendChild(lbl)
-  const cur = v.schematic_style || (v.candidates[v.chosen] && v.candidates[v.chosen].id) || 'minimal'
+  const cur = v.schematic_style || (v.candidates[v.chosen] && v.candidates[v.chosen].style) || 'minimal'
   const rowEl = document.createElement('div'); rowEl.className = 'enrStyleBtns' + ' ' + 'enrStyleBtns--' + cur
   for (const th of ENR_THEMES) {
     const b = document.createElement('button'); b.type = 'button'
@@ -3644,19 +3687,17 @@ function enrichEditors(it) {
   return null
 }
 
-// Сменить стиль схемы: если есть готовый кандидат этой темы — просто выбрать его
-// (мгновенно). Иначе записать желаемый schematic_style — бэкенд дорендерит при
-// следующем проходе/рендере (контракт перерисовки см. отчёт).
+// Сменить стиль код-схемы: если среди кандидатов есть готовый вариант этой темы
+// — просто выбрать его (мгновенно, через /api/enrich/select). Иначе записать
+// желаемый schematic_style (WHITELISTED плоское поле ImagePayload) — бэкенд
+// дорендерит при следующем проходе/рендере схемы.
 function enrichSetStyle(id, theme) {
   const it = enrichLocal(id); if (!it) return
   const v = enrichVisual(it)
-  const idx = v.candidates.findIndex((c) => c.kind === 'theme' && c.id === theme)
+  const idx = v.candidates.findIndex((c) => c.source === 'schematic' && c.style === theme)
   if (idx >= 0) { enrichChooseCandidate(id, idx); return }
-  // Полный visual (плоский мерж payload на бэкенде) — не теряем candidates.
-  const visual = { ...(it.payload && it.payload.visual ? it.payload.visual : {}),
-    source: v.source || 'schematic', candidates: v.candidates, chosen: v.chosen, schematic_style: theme }
-  it.payload = { ...(it.payload || {}), visual }
-  enrichQueueSave(id, { payload: { visual } })
+  it.payload = { ...(it.payload || {}), schematic_style: theme }
+  enrichQueueSave(id, { payload: { schematic_style: theme } })
   toast('Стиль «' + theme + '» применится при следующем рендере схемы', 'info')
   renderEnrich({ silent: true })
 }
@@ -3666,7 +3707,13 @@ let enrSaveTimer = 0
 const enrPending = new Map()   // id -> patch для debounced batch save
 function enrichQueueSave(id, patch) {
   const prev = enrPending.get(id) || { id }
-  enrPending.set(id, { ...prev, ...patch })
+  const merged = { ...prev, ...patch }
+  // payload вложенный — мержим на один уровень вглубь, иначе второй {payload:{…}}
+  // в одном окне debounce затирает первый (title vs items vs schematic_style).
+  if (prev.payload || patch.payload) {
+    merged.payload = { ...(prev.payload || {}), ...(patch.payload || {}) }
+  }
+  enrPending.set(id, merged)
   clearTimeout(enrSaveTimer)
   enrSaveTimer = setTimeout(enrichFlushSave, 350)
 }
@@ -3743,17 +3790,15 @@ function enrichEditPayload(id, patch) {
 
 // «Заменить ассет» своей картинкой: путь → asset_kind=user (источник stock).
 // Эмодзи-как-иллюстрация убран (§1: значки только для явного icon, не фолбэк).
-// Также синхронизируем payload.visual, чтобы превью/выбор показали свой файл.
+// Чистим candidates/selected, чтобы файл юзера победил сгенерированные варианты
+// (enrichVisual падёт на плоский шим и покажет именно его файл).
 function enrichSetAsset(id, val) {
   const it = enrichLocal(id); if (!it) return
   let patch
   if (!val) {
-    patch = { asset_kind: 'none', asset_path: '', emoji: '', visual: { source: 'none', candidates: [], chosen: 0, asset_path: '' } }
+    patch = { asset_kind: 'none', asset_path: '', emoji: '', candidates: [], selected: 0 }
   } else {
-    patch = {
-      asset_kind: 'user', asset_path: val, emoji: '',
-      visual: { source: 'stock', candidates: [{ kind: 'asset', id: 0, preview: val }], chosen: 0, asset_path: val },
-    }
+    patch = { asset_kind: 'user', asset_path: val, emoji: '', candidates: [], selected: 0 }
   }
   enrichEditPayload(id, patch)
 }
@@ -4113,6 +4158,9 @@ function bindUI() {
   $('#btnCloseRender').onclick = () => closeOverlay('#renderModal')
   $('#btnCancelRender').onclick = () => closeOverlay('#renderModal')
   $('#btnDoRender').onclick = submitRender
+  // Кнопка «Сбросить» настройки рендера к умолчаниям (mirror btnDetectReset).
+  // Guarded: элемента может ещё не быть в index.html — тогда просто нет кнопки.
+  { const brr = $('#btnRenderReset'); if (brr) brr.onclick = () => { seedRenderModal(); flash('Настройки рендера сброшены к умолчаниям') } }
   if ($('#btnExportNle')) $('#btnExportNle').onclick = exportNle
   $('#rEncoder').onchange = (e) => seedQuality(e.target.value, null)
   $('#rQuality').oninput = (e) => $('#rQualVal').textContent = `${qualLabel($('#rEncoder').value)} ${e.target.value}`
@@ -4217,6 +4265,16 @@ function bindUI() {
   for (const el of document.querySelectorAll('.metaCopyBtn')) { el.onclick = () => copyField(el.dataset.field) }
   $('#btnMetaCopyAll').onclick = copyAllMeta
   $('#metaTitle').addEventListener('input', () => { const l = $('#metaTitleLen'); const t = ($('#metaTitle').textContent || '').trim(); if (l) l.textContent = t ? `(${t.length}/100)` : '' })
+  // #36: чистая вставка (без rich-HTML) + флаг «есть ручные правки меты» для beforeunload.
+  for (const sel of ['#metaTitle', '#metaDesc', '#metaTags', '#metaHook']) {
+    const el = $(sel); if (!el) continue
+    el.addEventListener('paste', (e) => {
+      e.preventDefault()
+      const txt = (e.clipboardData || window.clipboardData).getData('text/plain')
+      document.execCommand('insertText', false, txt)
+    })
+    el.addEventListener('input', () => { st.metaDirty = true })
+  }
   $('#btnPrevCut').onclick = prevCut
   $('#btnNextCut').onclick = nextCut
   $('#btnSplit').onclick = () => {
@@ -4529,15 +4587,14 @@ async function openQueueModal() {
 
 // Текущие настройки рендера для постановки клипа в очередь: дефолты + текущая папка вывода.
 function currentRenderOpts() {
-  const d = st.rdefaults || {}
-  return {
-    encoder: d.encoder || 'nvenc',
-    quality: (d.quality != null) ? d.quality : null,
-    audio_bitrate: d.audio_bitrate || '320k',
-    censor_method: d.censor_method || 'partial',
-    subtitles: true, chapters: true,
-    out_dir: st.outDir || '',
-  }
+  // Постановка в очередь должна вести себя как ручной рендер: берём ПОЛНЫЙ набор
+  // из полей модалки рендера (collectRenderOpts), засеяв их дефолтами сессии,
+  // если модалку в этой сессии ни разу не открывали (паттерн openAutopackModal).
+  // Убираем только per-file filename — сервер подставит basename каждого входа.
+  if (!st._rSeeded) seedRenderModal()
+  const o = collectRenderOpts()
+  delete o.filename
+  return o
 }
 
 async function queuePost(url, body) {

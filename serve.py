@@ -2104,6 +2104,14 @@ def state():
         "defaults": {
             "encoder": s.cfg.render.encoder,
             "quality": s.cfg.render.nvenc.qp if s.cfg.render.encoder == "nvenc" else s.cfg.render.x264.crf,
+            # Per-encoder quality so the modal seeds the right value when the user
+            # switches encoder (#46) instead of a hardcoded 19/17.
+            "quality_nvenc": s.cfg.render.nvenc.qp,
+            "quality_x264": s.cfg.render.x264.crf,
+            # Seed the burn-subtitles / chapters checkboxes from config.yaml so a
+            # config `enabled: false` is honoured instead of hardcoding true (#38).
+            "subtitles": s.cfg.subtitles.enabled,
+            "chapters": s.cfg.chapters.enabled,
             "audio_bitrate": s.cfg.render.audio_bitrate,
             "censor_method": s.cfg.censor.method,
             "denoise": s.cfg.render.denoise.enabled,
