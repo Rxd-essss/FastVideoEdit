@@ -38,6 +38,21 @@ def probe_media(ff: FFmpeg, path: str | Path) -> MediaInfo:
     if duration <= 0 and v and v.get("duration"):
         duration = float(v["duration"])
 
+    # Container format.duration is the MAX of all streams, so a track that ends
+    # early (OBS audio outliving video, damaged/cover-art recordings) is
+    # invisible and a kept segment past its EOF makes concat silently
+    # truncate/desync. Clamp to the SHORTEST real stream so every downstream
+    # trim/atrim stays in-bounds -- but ONLY when BOTH streams are present AND
+    # BOTH report a positive duration (many containers omit per-stream
+    # duration), and ONLY when the gap exceeds ~1 frame so frame-quantization
+    # noise never shifts the value.
+    v_dur = float(v.get("duration", 0.0) or 0.0) if v else 0.0
+    a_dur = float(a.get("duration", 0.0) or 0.0) if a else 0.0
+    if v is not None and a is not None and v_dur > 0.0 and a_dur > 0.0:
+        shortest = min(v_dur, a_dur)
+        if duration - shortest > 0.05:
+            duration = shortest
+
     return MediaInfo(
         path=str(path),
         duration=duration,
