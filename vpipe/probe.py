@@ -27,6 +27,31 @@ class MediaInfo:
                 f"a={self.acodec or 'none'}@{self.sample_rate or 0}Hz")
 
 
+def _stream_rotation(v: dict) -> int:
+    """Net display rotation in degrees (0/90/180/270).
+
+    Reads the Display Matrix side-data (ffprobe reports a signed ``rotation``,
+    e.g. -90 for a clockwise-90 display) and falls back to the legacy stream
+    ``tags.rotate``. Returns a normalized non-negative multiple of 90 so callers
+    only need to test the axis-swapping values 90 and 270 -- the sign is
+    irrelevant to a width/height swap.
+    """
+    rot = 0.0
+    for sd in (v.get("side_data_list") or []):
+        if "rotation" in sd:
+            try:
+                rot = float(sd.get("rotation") or 0.0)
+            except (TypeError, ValueError):
+                rot = 0.0
+            break
+    else:
+        try:
+            rot = float((v.get("tags", {}) or {}).get("rotate", 0) or 0)
+        except (TypeError, ValueError):
+            rot = 0.0
+    return int(round(rot)) % 360
+
+
 def probe_media(ff: FFmpeg, path: str | Path) -> MediaInfo:
     info = ff.probe(path)
     fmt = info.get("format", {})
@@ -53,12 +78,23 @@ def probe_media(ff: FFmpeg, path: str | Path) -> MediaInfo:
         if duration - shortest > 0.05:
             duration = shortest
 
+    # ffprobe reports PRE-rotation coded width/height while ffmpeg autorotates
+    # every decoded frame at ingest. A phone/portrait clip tagged +/-90/270
+    # (Display Matrix side-data or legacy tags.rotate) therefore probes as
+    # landscape though every frame in the filtergraph is portrait. Swap to the
+    # DISPLAY dims so PlayRes, punch-zoom, blur-backplate, aspect dup-skip and
+    # the enrich planner all see what actually renders. 0/180 keep the axes.
+    width = int(v.get("width", 0)) if v else 0
+    height = int(v.get("height", 0)) if v else 0
+    if v is not None and _stream_rotation(v) in (90, 270):
+        width, height = height, width
+
     return MediaInfo(
         path=str(path),
         duration=duration,
         fps=parse_fps(v.get("avg_frame_rate") or v.get("r_frame_rate") or "0/0") if v else 0.0,
-        width=int(v.get("width", 0)) if v else 0,
-        height=int(v.get("height", 0)) if v else 0,
+        width=width,
+        height=height,
         vcodec=v.get("codec_name", "") if v else "",
         acodec=a.get("codec_name", "") if a else "",
         has_audio=a is not None,

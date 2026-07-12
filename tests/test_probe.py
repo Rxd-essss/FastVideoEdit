@@ -102,3 +102,64 @@ def test_duration_equal_streams_unchanged():
     ff = FakeFF(_info(10.0, v_dur=10.0, a_dur_val=10.0))
     mi = probe_media(ff, "x.mp4")
     assert mi.duration == 10.0
+
+
+# --- rotation metadata (probe-rotation-swap, Wave 2) ---------------------
+# ffprobe reports PRE-rotation coded width/height; ffmpeg autorotates frames at
+# decode. probe_media reads the Display Matrix side-data (or legacy tags.rotate)
+# and swaps width/height for a +/-90/270 rotation so downstream sees DISPLAY
+# dims. 0/180 rotations keep the axes and stay byte-for-byte unchanged.
+
+
+def _rot_info(*, side_data=None, tags=None):
+    """Single video stream, coded 1920x1080, no audio; optional rotation meta."""
+    vstream = {
+        "codec_type": "video",
+        "codec_name": "h264",
+        "width": 1920,
+        "height": 1080,
+        "avg_frame_rate": "30/1",
+    }
+    if side_data is not None:
+        vstream["side_data_list"] = side_data
+    if tags is not None:
+        vstream["tags"] = tags
+    return {"format": {"duration": "10.0"}, "streams": [vstream]}
+
+
+def test_rotation_90_swaps_dims():
+    # Display Matrix rotation=-90 (clockwise-90 display) -> every frame 1080x1920.
+    ff = FakeFF(_rot_info(side_data=[
+        {"side_data_type": "Display Matrix", "rotation": -90}]))
+    mi = probe_media(ff, "portrait.mp4")
+    assert (mi.width, mi.height) == (1080, 1920)
+
+
+def test_rotation_270_swaps_dims():
+    # Positive 270 also swaps the axes (sign is irrelevant to a W/H swap).
+    ff = FakeFF(_rot_info(side_data=[
+        {"side_data_type": "Display Matrix", "rotation": 270}]))
+    mi = probe_media(ff, "portrait.mp4")
+    assert (mi.width, mi.height) == (1080, 1920)
+
+
+def test_rotation_180_no_swap():
+    # A 180 flip keeps the same axes -> dims unchanged.
+    ff = FakeFF(_rot_info(side_data=[
+        {"side_data_type": "Display Matrix", "rotation": 180}]))
+    mi = probe_media(ff, "flip.mp4")
+    assert (mi.width, mi.height) == (1920, 1080)
+
+
+def test_legacy_tags_rotate_swaps_dims():
+    # Older muxes expose rotation via stream tags.rotate, not side-data.
+    ff = FakeFF(_rot_info(tags={"rotate": "90"}))
+    mi = probe_media(ff, "old.mp4")
+    assert (mi.width, mi.height) == (1080, 1920)
+
+
+def test_no_rotation_landscape_unchanged():
+    # Ordinary landscape file, no rotation metadata -> byte-for-byte unchanged.
+    ff = FakeFF(_rot_info())
+    mi = probe_media(ff, "land.mp4")
+    assert (mi.width, mi.height) == (1920, 1080)
