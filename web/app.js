@@ -177,10 +177,13 @@ function clearSaveError() { if (errorToastEl && errorToastEl.parentNode) errorTo
 
 // Warn before leaving with unsaved or in-flight changes.
 window.addEventListener('beforeunload', (e) => {
-  if (st.dirty || st.saving || st.metaDirty) { e.preventDefault(); e.returnValue = ''; return '' }
+  if (st.dirty || st.saving || st.metaDirty || enrPending.size || enrSaveTimer) { e.preventDefault(); e.returnValue = ''; return '' }
 })
 
-init()
+init().catch((e) => {
+  toast('Сервер недоступен — повторяю…', 'error')
+  setTimeout(() => { init().catch(() => {}) }, 3000)
+})
 
 async function init() {
   bindFiles()
@@ -189,7 +192,9 @@ async function init() {
   bindModels()
   bindTabs()      // ДО ранних return'ов: таб-бар жив и кликабелен в пустой сессии
   checkHealth()   // A7: карточка «ffmpeg не найден» (не блокирует загрузку — fire-and-forget)
-  const s = await (await fetch('/api/state')).json()
+  let s
+  try { const r = await fetch('/api/state'); if (!r.ok) throw new Error('HTTP ' + r.status); s = await r.json() }
+  catch (e) { toast('Не удалось загрузить состояние: ' + e.message, 'error'); throw e }
   if (s.network) renderNetBadge(s.network)   // P2-#4: zero-upload badge from bootstrap
   if (s.no_session) {
     st.hasSession = false; st.curDir = s.start_dir
@@ -249,6 +254,16 @@ async function init() {
   loadEnrichFromCache()  // P4: вкладка «Монтаж» из out/<stem>.enrich.json — без LLM
   if (s.has_transcript) { loadChaptersFromCache(); loadMetadataFromCache() }  // #36: восстановить Главы/Мета из кэша сервера (пусто без транскрипта)
   if (s.task && s.task.running) followTask(s.task.name)
+  // Задача завершилась, пока вкладка была перезагружена/усыплена — показать исход
+  // один раз. Клипы/enrich и Главы/Мета уже восстановлены из кэша выше (248-250);
+  // здесь остаётся рендер основного ролика (его ссылки иначе теряются) и
+  // терминальная ошибка. Сервер жив (иначе s.no_session → return на 201).
+  else if (s.task && s.task.done && !s.task.error && !s.task.cancelled && s.task.name === 'render' && s.task.results) {
+    showResults(s.task.results); toast('Рендер завершён', 'success')
+  }
+  else if (s.task && s.task.error && s.task.error !== 'cancelled' && !s.task.cancelled) {
+    toast('Прошлая задача завершилась с ошибкой: ' + s.task.error, 'error')
+  }
 
   video.addEventListener('timeupdate', () => { if (video.paused) onFrame() })
   video.addEventListener('seeked', onFrame)
@@ -376,7 +391,9 @@ const refreshRegionColor = (id) => { const r = regionById.get(id), s = segOf(id)
 
 /* ---------- data ---------- */
 async function loadData() {
-  const tr = await (await fetch('/api/transcript')).json()
+  let tr
+  try { const r = await fetch('/api/transcript'); if (!r.ok) throw new Error('HTTP ' + r.status); tr = await r.json() }
+  catch (e) { toast('Не удалось загрузить транскрипт: ' + e.message, 'error'); return }
   // A6: тихий CPU-фоллбэк — бейдж «CPU» + один тост (device_used пишется в кэш
   // транскрипта; null у старых кэшей или до A6-бэкенда → ничего не показываем).
   updateCpuBadge(tr.device_used, tr.device_configured)
@@ -811,17 +828,20 @@ function setSubsMode(on) {
 
 /* ---------- F2: главы (фоновая задача — LLM) ---------- */
 async function loadChapters() {
-  if (st.task) { toast('Дождись завершения задачи перед предпросмотром глав', 'info'); return }
-  let res
-  try { res = await fetch('/api/preview/chapters', { method: 'POST' }) }
-  catch (e) { toast('Сеть: не удалось запросить главы (' + e.message + ')', 'error'); return }
-  if (!res.ok) { await failToast(res, 'Не удалось запустить предпросмотр глав'); return }
-  let j; try { j = await res.json() } catch { j = {} }
-  if (j && j.ok === false && j.reason === 'llm_off') {
-    toast('LLM выключена — главы недоступны. Включи Ollama.', 'info'); return
-  }
-  // Задача запущена — следим по SSE (renderChapters вызовется в followTask).
-  followTask('preview_chapters')
+  if (st.task || st._starting) { toast('Дождись завершения задачи перед предпросмотром глав', 'info'); return }
+  st._starting = true
+  try {
+    let res
+    try { res = await fetch('/api/preview/chapters', { method: 'POST' }) }
+    catch (e) { toast('Сеть: не удалось запросить главы (' + e.message + ')', 'error'); return }
+    if (!res.ok) { await failToast(res, 'Не удалось запустить предпросмотр глав'); return }
+    let j; try { j = await res.json() } catch { j = {} }
+    if (j && j.ok === false && j.reason === 'llm_off') {
+      toast('LLM выключена — главы недоступны. Включи Ollama.', 'info'); return
+    }
+    // Задача запущена — следим по SSE (renderChapters вызовется в followTask).
+    followTask('preview_chapters')
+  } finally { st._starting = false }
 }
 // ---- Таб-бар правой колонки (Вырезы/Главы/Мета/Клипы) -----------------------
 // Панели смонтированы ВСЕГДА (contenteditable-правки меты и clipEls живут в
@@ -970,17 +990,20 @@ function renderChapters(chapters) {
 
 /* ---------- B: метаданные YouTube (фоновая задача — LLM) ---------- */
 async function loadMetadata() {
-  if (st.task) { toast('Дождись завершения задачи перед генерацией метаданных', 'info'); return }
-  let res
-  try { res = await fetch('/api/preview/metadata', { method: 'POST' }) }
-  catch (e) { toast('Сеть: не удалось запросить метаданные (' + e.message + ')', 'error'); return }
-  if (!res.ok) { await failToast(res, 'Не удалось запустить генерацию метаданных'); return }
-  let j; try { j = await res.json() } catch { j = {} }
-  if (j && j.ok === false && j.reason === 'llm_off') {
-    toast('LLM выключена — метаданные недоступны. Включи Ollama.', 'info'); return
-  }
-  // Задача запущена — следим по SSE (renderMetadata вызовется в followTask).
-  followTask('preview_metadata')
+  if (st.task || st._starting) { toast('Дождись завершения задачи перед генерацией метаданных', 'info'); return }
+  st._starting = true
+  try {
+    let res
+    try { res = await fetch('/api/preview/metadata', { method: 'POST' }) }
+    catch (e) { toast('Сеть: не удалось запросить метаданные (' + e.message + ')', 'error'); return }
+    if (!res.ok) { await failToast(res, 'Не удалось запустить генерацию метаданных'); return }
+    let j; try { j = await res.json() } catch { j = {} }
+    if (j && j.ok === false && j.reason === 'llm_off') {
+      toast('LLM выключена — метаданные недоступны. Включи Ollama.', 'info'); return
+    }
+    // Задача запущена — следим по SSE (renderMetadata вызовется в followTask).
+    followTask('preview_metadata')
+  } finally { st._starting = false }
 }
 function renderMetadata(meta) {
   meta = meta || {}
@@ -1122,16 +1145,19 @@ function clipsRenderOpts() {
 
 // «Предложить клипы» — фоновая задача preview_clips (паттерн loadChapters).
 async function loadClips() {
-  if (st.task) { toast('Дождись завершения задачи перед подбором клипов', 'info'); return }
-  let res
-  try { res = await fetch('/api/clips/suggest', { method: 'POST' }) }
-  catch (e) { toast('Сеть: не удалось запросить клипы (' + e.message + ')', 'error'); return }
-  if (!res.ok) { await failToast(res, 'Не удалось запустить подбор клипов'); return }
-  let j; try { j = await res.json() } catch { j = {} }
-  if (j && j.ok === false && j.reason === 'llm_off') {
-    toast('LLM выключена — клипы недоступны. Включи Ollama (модель qwen3:8b).', 'info'); return
-  }
-  followTask('preview_clips')
+  if (st.task || st._starting) { toast('Дождись завершения задачи перед подбором клипов', 'info'); return }
+  st._starting = true
+  try {
+    let res
+    try { res = await fetch('/api/clips/suggest', { method: 'POST' }) }
+    catch (e) { toast('Сеть: не удалось запросить клипы (' + e.message + ')', 'error'); return }
+    if (!res.ok) { await failToast(res, 'Не удалось запустить подбор клипов'); return }
+    let j; try { j = await res.json() } catch { j = {} }
+    if (j && j.ok === false && j.reason === 'llm_off') {
+      toast('LLM выключена — клипы недоступны. Включи Ollama (модель qwen3:8b).', 'info'); return
+    }
+    followTask('preview_clips')
+  } finally { st._starting = false }
 }
 
 // Восстановление панели при открытии файла: GET /api/clips (кэш clips.json).
@@ -1519,24 +1545,27 @@ function updateClipsEff() {
 
 // «Рендерить выбранные (N)» → одна фоновая задача render_clips (план §2.4).
 async function clipsRender() {
-  if (st.task) { toast('Дождись завершения текущей задачи', 'info'); return }
+  if (st.task || st._starting) { toast('Дождись завершения текущей задачи', 'info'); return }
   const chosen = st.clipsData.filter((c) => st.clipsSel.has(String(c.id)))
   if (!chosen.length) { toast('Выбери хотя бы один клип — чекбокс на карточке', 'info'); return }
-  await save()   // сервер режет по своему live-катлисту — зафиксировать правки
-  const stem = ($('#filename').textContent || 'clip').replace(/\.[^.]+$/, '')
-  const body = {
-    clips: chosen.map((c, i) => ({
-      start: c.start, end: c.end,
-      filename: `${stem}_clip${String(i + 1).padStart(2, '0')}`,
-    })),
-    render_opts: clipsRenderOpts(),
-  }
-  st._clipsRenderIds = chosen.map((c) => String(c.id))
-  let res
-  try { res = await fetch('/api/clips/render', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }) }
-  catch (e) { toast('Сеть: не удалось запустить рендер клипов (' + e.message + ')', 'error'); return }
-  if (!res.ok) { await failToast(res, 'Не удалось запустить рендер клипов'); return }
-  followTask('render_clips')
+  st._starting = true
+  try {
+    await save()   // сервер режет по своему live-катлисту — зафиксировать правки
+    const stem = ($('#filename').textContent || 'clip').replace(/\.[^.]+$/, '')
+    const body = {
+      clips: chosen.map((c, i) => ({
+        start: c.start, end: c.end,
+        filename: `${stem}_clip${String(i + 1).padStart(2, '0')}`,
+      })),
+      render_opts: clipsRenderOpts(),
+    }
+    st._clipsRenderIds = chosen.map((c) => String(c.id))
+    let res
+    try { res = await fetch('/api/clips/render', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }) }
+    catch (e) { toast('Сеть: не удалось запустить рендер клипов (' + e.message + ')', 'error'); return }
+    if (!res.ok) { await failToast(res, 'Не удалось запустить рендер клипов'); return }
+    followTask('render_clips')
+  } finally { st._starting = false }
 }
 
 // Результаты render_clips → на карточки: ссылка на mp4 или текст ошибки.
@@ -1847,8 +1876,14 @@ function onSelectionChange() {
   if (hi < 0) { float.classList.add('hidden'); st.selRange = null; return }
   st.selRange = [lo, hi]
   const r = range.getBoundingClientRect()
-  float.style.left = (r.left + r.width / 2 - 45) + 'px'; float.style.top = (r.top - 42) + 'px'
-  float.classList.remove('hidden')
+  float.classList.remove('hidden')            // un-hide first so offsetWidth/Height are measurable
+  const fw = float.offsetWidth || 90, fh = float.offsetHeight || 34
+  let left = r.left + r.width / 2 - fw / 2
+  let top = r.top - fh - 8
+  if (top < 8) top = r.bottom + 8             // clipped above → flip below the selection
+  left = Math.max(8, Math.min(left, window.innerWidth - fw - 8))
+  top = Math.max(8, Math.min(top, window.innerHeight - fh - 8))
+  float.style.left = left + 'px'; float.style.top = top + 'px'
 }
 function cutSelection() {
   if (!st.selRange) return
@@ -1864,6 +1899,7 @@ function cutFromMarks() { if (st.inP == null || st.outP == null) { flash('Пос
 let editingSpan = null   // спан .w в режиме правки (null, если правки нет)
 
 function startWordEdit(sp) {
+  if (st.task) { toast('Идёт фоновая задача — правка текста будет доступна после её завершения', 'info'); return }
   if (editingSpan === sp) return
   if (editingSpan) cancelWordEdit(editingSpan)        // одна правка за раз
   const w = st.words[+sp.dataset.i]; if (!w) return
@@ -2067,7 +2103,7 @@ async function doSave() {
         st.dirty = true                                   // unsaved -> keep dirty
         let detail = 'HTTP ' + res.status
         try { const j = await res.json(); if (j && j.detail) detail = j.detail } catch {}
-        throw new Error(detail)
+        const err = new Error(detail); err.status = res.status; throw err
       }
     }
     st.saveError = false; clearSaveError()
@@ -2077,10 +2113,18 @@ async function doSave() {
       if (st.subsMode) loadSubtitles()   // правки сохранены → обновить реплики
     }
   } catch (e) {
-    st.saveError = true   // keep dirty
-    setSavePill('error', 'Не сохранено')
-    showSaveError('Не удалось сохранить правки: ' + e.message + '. Изменения не потеряны — повтор автоматически.')
-    clearTimeout(saveTimer); saveTimer = setTimeout(save, 2000)   // auto-retry
+    st.dirty = true; st.saveError = true   // keep dirty either way
+    if (e.status === 409) {
+      // Бэк отклоняет запись, пока идёт фоновая задача. Правки НЕ потеряны —
+      // авто-повтор допишет их после. Спокойный статус вместо красной ошибки.
+      setSavePill('saving', 'Отложено — идёт задача')
+      clearSaveError()
+      clearTimeout(saveTimer); saveTimer = setTimeout(save, 2000)
+    } else {
+      setSavePill('error', 'Не сохранено')
+      showSaveError('Не удалось сохранить правки: ' + e.message + '. Изменения не потеряны — повтор автоматически.')
+      clearTimeout(saveTimer); saveTimer = setTimeout(save, 2000)   // auto-retry
+    }
   } finally {
     st.saving = false; st.savingPromise = null
   }
@@ -2110,14 +2154,40 @@ async function cancelTask() {
   catch (e) { toast('Сеть: не удалось отменить (' + e.message + ')', 'error') }
 }
 let taskStart = 0
+function taskLost() {
+  // Бэкенд умер/перезапустился в ходе задачи: гасим спиннер, разблокируем UI и
+  // показываем sticky-тост с подсказкой вместо замершего навсегда прогресс-бара.
+  if (es) { es.close(); es = null }
+  st._sseErrs = 0
+  $('#progress').classList.add('hidden'); $('#progress').classList.remove('indeterminate')
+  setRunning(null)
+  toast('Связь с задачей потеряна — возможно, сервер перезапустился. Обновите страницу.', 'error', { sticky: true })
+}
 function followTask(name) {
   setRunning(name); taskStart = Date.now()
   $('#progress').classList.remove('hidden'); $('#progress').classList.add('indeterminate')
   setProgress(35, `${name}…`)
   if (es) es.close()
+  st._sseErrs = 0
   es = new EventSource('/api/events')
-  es.onerror = () => { /* let EventSource auto-retry; final state arrives via message */ }
+  es.onerror = () => {
+    // Разовые сбои — пусть EventSource переподключается сам. Но мёртвый/
+    // перезапущенный бэкенд даёт бесконечные ошибки переподключения (или первый
+    // reconnect ловит 409 и поток закрывается навсегда). После нескольких
+    // подряд ошибок пробуем /api/state: та же задача жива (ждём) vs задачи нет
+    // (восстанавливаем UI).
+    st._sseErrs = (st._sseErrs || 0) + 1
+    if (st._sseErrs < 3) return
+    st._sseErrs = 0
+    fetch('/api/state').then((r) => r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status))).then((s) => {
+      const t = s && s.task
+      if (s.no_session || !t || t.name !== name) { taskLost() }                 // сессия/задача исчезла
+      else if (t.running) { /* сервер жив, та же задача идёт — ES продолжит ретраи */ }
+      else { if (es) { es.close(); es = null }; followTask(name) }               // завершилась в момент сбоя → переоткрыть, /api/events отдаст финальный снимок
+    }).catch(() => taskLost())                                                  // сам /api/state недоступен → сервер лёг
+  }
   es.onmessage = (ev) => {
+    st._sseErrs = 0
     let t; try { t = JSON.parse(ev.data) } catch { return }
     const pct = Math.max(0, Math.min(100, t.percent || 0))
     if (pct > 0) {
@@ -3718,13 +3788,17 @@ function enrichQueueSave(id, patch) {
   enrSaveTimer = setTimeout(enrichFlushSave, 350)
 }
 async function enrichFlushSave() {
+  enrSaveTimer = 0   // таймер отработал — сбросить маркер, чтобы чистый flush не держал beforeunload-гард
   if (!enrPending.size) return
   const items = [...enrPending.values()]
   enrPending.clear()
+  // При сбое вернуть патчи в очередь через enrichQueueSave (тот же коалесинг +
+  // пере-взвод debounce), чтобы правки не потерялись, а повтор дописал их.
+  const requeue = () => { for (const it of items) enrichQueueSave(it.id, it) }
   let res
   try { res = await fetch('/api/enrich/save', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ items }) }) }
-  catch (e) { toast('Сеть: не удалось сохранить правки монтажа (' + e.message + ')', 'error'); return }
-  if (!res.ok) { await failToast(res, 'Не удалось сохранить правки монтажа'); return }
+  catch (e) { requeue(); toast('Сеть: не удалось сохранить правки монтажа (' + e.message + ') — повтор автоматически', 'error'); return }
+  if (!res.ok) { requeue(); await failToast(res, 'Не удалось сохранить правки монтажа'); return }
   // POST /api/enrich/save возвращает ТОЛЬКО изменённые items ({ok, items}) —
   // мержим их в локальный набор (санитизация/клампы/edited применяются), затем
   // полный GET /api/enrich, чтобы перепланированные статусы соседей и баннер
@@ -4115,12 +4189,12 @@ function trapTab(e, ov) {
 
 /* ---------- search ---------- */
 function doSearch(q) {
-  q = q.trim().toLowerCase()
+  q = dictKey(q.trim())   // #70: фолд ё→е + lowercase, как в дедупе словаря — «еще» находит «ещё»
   if (!virtOn) {
     let first = null
     const spans = st.spans || (st.spans = $('#transcript').querySelectorAll('.w'))
     for (const sp of spans) {
-      const hit = q && sp.textContent.toLowerCase().includes(q)
+      const hit = q && dictKey(sp.textContent).includes(q)
       sp.classList.toggle('match', hit); if (hit && !first) first = sp
     }
     if (first) first.scrollIntoView({ block: 'center' })
@@ -4131,7 +4205,7 @@ function doSearch(q) {
   virtMatches = q ? new Set() : null
   let firstIdx = -1
   if (q) for (const w of st.words) {
-    if (w.word.toLowerCase().includes(q)) { virtMatches.add(w.i); if (firstIdx < 0) firstIdx = w.i }
+    if (dictKey(w.word).includes(q)) { virtMatches.add(w.i); if (firstIdx < 0) firstIdx = w.i }
   }
   forEachShownSpan((sp) => { sp.classList.toggle('match', !!(virtMatches && virtMatches.has(+sp.dataset.i))) })
   if (firstIdx >= 0) {
@@ -4374,7 +4448,13 @@ function bindKeys() {
     else if (k === 'Enter') {
       // P4: на вкладке «Монтаж» Enter — превью активной карточки (Linear-паттерн).
       if (activeTab === 'enrich' && st.enrichActive) { e.preventDefault(); enrichPreviewActive() }
-      else if (st.selected) toggleEnabled(st.selected)
+      else if (st.selected) {
+        // Фокус на кнопке/ссылке — Enter принадлежит этому контролу (его нативный
+        // click), а не глобальному тумблеру: иначе двойное действие (#69).
+        const ae2 = document.activeElement
+        if (ae2 && (ae2.tagName === 'BUTTON' || ae2.tagName === 'A')) return
+        toggleEnabled(st.selected)
+      }
     }
     else if (k === 'c' || k === 'с') { if (st.selected) cycleAction(st.selected) }
     else if (k === 'Delete' || k === 'Backspace') {
@@ -4635,8 +4715,13 @@ async function stopQueue() {
 }
 
 async function clearQueue() {
-  const r = await queuePost('/api/queue/clear', {})
-  if (r && r.ok) { if (r.removed) toast(`Удалено заданий: ${r.removed}`, 'info'); loadQueueList() }
+  // «Очистить завершённые» — чистим ТОЛЬКО завершённые задания (done/error);
+  // ожидающие задания (например, поставленные на ночной прогон) не трогаем.
+  const r = await queuePost('/api/queue/clear', { statuses: ['done', 'error'] })
+  if (r && r.ok) {
+    toast(r.removed ? `Очищено завершённых: ${r.removed}` : 'Завершённых заданий нет', 'info')
+    loadQueueList()
+  }
 }
 
 async function removeQueueJob(id) {
@@ -4647,7 +4732,20 @@ async function removeQueueJob(id) {
 async function loadQueueList() {
   let j
   try { const res = await fetch('/api/queue'); if (!res.ok) throw new Error('HTTP ' + res.status); j = await res.json() }
-  catch (e) { toast('Не удалось загрузить очередь: ' + e.message, 'error'); return }
+  catch (e) {
+    // Опрос идёт каждые 1.5с: не заливать тостами. Первые сбои глотаем молча,
+    // после 3-го — останавливаем опрос и показываем ОДИН sticky-тост. Ручной
+    // вызов (без активного таймера) по-прежнему тостит сразу, как раньше.
+    st.queuePollFails = (st.queuePollFails || 0) + 1
+    if (st.queuePollTimer && st.queuePollFails >= 3) {
+      stopQueuePoll()
+      toast('Очередь недоступна — опрос остановлен (' + e.message + '). Перезапустите сервер и обновите страницу.', 'error')
+    } else if (!st.queuePollTimer) {
+      toast('Не удалось загрузить очередь: ' + e.message, 'error')
+    }
+    return
+  }
+  st.queuePollFails = 0
   st.queueJobs = j.jobs || []
   st.queueRunning = !!j.running
   renderQueueList()
