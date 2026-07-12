@@ -22,7 +22,7 @@ def test_shutdown_calls_cancel_all(monkeypatch):
     calls = []
     monkeypatch.setattr(ffmpeg_utils, "cancel_all", lambda: calls.append(1))
     # Entering/exiting the TestClient context runs the ASGI startup+shutdown
-    # lifespan, which fires @app.on_event("shutdown").
+    # lifespan, whose teardown calls _cancel_ffmpeg_on_shutdown -> cancel_all.
     with TestClient(serve.app):
         pass
     assert calls, "shutdown hook did not call ffmpeg_utils.cancel_all()"
@@ -32,5 +32,7 @@ def test_main_registers_atexit_cancel_all():
     src = Path(serve.__file__).read_text(encoding="utf-8")
     assert "import atexit" in src
     assert "atexit.register(ffmpeg_utils.cancel_all)" in src
-    # the ASGI-shutdown teardown hook is present too
-    assert 'on_event("shutdown")' in src
+    # the ASGI-shutdown teardown hook is present too (lifespan handler, not the
+    # deprecated on_event; it calls the same _cancel_ffmpeg_on_shutdown).
+    assert "lifespan=_lifespan" in src
+    assert "_cancel_ffmpeg_on_shutdown()" in src

@@ -14,6 +14,7 @@ import atexit
 import copy
 import hashlib
 import json
+from contextlib import asynccontextmanager
 import logging
 import math
 import os
@@ -428,15 +429,25 @@ class Session:
 
 
 SESSION: Optional[Session] = None
-app = FastAPI(title="FastVideoEdit")
 
 
-@app.on_event("shutdown")
+@asynccontextmanager
+async def _lifespan(_app: "FastAPI"):
+    """ASGI lifespan: nothing to set up before serving (main() does that), but on
+    graceful shutdown (Ctrl+C / SIGTERM) run the ffmpeg-cancel + flush teardown.
+    Replaces the deprecated @app.on_event("shutdown") hook."""
+    yield
+    _cancel_ffmpeg_on_shutdown()
+
+
+app = FastAPI(title="FastVideoEdit", lifespan=_lifespan)
+
+
 def _cancel_ffmpeg_on_shutdown() -> None:
     """uvicorn graceful shutdown (Ctrl+C / SIGTERM) -> terminate any tracked
     ffmpeg so a daemon render thread can't keep an orphan encoding after the
     server has quit (holding the GPU + locking the .part file). Idempotent;
-    safe when nothing is running."""
+    safe when nothing is running. Invoked from the ASGI lifespan handler."""
     try:
         ffmpeg_utils.cancel_all()
     except Exception:  # noqa: BLE001 — best-effort teardown, never raise on exit
