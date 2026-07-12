@@ -64,6 +64,8 @@ ILL_MAX_PER_WINDOW = 4         # окно-лимит 4 точки (модель 
 CTA_MARK_EVERY = 25            # §3.2: маркеры каждые 25 слов…
 CTA_MARK_EVERY_LONG = 50       # …>45 мин — прореживание до 50 (num_ctx 16384)
 CTA_LONG_S = 45 * 60.0
+CTA_WINDOW = 3200              # слов на ОДИН CTA-вызов: ~≤0.8*num_ctx с маркерами
+                               # (>~21 мин ролик режется на окна; короче — 1 окно)
 CTA_TEMPERATURE = 0.4          # подъём temp ТОЛЬКО на CTA-вызове: разнообразие
                                # тематического вопроса (списки/иллюстрации — 0)
 
@@ -843,60 +845,67 @@ def _detect_cta(eff: _EffStream, transcript: Transcript, llm, ka_next,
     eff_dur = eff.tl.new_duration()
     every = CTA_MARK_EVERY_LONG if eff_dur > CTA_LONG_S else CTA_MARK_EVERY
     log("Монтаж: CTA…")
-    user = _CTA_USER_TMPL.format(text=_marked_text(eff, 0, n, every))
-    # CTA — единственный детектор, которому нужно РАЗНООБРАЗИЕ, а не точный
-    # снап: на temp=0 qwen3:8b детерминированно залипает в общий вопрос без
-    # предмета («Если эта тема станет интересной, пишите»). Лёгкий подъём до
-    # 0.4 на ОДНОМ этом вызове разблокирует осмысленный тематический вопрос
-    # (живой Prod9: «Какой дистрибутив Linux вы выбрали и почему?»). Тесты на
-    # MockLLM температуру не читают (нет .cfg) — детерминизм тестов цел.
-    with _cta_temperature(llm, CTA_TEMPERATURE):
-        try:
-            data = llm.chat_json(_CTA_SYSTEM, user, _CTA_SCHEMA,
-                                 keep_alive=ka_next())
-        except Exception as e:  # noqa: BLE001 — сбойный детектор не валит пасс
-            log(f"  enrich: CTA-детектор пропущен ({e})")
-            return []
-    raw = data.get("ctas") if isinstance(data, dict) else None
-
+    # Окна, чтобы промпт не превысил num_ctx на длинных роликах: маркеры несут
+    # АБСОЛЮТНЫЙ filtered-индекс, поэтому word_idx из окон совместимы с общими
+    # гардами/дедупом ниже. Короткий/средний ролик = РОВНО одно окно [0:n]
+    # (поведение без изменений). Модель держим тёплой (ka_next → 300; финальный
+    # unload — в detect_all).
+    wins = (segment_windows(n, _win_cfg(CTA_WINDOW, 0))
+            if n > CTA_WINDOW else [(0, n)])
     cand: list[dict] = []
-    for r in (raw if isinstance(raw, list) else []):
-        if not isinstance(r, dict):
-            continue
-        typ = r.get("type")
-        if typ not in ("subscribe", "comment"):
-            continue                               # type вне множества -> дроп
-        wi = r.get("word_idx")
-        if not _valid_int(wi):
-            continue
-        wi = max(0, min(n - 1, wi))
-        question = _trim_text(r.get("comment_question"), CTA_QUESTION_MAX)
-        if typ == "comment" and (not question or _is_weak_question(question)):
-            continue                               # без вопроса / общий -> дроп
-            # (template-фолбэк ниже гарантирует, что comment-CTA не пропадёт)
-        # Снап к концу предложения: граница whisper-сегмента (±25 слов маркера
-        # хватает для значка, который висит секунды; снап убирает «середину фразы»).
-        orig_i = eff.orig[wi]
-        si = eff.seg_of[orig_i]
-        last_i = eff.seg_last[si]
-        t_orig = eff.all_words[last_i].end
-        t_eff = eff.tl.remap_clamped(t_orig)
-        if t_eff < CTA_MIN_T_S or t_eff > eff_dur - CTA_TAIL_S:
-            continue                               # первые 60 c / последние 20 c
-        cand.append({
-            "typ": typ, "t_eff": t_eff,
-            "d": {
-                "type": (ENR_CTA_SUBSCRIBE if typ == "subscribe"
-                         else ENR_CTA_COMMENT),
-                "score": _CTA_SCORE[typ],
-                "word_start": last_i, "word_end": last_i,
-                "t_start": t_orig, "t_end": 0.0,   # t_end выставит item_from_dict
-                "quote": _trim_text(transcript.segments[si].text, 120),
-                "reason": _trim_text(r.get("reason"), 200),
-                "payload": ({"variant": "sub_like"} if typ == "subscribe"
-                            else {"question": question}),
-            },
-        })
+    for lo, hi in wins:
+        user = _CTA_USER_TMPL.format(text=_marked_text(eff, lo, hi, every))
+        # CTA — единственный детектор, которому нужно РАЗНООБРАЗИЕ, а не точный
+        # снап: на temp=0 qwen3:8b детерминированно залипает в общий вопрос без
+        # предмета («Если эта тема станет интересной, пишите»). Лёгкий подъём до
+        # 0.4 на ЭТОМ вызове разблокирует осмысленный тематический вопрос
+        # (живой Prod9: «Какой дистрибутив Linux вы выбрали и почему?»). Тесты на
+        # MockLLM температуру не читают (нет .cfg) — детерминизм тестов цел.
+        with _cta_temperature(llm, CTA_TEMPERATURE):
+            try:
+                data = llm.chat_json(_CTA_SYSTEM, user, _CTA_SCHEMA,
+                                     keep_alive=ka_next())
+            except Exception as e:  # noqa: BLE001 — сбойное окно не валит пасс
+                log(f"  enrich: CTA-окно [{lo}:{hi}] пропущено ({e})")
+                continue
+        raw = data.get("ctas") if isinstance(data, dict) else None
+        for r in (raw if isinstance(raw, list) else []):
+            if not isinstance(r, dict):
+                continue
+            typ = r.get("type")
+            if typ not in ("subscribe", "comment"):
+                continue                           # type вне множества -> дроп
+            wi = r.get("word_idx")
+            if not _valid_int(wi):
+                continue
+            wi = max(0, min(n - 1, wi))
+            question = _trim_text(r.get("comment_question"), CTA_QUESTION_MAX)
+            if typ == "comment" and (not question or _is_weak_question(question)):
+                continue                           # без вопроса / общий -> дроп
+                # (template-фолбэк ниже гарантирует, что comment-CTA не пропадёт)
+            # Снап к концу предложения: граница whisper-сегмента (±25 слов маркера
+            # хватает для значка, который висит секунды; снап убирает «середину фразы»).
+            orig_i = eff.orig[wi]
+            si = eff.seg_of[orig_i]
+            last_i = eff.seg_last[si]
+            t_orig = eff.all_words[last_i].end
+            t_eff = eff.tl.remap_clamped(t_orig)
+            if t_eff < CTA_MIN_T_S or t_eff > eff_dur - CTA_TAIL_S:
+                continue                           # первые 60 c / последние 20 c
+            cand.append({
+                "typ": typ, "t_eff": t_eff,
+                "d": {
+                    "type": (ENR_CTA_SUBSCRIBE if typ == "subscribe"
+                             else ENR_CTA_COMMENT),
+                    "score": _CTA_SCORE[typ],
+                    "word_start": last_i, "word_end": last_i,
+                    "t_start": t_orig, "t_end": 0.0,  # t_end выставит item_from_dict
+                    "quote": _trim_text(transcript.segments[si].text, 120),
+                    "reason": _trim_text(r.get("reason"), 200),
+                    "payload": ({"variant": "sub_like"} if typ == "subscribe"
+                                else {"question": question}),
+                },
+            })
 
     # Дедуп <120 c + плотность <=2 на 10 мин с приоритетом «1 subscribe +
     # 1 comment» (по score: comment > subscribe — он несёт уникальный вопрос).
@@ -1625,7 +1634,8 @@ def match_user_assets(points: list, folder, llm, log: LogFn = _noop,
 # === сборка ======================================================================
 def detect_all(transcript: Optional[Transcript], cutlist: Optional[CutList],
                params: Optional[dict], llm, log: LogFn = _noop,
-               on_progress=None, *, user_folder: Optional[str] = None) -> list[EnrichItem]:
+               on_progress=None, *, user_folder: Optional[str] = None,
+               codegfx_style: str = SCHEMATIC_STYLE_DEF) -> list[EnrichItem]:
     """Полный LLM-пасс обогащения (§3): списки -> CTA -> иллюстрации -> ассеты.
 
     - выключенный в ``params["types"]`` тип НЕ вызывается вообще (§3.4);
@@ -1664,33 +1674,15 @@ def detect_all(transcript: Optional[Transcript], cutlist: Optional[CutList],
         prog(1.0)
         return []
 
-    # Матчинг папки юзера = ОДИН LLM-вызов; считаем его в плане вызовов (для
-    # keep_alive ПОСЛЕДНЕГО), только если он реально пойдёт: источник
-    # auto/user_folder + папка задана, существует И содержит хоть один ассет
-    # (пустая папка / только эмодзи-фолбэк LLM не зовут — иначе предыдущий
-    # вызов зря держал бы модель тёплой). detect_all зовёт match_user_assets
-    # на ВСЕ иллюстрации; здесь лишь предсказываем, будет ли LLM-вызов.
-    _folder_p = Path(str(user_folder)).expanduser() if user_folder else None
-    will_match_folder = (
-        run_assets and image_source in ("auto", "user_folder")
-        and _folder_p is not None and _folder_p.is_dir()
-        and bool(_index_assets(_folder_p)))
-
-    # План вызовов известен заранее -> знаем ПОСЛЕДНИЙ (keep_alive=0 на нём,
-    # VRAM под Whisper/рендер — §3.4).
-    n_calls = ((len(segment_windows(len(eff.words),
-                                    _win_cfg(LISTS_WINDOW, LISTS_OVERLAP)))
-                if run_lists else 0)
-               + (1 if run_cta else 0)
-               + (len(segment_windows(len(eff.words), _win_cfg(ILL_WINDOW, 0)))
-                  if run_ill else 0)
-               + (1 if will_match_folder else 0))
-    made = 0
-
+    # VRAM (§3.4): модель держим ТЁПЛОЙ ВЕСЬ пасс (детекторы → CTA-окна →
+    # schematic-экстракторы _build_candidates → матч папки). Их точное число
+    # заранее НЕизвестно (экстракторы зависят от вывода детектора иллюстраций),
+    # поэтому НЕ угадываем «последний вызов» (старый n_calls промахивался:
+    # экстракторы не считались → модель выгружалась посреди пасса и грузилась
+    # заново). Вместо этого — ОДИН явный llm.unload() в конце пасса (ниже):
+    # робастно и работает даже когда SD-этап пропущен.
     def ka_next() -> int:
-        nonlocal made
-        made += 1
-        return 0 if made >= n_calls else KEEP_ALIVE_BETWEEN
+        return KEEP_ALIVE_BETWEEN
 
     dicts: list[dict] = []
     prog(0.0)
@@ -1722,6 +1714,7 @@ def detect_all(transcript: Optional[Transcript], cutlist: Optional[CutList],
     if run_ill:
         try:
             _build_candidates(dicts, eff, llm, log,
+                              default_style=codegfx_style,
                               run_diffusion=image_source in ("auto", "generate"))
         except Exception as e:  # noqa: BLE001 — сбойная стадия не валит пасс
             log(f"enrich: стадия кандидатов упала ({e}) — точки без кандидатов")
@@ -1738,6 +1731,17 @@ def detect_all(transcript: Optional[Transcript], cutlist: Optional[CutList],
         except Exception as e:  # noqa: BLE001 — сбойный этап ассетов не валит пасс
             log(f"enrich: этап ассетов упал ({e}) — предложения без ассета")
     prog(1.0)
+
+    # VRAM освобождаем ЯВНО в конце пасса (см. ka_next): единственная точка
+    # выгрузки qwen3 — работает и когда SD-этап пропущен. best-effort: у боевого
+    # OllamaClient unload() никогда не бросает; тестовые моки без unload()
+    # просто пропускаем (getattr-гард).
+    _unload = getattr(llm, "unload", None)
+    if callable(_unload):
+        try:
+            _unload()
+        except Exception as e:  # noqa: BLE001 — выгрузка best-effort
+            log(f"enrich: не удалось выгрузить модель в конце пасса ({e})")
 
     items: list[EnrichItem] = []
     for d in dicts:

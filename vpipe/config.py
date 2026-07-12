@@ -315,6 +315,7 @@ class ImageGenCfg(_Base):
     imagegen_cfg: float = 1.5                 # cfg-scale (Turbo крепче держит на 1.5)
     imagegen_candidates: int = 4             # N сидов на момент (-b 4 -s -1) → выбор
     imagegen_vae: str = ""                   # путь к sdxl_vae_fp16fix.safetensors (--vae); ""=без
+    imagegen_max_vram: float = -1.0          # ГиБ-бюджет VRAM для sd-cli graph-split; <0=авто-детект свободной, 0=выкл
 
 
 class CodegfxCfg(_Base):

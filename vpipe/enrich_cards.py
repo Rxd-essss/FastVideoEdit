@@ -64,6 +64,20 @@ CARD_SUBS_CLEAR_1080 = 60    # низ блока пунктов не ниже к
 CTA_GAP_OVER_SUBS_1080 = 70  # CtaText: 60–80 px над зоной сабов — середина
 CTA_ICON_GAP_1080 = 24       # зазор между иконкой-облачком (§2.3) и текстом
 
+
+def subs_zone_top_1080(style, max_lines: int = 2) -> float:
+    """Верхняя кромка зоны burn-сабов (px @1080) для КОНКРЕТНОГО стиля (#52).
+
+    Низ-якорь (``position='bottom'``): ``1080 − margin_v − max_lines×size×1.2``.
+    Top/center-сабы в нижней зоне не сидят → ``1080`` (зона полностью свободна).
+    Заменяет хардкод :data:`SUBS_TOP_1080` (дефолты AssStyleCfg 52/40/bottom/2
+    → ≈915), чтобы «Неон»/«Крупный» не перекрывали CTA/карточки сабами.
+    """
+    if getattr(style, "position", "bottom") != "bottom":
+        return 1080.0
+    return max(0.0, 1080.0 - float(style.margin_v)
+               - int(max_lines) * float(style.size) * 1.2)
+
 # --- анимации, мс (§2.2) ----------------------------------------------------------
 SCRIM_FAD = (250, 300)
 TITLE_FAD = (250, 300)
@@ -254,7 +268,8 @@ def _resolve_mode(card: CardPlan, override: Optional[str]) -> str:
 
 
 def _card_events(card: CardPlan, W: int, H: int, k: float, alpha_hex: str,
-                 accent: str, dim: str, mode: str = "panel") -> list[str]:
+                 accent: str, dim: str, mode: str = "panel",
+                 subs_top: float = SUBS_TOP_1080) -> list[str]:
     r"""События одной карточки — диспетчер по ``mode`` (§3).
 
     ``panel`` (стиль A, дефолт V11) -> :func:`_card_events_panel`; ``scrim``
@@ -264,12 +279,14 @@ def _card_events(card: CardPlan, W: int, H: int, k: float, alpha_hex: str,
     if not shown:
         return []                       # карточка без пунктов не рисуется
     if mode == "scrim":
-        return _card_events_scrim(card, W, H, k, alpha_hex, accent, dim)
+        return _card_events_scrim(card, W, H, k, alpha_hex, accent, dim,
+                                  subs_top)
     return _card_events_panel(card, W, H, k, accent, dim)
 
 
 def _card_events_scrim(card: CardPlan, W: int, H: int, k: float, alpha_hex: str,
-                       accent: str, dim: str) -> list[str]:
+                       accent: str, dim: str,
+                       subs_top: float = SUBS_TOP_1080) -> list[str]:
     """Стиль B-фолбэк «scrim»: слой 0 скрим / 1 заголовок / 2 пункты (плоский
     список — исторический путь, оставлен как fallback за тумблером mode=scrim)."""
     items = _shown_items(card)
@@ -282,7 +299,7 @@ def _card_events_scrim(card: CardPlan, W: int, H: int, k: float, alpha_hex: str,
     y0 = _px(CARD_Y0_1080, k)
     step = max(1, _px(CARD_STEP_1080, k))
     line_h = _px(ITEM_LINE_H_1080, k)
-    y_limit = _px(SUBS_TOP_1080 - CARD_SUBS_CLEAR_1080, k)
+    y_limit = _px(subs_top - CARD_SUBS_CLEAR_1080, k)
     n_geom = (y_limit - line_h - y0) // step + 1
     n = max(1, min(MAX_CARD_ITEMS, n_geom, len(items)))
     shown = items[:n]
@@ -442,7 +459,8 @@ def _card_events_panel(card: CardPlan, W: int, H: int, k: float,
 
 def build_enrich_ass(cards: Sequence[CardPlan], ctas: Sequence[CtaTextPlan],
                      W: int, H: int,
-                     style_overrides: Optional[dict] = None) -> str:
+                     style_overrides: Optional[dict] = None,
+                     subs_top_1080: Optional[float] = None) -> str:
     """Собрать текст ``enrich_{base}.ass`` (PlayResX/Y = финальное разрешение).
 
     ``cards``/``ctas`` — ``RenderEnrich.cards``/``RenderEnrich.cta_texts``
@@ -457,6 +475,8 @@ def build_enrich_ass(cards: Sequence[CardPlan], ctas: Sequence[CtaTextPlan],
     if W <= 0 or H <= 0:
         raise ValueError(f"build_enrich_ass: некорректное разрешение {W}x{H}")
     k = H / 1080.0
+    # #52: кромка зоны burn-сабов от РЕАЛЬНОГО стиля (None ⇒ хардкод-дефолт).
+    subs_top = SUBS_TOP_1080 if subs_top_1080 is None else float(subs_top_1080)
     ov = style_overrides if isinstance(style_overrides, dict) else {}
     alpha_hex = scrim_alpha_hex(ov.get("scrim_opacity", SCRIM_OPACITY_DEF))
     accent = str(ov.get("accent", ACCENT_BGR))
@@ -467,7 +487,7 @@ def build_enrich_ass(cards: Sequence[CardPlan], ctas: Sequence[CtaTextPlan],
     # низ текста — на CTA_GAP_OVER_SUBS px выше верхней кромки зоны сабов.
     cta_ml = (_px(PIP_PAD_PX, k) + int(round(W * CTA_WIDTH_FRAC))
               + _px(CTA_ICON_GAP_1080, k))
-    cta_mv = _px(1080 - SUBS_TOP_1080 + CTA_GAP_OVER_SUBS_1080, k)
+    cta_mv = _px(1080 - subs_top + CTA_GAP_OVER_SUBS_1080, k)
 
     lines = [
         "[Script Info]",
@@ -501,7 +521,8 @@ def build_enrich_ass(cards: Sequence[CardPlan], ctas: Sequence[CtaTextPlan],
 
     for card in cards:
         mode = _resolve_mode(card, mode_override)
-        lines.extend(_card_events(card, W, H, k, alpha_hex, accent, dim, mode))
+        lines.extend(_card_events(card, W, H, k, alpha_hex, accent, dim, mode,
+                                  subs_top=subs_top))
     for cta in ctas:
         text = ass_escape((cta.text or "").strip())
         if not text:
@@ -514,10 +535,12 @@ def build_enrich_ass(cards: Sequence[CardPlan], ctas: Sequence[CtaTextPlan],
 
 def write_enrich_ass(cards: Sequence[CardPlan], ctas: Sequence[CtaTextPlan],
                      W: int, H: int, path: str | Path,
-                     style_overrides: Optional[dict] = None) -> Path:
+                     style_overrides: Optional[dict] = None,
+                     subs_top_1080: Optional[float] = None) -> Path:
     """Записать ASS в work_dir (UTF-8 c BOM — как write_ass: libass на Windows
     надёжнее всего читает кириллицу с BOM). Возвращает путь файла."""
     p = Path(path)
-    p.write_text(build_enrich_ass(cards, ctas, W, H, style_overrides),
+    p.write_text(build_enrich_ass(cards, ctas, W, H, style_overrides,
+                                  subs_top_1080=subs_top_1080),
                  encoding="utf-8-sig")
     return p

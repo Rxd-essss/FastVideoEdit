@@ -12,8 +12,10 @@ CtaText (Inter Medium/SemiBold, кегли ×PlayResY/1080), скрим-слой
 import pytest
 
 from vpipe.enrich import CardPlan, CardPlanItem, CtaTextPlan, card_tail_s
+from vpipe.config import AssStyleCfg
 from vpipe.enrich_cards import (ass_escape, build_enrich_ass, card_windows_for,
-                                rrect, scrim_alpha_hex, write_enrich_ass)
+                                rrect, scrim_alpha_hex, subs_zone_top_1080,
+                                write_enrich_ass)
 from vpipe.subtitles import _ass_ts
 
 
@@ -480,3 +482,28 @@ def test_empty_plan_valid_header_no_events():
 def test_bad_resolution_raises():
     with pytest.raises(ValueError):
         build_enrich_ass([], [], 0, 1080)
+
+
+# --- #52: зона сабов от РЕАЛЬНОГО стиля --------------------------------------------
+def _cta_margin_v(ass):
+    """MarginV стиля CtaText (предпоследнее поле Style-строки перед Encoding)."""
+    line = next(l for l in ass.splitlines() if l.startswith("Style: CtaText,"))
+    return int(line.split(",")[-2])
+
+
+def test_subs_zone_top_from_style():
+    # дефолт AssStyleCfg (52/40/bottom/2): 1080-40-2*52*1.2 = 915.2 (≈хардкод 915)
+    assert subs_zone_top_1080(AssStyleCfg()) == pytest.approx(915.2, abs=0.6)
+    # «Неон» (size 62, margin_v 160): 1080-160-2*62*1.2 = 771.2 — зона выше
+    assert subs_zone_top_1080(
+        AssStyleCfg(size=62, margin_v=160)) == pytest.approx(771.2, abs=0.6)
+    # top/center-сабы в нижней зоне не сидят → полностью свободна
+    assert subs_zone_top_1080(AssStyleCfg(position="center")) == 1080.0
+
+
+def test_cta_margin_v_follows_subs_top():
+    default = _cta_margin_v(build_enrich_ass([], [make_cta()], 1920, 1080))
+    lifted = _cta_margin_v(build_enrich_ass([], [make_cta()], 1920, 1080,
+                                            subs_top_1080=771))
+    # меньший subs_top («Неон») ⇒ больший MarginV ⇒ CTA поднят выше над сабами
+    assert lifted > default

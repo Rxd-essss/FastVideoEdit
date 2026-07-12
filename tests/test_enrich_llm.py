@@ -280,6 +280,33 @@ def test_cta_single_call_snap_to_segment_end_and_payloads():
     assert sub.score == 60 and com.score == 70           # эвристика кода
 
 
+def test_cta_windows_long_transcript():
+    """>~21 мин ролик режется на CTA-окна (num_ctx-safe); CTA из ВТОРОГО окна
+    (абсолютный word_idx >= CTA_WINDOW) доживает до items."""
+    n = enrich_llm.CTA_WINDOW * 2                     # ровно 2 окна
+    tr = _build_tr(n)
+    llm = MockLLM([
+        {"ctas": [_cta("subscribe", 300)]},           # окно 1 [0:CTA_WINDOW)
+        {"ctas": [_cta("comment", enrich_llm.CTA_WINDOW + 800,
+                       q="Какой дистрибутив выбрали и почему?")]},  # окно 2
+    ])
+    out = detect_all(tr, _cl(tr), _only("cta"), llm, log=_SILENT)
+    exp = len(enrich_llm.segment_windows(
+        n, enrich_llm._win_cfg(enrich_llm.CTA_WINDOW, 0)))
+    cta_calls = [c for c in llm.calls if c["schema"] is enrich_llm._CTA_SCHEMA]
+    assert len(cta_calls) == exp == 2                 # одно окно = один промпт
+    assert any(it.type == ENR_CTA_COMMENT
+               and it.word_start >= enrich_llm.CTA_WINDOW for it in out)
+
+
+def test_cta_short_transcript_single_call_fast_path():
+    tr = _build_tr(300)                               # n <= CTA_WINDOW → 1 окно
+    llm = MockLLM([{"ctas": [_cta("subscribe", 150)]}])
+    detect_all(tr, _cl(tr), _only("cta"), llm, log=_SILENT)
+    cta_calls = [c for c in llm.calls if c["schema"] is enrich_llm._CTA_SCHEMA]
+    assert len(cta_calls) == 1                        # быстрый путь — один вызов
+
+
 def test_cta_drop_before_60s_and_tail_and_junk():
     tr = _build_tr(300)                                  # 150 c, хвост-гард 130
     llm = MockLLM([{"ctas": [
@@ -823,17 +850,42 @@ def test_keep_alive_300_between_and_0_on_last_call_of_pass():
     tr = _build_tr(300)                               # 1+1+1 вызов
     llm = MockLLM([{"lists": []}, {"ctas": []}, {"points": []}])
     detect_all(tr, _cl(tr), _params(), llm, log=_SILENT)
-    assert [c["keep_alive"] for c in llm.calls] == [300, 300, 0]
+    assert [c["keep_alive"] for c in llm.calls] == [300, 300, 300]
 
 
 def test_keep_alive_last_call_shifts_when_types_disabled():
     tr = _build_tr(300)
     llm = MockLLM([{"lists": []}])                    # только списки → их вызов
     detect_all(tr, _cl(tr), _only("list_card"), llm, log=_SILENT)
-    assert [c["keep_alive"] for c in llm.calls] == [0]  # последний = 0
+    assert [c["keep_alive"] for c in llm.calls] == [300]  # тёплый весь пасс
     llm = MockLLM([{"lists": []}, {"points": []}])    # списки + иллюстрации
     detect_all(tr, _cl(tr), _params(cta=False), llm, log=_SILENT)
-    assert [c["keep_alive"] for c in llm.calls] == [300, 0]
+    assert [c["keep_alive"] for c in llm.calls] == [300, 300]
+
+
+class _UnloadLLM(MockLLM):
+    """MockLLM с записью вызовов unload() (боевой OllamaClient его имеет)."""
+
+    def __init__(self, responses):
+        super().__init__(responses)
+        self.unloads = 0
+        self.calls_at_unload = -1
+
+    def unload(self, model=None):
+        self.unloads += 1
+        self.calls_at_unload = len(self.calls)
+        return True
+
+
+def test_pass_unloads_model_once_at_end():
+    tr = _build_tr(300)                               # 1+1+1 вызов детекторов
+    llm = _UnloadLLM([{"lists": []}, {"ctas": []}, {"points": []}])
+    detect_all(tr, _cl(tr), _params(), llm, log=_SILENT)
+    # модель ТЁПЛАЯ весь пасс: ни один chat_json не выгружает (keep_alive!=0)
+    assert [c["keep_alive"] for c in llm.calls] == [300, 300, 300]
+    # ровно ОДНА явная выгрузка — ПОСЛЕ последнего chat_json
+    assert llm.unloads == 1
+    assert llm.calls_at_unload == len(llm.calls) == 3
 
 
 def test_progress_weights_sum_and_detector_milestones():
@@ -863,3 +915,43 @@ def test_progress_reaches_full_even_with_all_types_disabled():
                      MockLLM([]), log=_SILENT, on_progress=seen.append)
     assert out == []
     assert seen[-1] == 1.0
+
+
+def test_build_candidates_threads_default_style(monkeypatch):
+    """default_style роутится в schematic-кандидат (candidates[0].style) и в
+    плоское payload.schematic_style — вместо жёсткого 'minimal'."""
+    tr = _build_tr(300)
+    eff = enrich_llm._build_eff(tr, _cl(tr))
+    monkeypatch.setattr(enrich_llm, "_extract_schematic",
+                        lambda *a, **k: {"title": "t", "nodes": []})
+    pt = {"type": ENR_IMAGE, "word_start": 100, "word_end": 105,
+          "t_start": 50.0, "t_end": 53.0, "quote": "цитата", "reason": "r",
+          "payload": {"source": "schematic"},
+          "_route": {"source": "schematic", "intent": "tree",
+                     "lo": 100, "hi": 106}}
+    enrich_llm._build_candidates([pt], eff, None, _SILENT, default_style="neon")
+    cands = pt["payload"]["candidates"]
+    assert cands[0]["source"] == "schematic"
+    assert cands[0]["style"] == "neon"
+    assert pt["payload"]["schematic_style"] == "neon"
+
+
+def test_detect_all_forwards_codegfx_style(monkeypatch):
+    """detect_all прокидывает codegfx_style в кандидатов (config → candidate)."""
+    tr = _build_tr(300)
+    monkeypatch.setattr(enrich_llm, "_extract_schematic",
+                        lambda *a, **k: {"title": "t", "nodes": []})
+    params = _params(animation=False, list_card=False, cta=False)
+    params["image_source"] = "generate"              # без матча папки/эмодзи-LLM
+    llm = MockLLM([
+        {"points": [{"word_start": 100, "word_end": 105,
+                     "concept": "реестр Windows", "source": "schematic",
+                     "intent": "tree", "image_query_en": ""}]},
+    ])
+    out = detect_all(tr, _cl(tr), params, llm, log=_SILENT,
+                     codegfx_style="business")
+    assert len(out) == 1
+    pl = out[0].payload
+    sche = [c for c in pl.candidates if c["source"] == "schematic"]
+    assert sche and sche[0]["style"] == "business"
+    assert pl.schematic_style == "business"

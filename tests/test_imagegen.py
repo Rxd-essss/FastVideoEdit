@@ -362,6 +362,46 @@ def test_generate_image_vae_flag_when_configured(monkeypatch, tmp_path):
     assert seen["cmd"][seen["cmd"].index("--vae") + 1] == str(vae)
 
 
+def test_generate_max_vram_flag_default(monkeypatch, tmp_path):
+    """VRAM-гард (#40): sd-cli зовётся с --max-vram -1.0 по умолчанию —
+    авто-детект свободной VRAM (фолбэк, обещанный llm.unload/_wait_ollama)."""
+    _touch(tmp_path / "sd-cli.exe")
+    _touch(tmp_path / "m.gguf")
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+        from pathlib import Path
+        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"\x89PNG")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    imagegen.generate_image("q english", imagegen.STYLE_SUFFIX, 1, 768, 768,
+                            cfg=_cfg(tmp_path), cache_dir=tmp_path / "c",
+                            log=_SILENT)
+    assert "--max-vram" in seen["cmd"]
+    assert seen["cmd"][seen["cmd"].index("--max-vram") + 1] == "-1.0"
+
+
+def test_generate_max_vram_disabled_when_zero(monkeypatch, tmp_path):
+    """cfg=0 — эскейп-хэтч: флаг не добавляется (неограниченное поведение)."""
+    _touch(tmp_path / "sd-cli.exe")
+    _touch(tmp_path / "m.gguf")
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+        from pathlib import Path
+        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"\x89PNG")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    imagegen.generate_image("q english", imagegen.STYLE_SUFFIX, 1, 768, 768,
+                            cfg=_cfg(tmp_path, imagegen_max_vram=0.0),
+                            cache_dir=tmp_path / "c", log=_SILENT)
+    assert "--max-vram" not in seen["cmd"]
+
+
 def test_generate_candidates_n4_distinct_seeds(monkeypatch, tmp_path):
     """generate_candidates → N=4 кадра разными (детерминированными) сидами."""
     seeds_seen = []

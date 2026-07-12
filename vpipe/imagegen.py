@@ -207,6 +207,15 @@ def generate_image(query_en: str, style_suffix: str, seed: int, W: int, H: int,
         cmd += ["--vae", vae]           # sdxl_vae_fp16fix: стабильнее цвет (§5.6)
     if bool(getattr(cfg, "imagegen_vae_on_cpu", False)):
         cmd.append("--vae-on-cpu")
+    # VRAM-гард (#40): sd-cli режет граф под доступную VRAM, когда qwen3 не
+    # успела выгрузиться (8 ГБ карта) — обещанный llm.unload/_wait_ollama_unloaded
+    # фолбэк. <0 = авто-детект свободной VRAM; 0 = выкл (неограниченно).
+    try:
+        max_vram = float(getattr(cfg, "imagegen_max_vram", -1.0))
+    except (TypeError, ValueError):
+        max_vram = -1.0
+    if max_vram != 0.0:
+        cmd += ["--max-vram", str(max_vram)]
     log(f"  SD: генерация «{query_en}» ({W}x{H}, {steps} шагов, "
         f"cfg {cfg_scale}, seed {real_seed})…")
     try:
