@@ -10,6 +10,7 @@ Nothing leaves the machine.
 from __future__ import annotations
 
 import argparse
+import atexit
 import copy
 import hashlib
 import json
@@ -203,6 +204,18 @@ _queue_running = False               # editor↔queue GPU mutual-exclusion flag 
 _queue_cancel = threading.Event()    # set by /api/queue/stop to abort the run
 
 
+def _quarantine_corrupt(path: Path) -> None:
+    """Rename a corrupt on-disk state file aside (never delete) so the ctor can
+    re-derive it instead of turning /api/open into a raw parser-error 400 (or a
+    startup exit-2 with --video). Best-effort — never raises."""
+    try:
+        bak = path.with_suffix(path.suffix + f".corrupt-{int(time.time())}")
+        os.replace(path, bak)
+        print(f"  повреждённый файл {path.name} отложен как {bak.name}; пересчитываю.")
+    except OSError:
+        pass
+
+
 class Session:
     """All mutable state for the one video being edited."""
 
@@ -247,15 +260,30 @@ class Session:
                      "stage": "", "error": None, "done": False, "results": None}
         self._ctor_fresh_detect = False   # True if __init__ ran a fresh _detect()
 
-        # Load anything already on disk.
+        # Load anything already on disk. Detection is NO LONGER run here: it used
+        # to block /api/open for MINUTES on a synchronous LLM+VAD pass (no
+        # progress/cancel; a second /api/open raced two detections). A cached
+        # transcript with no VALID cutlist now leaves self.cutlist=None; the
+        # editor launches detection as a background task (open_session) and the
+        # batch queue detects explicitly. Corrupt files are quarantined, not fatal.
         cache_file = self.cache_dir / f"{self.audio_hash}.transcript.json"
         if cfg.transcribe.cache and cache_file.exists():
-            self.transcript = Transcript.load(cache_file)
+            try:
+                self.transcript = Transcript.load(cache_file)
+            except (ValueError, OSError):
+                _quarantine_corrupt(cache_file)          # corrupt cache -> re-transcribe
         if self.cutlist_path.exists():
-            self.cutlist = CutList.load_json(self.cutlist_path)
-        elif self.transcript is not None:
-            self.cutlist = self._detect()
-            self._ctor_fresh_detect = True
+            try:
+                loaded = CutList.load_json(self.cutlist_path)
+            except (ValueError, OSError):
+                _quarantine_corrupt(self.cutlist_path)   # corrupt -> re-detect later
+            else:
+                # The cutlist file is keyed by stem in a possibly SHARED out_dir;
+                # only trust it if it belongs to THIS video (cross-video / re-record).
+                # A foreign/stale list is dropped (self.cutlist stays None) so a
+                # later _detect() can't merge its stale manual cuts.
+                if self._cutlist_matches(loaded):
+                    self.cutlist = loaded
 
     # --- helpers -------------------------------------------------------------
     def _detect(self, cfg: Optional[Config] = None) -> CutList:
@@ -277,10 +305,24 @@ class Session:
         if self.cutlist is not None:
             cl.segments.extend(s for s in self.cutlist.segments if s.type == TYPE_MANUAL)
             cl.segments.sort(key=lambda s: s.start)
+        cl.audio_hash = self.audio_hash   # stamp so a reopen can validate ownership
         cl.save_json(self.cutlist_path)
         save_txt(cl, self.out_dir / f"{self.inp.stem}.cutlist.txt")
         self.cutlist = cl
         return cl
+
+    def _cutlist_matches(self, cl: CutList) -> bool:
+        """True if an on-disk cutlist belongs to THIS input. New cutlists carry
+        the source ``audio_hash``; legacy ones (no hash) fall back to an exact
+        source-path + duration match. Guards against a same-stem cutlist from a
+        different or re-recorded video sharing an out_dir."""
+        h = getattr(cl, "audio_hash", "")
+        if h:                                  # new cutlists carry the hash
+            return h == self.audio_hash
+        # legacy cutlist (no hash): exact source path + duration.
+        src_ok = (not cl.source) or cl.source == str(self.inp)
+        dur_ok = (not cl.duration) or abs(cl.duration - self.media.duration) <= 0.5
+        return src_ok and dur_ok
 
     def set_progress(self, frac: float) -> None:
         self.task["percent"] = round(min(1.0, max(0.0, frac)) * 100, 1)
@@ -322,6 +364,18 @@ class Session:
 
 SESSION: Optional[Session] = None
 app = FastAPI(title="FastVideoEdit")
+
+
+@app.on_event("shutdown")
+def _cancel_ffmpeg_on_shutdown() -> None:
+    """uvicorn graceful shutdown (Ctrl+C / SIGTERM) -> terminate any tracked
+    ffmpeg so a daemon render thread can't keep an orphan encoding after the
+    server has quit (holding the GPU + locking the .part file). Idempotent;
+    safe when nothing is running."""
+    try:
+        ffmpeg_utils.cancel_all()
+    except Exception:  # noqa: BLE001 — best-effort teardown, never raise on exit
+        pass
 
 
 @app.middleware("http")
@@ -387,6 +441,17 @@ async def _csrf_guard(request: Request, call_next):
 def open_session(path: str) -> Session:
     global SESSION
     SESSION = Session(path, APP["cfg"], APP["out_dir"], APP["use_llm"])
+    s = SESSION
+    # The ctor no longer detects synchronously (that froze /api/open for minutes
+    # on an LLM+VAD pass). If we have a transcript but no valid cutlist, launch
+    # detection as a background TASK so the request returns immediately and the
+    # UI gets progress + cancel. A busy queue -> start_task raises 409; swallow
+    # it (the user can detect once the queue frees up).
+    if s.cutlist is None and s.transcript is not None:
+        try:
+            s.start_task("detect", lambda: s._detect())
+        except HTTPException:
+            pass
     return SESSION
 
 
@@ -888,6 +953,24 @@ def _network_summary(offline: bool, st: dict) -> str:
 
 
 # --- shared render helpers (reused by /api/render AND the F3 queue worker) ----
+def _clean_stem(raw, fallback: str) -> str:
+    """Output stem from a UI/queue filename OR the input stem. BOTH are already
+    extension-less, so a blind ``Path(...).stem`` truncates a DOTTED name at its
+    last dot (``лекция.часть1`` -> ``лекция``), collapsing every ``stem_clipNN``
+    clip onto one file. Strip a trailing suffix ONLY when it is a known media
+    extension (so a stray ``.mp4`` a user typed is still cleaned)."""
+    raw = (str(raw) if raw is not None else "").strip() or fallback
+    p = Path(raw)
+    return (p.stem if p.suffix.lower() in VIDEO_EXT else p.name) or fallback
+
+
+def _with_ext(base: Path, ext: str) -> Path:
+    """Append ``ext`` WITHOUT ``Path.with_suffix`` (which truncates a dotted stem
+    at its last dot). Identical to ``with_suffix`` for the common non-dotted
+    stem, so existing single-format outputs are byte-for-byte unchanged."""
+    return base.parent / (base.name + ext)
+
+
 def _resolve_render_opts(s: Session, opts: dict):
     """Translate UI/queue render-opts into (cfg, scale_h, fps, out_dir, base).
 
@@ -1106,7 +1189,7 @@ def _resolve_render_opts(s: Session, opts: dict):
 
     out_dir = Path(opts.get("out_dir") or s.out_dir).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
-    stem = Path((opts.get("filename") or s.inp.stem).strip() or s.inp.stem).stem
+    stem = _clean_stem(opts.get("filename") or s.inp.stem, s.inp.stem)
     base = out_dir / stem
     return cfg, scale_h, fps, out_dir, base
 
@@ -1275,11 +1358,12 @@ def _run_render_pipeline(s: Session, cfg, scale_h, fps, out_dir: Path,
     # оставляет вызов render() бит-в-бит прежним (легаси-контракт).
     enrich_kw = {"enrich": render_enrich} if render_enrich is not None else {}
     rr = render_mod.render(
-        s.ff, s.media, cl, cfg, base.with_suffix(".mp4"), s.work_dir,
+        s.ff, s.media, cl, cfg, _with_ext(base, ".mp4"), s.work_dir,
         on_progress=on_progress,
         log=lambda m="": on_stage(str(m).strip() or "Рендер видео…"),
         scale_h=scale_h, fps=fps, ass_path=ass_path, crop_filter=crop_filter,
-        edge_fade=edge_fade, **enrich_kw)
+        edge_fade=edge_fade,
+        should_cancel=lambda: bool(s.task.get("cancelled")), **enrich_kw)
 
     sr: dict = {}
     subtitles_ok = not cfg.subtitles.enabled
@@ -1424,7 +1508,7 @@ def _render_formats(s: Session, opts: dict, formats: list[str],
     если не удался НИ ОДИН (а попытки были) — задача падает, как раньше.
     """
     n = len(formats)
-    stem = Path((opts.get("filename") or s.inp.stem).strip() or s.inp.stem).stem
+    stem = _clean_stem(opts.get("filename") or s.inp.stem, s.inp.stem)
     src_w = s.media.width or 0
     src_h = s.media.height or 0
     entries: list[dict] = []
@@ -2230,6 +2314,7 @@ def put_cutlist(payload: dict = Body(...)):
     cl = CutList.from_dict(payload)
     cl.duration = s.media.duration
     cl.source = str(s.inp)
+    cl.audio_hash = s.audio_hash   # stamp so a user-edited cutlist validates on reopen
     s.cutlist = cl
     cl.save_json(s.cutlist_path)
     save_txt(cl, s.out_dir / f"{s.inp.stem}.cutlist.txt")
@@ -2845,7 +2930,17 @@ def queue_stop():
     """Abort the running queue: flag it and kill any in-flight ffmpeg. The
     current job ends in 'error: Очередь остановлена'; pending jobs stay pending."""
     _queue_cancel.set()
-    ffmpeg_utils.cancel_all()
+    # cancel_all() is PROCESS-WIDE (kills every registered ffmpeg). Only fire it
+    # when the queue is really running — otherwise a stale Stop button (queue
+    # finished, editor render started) or an out-of-band call would terminate the
+    # editor's ffmpeg with a raw exit-1 dump instead of a clean cancel. Same
+    # editor<->queue exclusion invariant /api/cancel relies on. Read the flag
+    # under TASK_LOCK (which guards _queue_running); no QUEUE_LOCK is taken, so
+    # the TASK_LOCK-before-QUEUE_LOCK order invariant is untouched.
+    with TASK_LOCK:
+        running = _queue_running
+    if running:
+        ffmpeg_utils.cancel_all()
     return {"ok": True}
 
 
@@ -4376,6 +4471,11 @@ def main() -> int:
     # A7: mute the «ConnectionResetError [WinError 10054]» tracebacks the
     # proactor loop prints whenever the browser drops a video stream mid-read.
     _install_connection_reset_filter()
+    # Parent interpreter exit (normal return / SystemExit that skips the ASGI
+    # shutdown) must also kill any tracked ffmpeg so it can't orphan and keep the
+    # GPU + a .part lock. Registered HERE (not at import) so import-only test
+    # processes don't add a global hook.
+    atexit.register(ffmpeg_utils.cancel_all)
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
     return 0
 

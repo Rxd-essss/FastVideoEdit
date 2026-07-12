@@ -228,11 +228,13 @@ def generate(transcript: Transcript, removed: list[tuple[float, float]],
     cues = build_cues(words, matcher, subs, mask, tl.new_duration())
 
     base = Path(out_base)
-    srt = str(base.with_suffix(".srt"))
+    # String-append, not Path.with_suffix: a dotted sidecar base (лекция.часть1)
+    # would otherwise be re-truncated at its last dot to лекция.srt.
+    srt = str(Path(str(base) + ".srt"))
     write_srt(cues, srt)
     result = {"cues": len(cues), "srt": srt}
     if subs.write_vtt:
-        vtt = str(base.with_suffix(".vtt"))
+        vtt = str(Path(str(base) + ".vtt"))
         write_vtt(cues, vtt)
         result["vtt"] = vtt
     if subs.write_transcript:

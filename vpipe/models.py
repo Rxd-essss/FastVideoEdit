@@ -150,6 +150,12 @@ class CutList:
     duration: float
     segments: list[CutSegment] = field(default_factory=list)
     version: int = 1
+    audio_hash: str = ""   # hash of the source media; validates the cutlist
+                           # belongs to THIS video on reopen (cross-video /
+                           # re-record guard). Empty for legacy files.
+    audio_hash: str = ""   # hash of the source media; validates the cutlist
+                           # belongs to THIS video on reopen (cross-video /
+                           # re-record guard). Empty for legacy files.
 
     def enabled_removes(self) -> list[tuple[float, float]]:
         return [(s.start, s.end) for s in self.segments
@@ -161,7 +167,7 @@ class CutList:
 
     def to_dict(self) -> dict:
         return {"version": self.version, "source": self.source,
-                "duration": self.duration,
+                "duration": self.duration, "audio_hash": self.audio_hash,
                 "segments": [s.to_dict() for s in self.segments]}
 
     @staticmethod
@@ -169,7 +175,7 @@ class CutList:
         return CutList(
             source=d.get("source", ""), duration=float(d.get("duration", 0.0)),
             segments=[CutSegment.from_dict(s) for s in d.get("segments", [])],
-            version=int(d.get("version", 1)))
+            version=int(d.get("version", 1)), audio_hash=d.get("audio_hash", ""))
 
     def save_json(self, path: str | Path) -> None:
         _atomic_write_text(path, json.dumps(self.to_dict(), ensure_ascii=False, indent=2))
