@@ -226,3 +226,60 @@ def test_resolve_render_opts_bad_scale_h_raises(tmp_path):
     s.out_dir = tmp_path / "out"
     with pytest.raises(HTTPException):
         serve._resolve_render_opts(s, {"scale_h": 99})   # below 144
+
+
+# --- #43: queue must not re-detect over the user's curated cutlist ------------
+def _fake_queue_session(cutlist_source, inp_path):
+    import threading
+    from pathlib import Path
+    from unittest.mock import MagicMock
+    return SimpleNamespace(
+        transcript=object(),
+        cutlist=SimpleNamespace(source=cutlist_source),
+        inp=Path(str(inp_path)),
+        _ctor_fresh_detect=False,
+        _detect=MagicMock(),
+        media=SimpleNamespace(has_audio=True),
+        percent=0.0, stage="", result=None, status="pending", error=None)
+
+
+def _wire_queue_process(monkeypatch, fake):
+    import threading
+    monkeypatch.setattr(serve, "_queue_cancel", threading.Event())
+    monkeypatch.setattr(serve, "Session",
+                        lambda path, cfg, out, use_llm: fake)
+    monkeypatch.setattr(serve, "_resolve_render_opts",
+                        lambda ls, opts: (None, None, None, None, None))
+    monkeypatch.setattr(serve, "_run_render_pipeline",
+                        lambda *a, **k: {"mp4": "x"})
+
+
+def test_queue_own_cutlist_not_re_detected(client, sample_video, monkeypatch):
+    """Катлист ЭТОГО входа (source == inp) — курированный юзером; _detect()
+    пропускается, иначе он сохранил бы свежую детекцию поверх ревью."""
+    from pathlib import Path
+    inp = sample_video
+    out_dir = Path(serve.APP["out_dir"])
+    cl_path = out_dir / (inp.stem + ".cutlist.json")
+    cl_path.write_text('{"curated": true}', encoding="utf-8")
+    before = cl_path.read_bytes()
+    fake = _fake_queue_session(str(inp), inp)
+    _wire_queue_process(monkeypatch, fake)
+    serve._queue_process_one(
+        serve.QueueJob(id="j1", path=str(inp), out_dir=str(out_dir)))
+    fake._detect.assert_not_called()               # курированный катлист не тронут
+    assert cl_path.read_bytes() == before          # файл на диске не перезаписан
+
+
+def test_queue_foreign_cutlist_still_re_detected(client, sample_video,
+                                                 monkeypatch):
+    """Катлист с ЧУЖИМ source (копия/легаси) по-прежнему переопределяется —
+    защита от протечки устаревшей детекции сохранена."""
+    from pathlib import Path
+    inp = sample_video
+    out_dir = Path(serve.APP["out_dir"])
+    fake = _fake_queue_session("D:/other/foreign.mp4", inp)
+    _wire_queue_process(monkeypatch, fake)
+    serve._queue_process_one(
+        serve.QueueJob(id="j2", path=str(inp), out_dir=str(out_dir)))
+    fake._detect.assert_called_once()

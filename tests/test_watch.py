@@ -418,3 +418,35 @@ def test_watch_worker_exits_when_disabled(wired):
     start = time.monotonic()
     serve._watch_worker(threading.Event())
     assert time.monotonic() - start < 2.0
+
+
+# --- #49: generation guard — in-flight tick must not clobber a re-seed --------
+def test_watch_tick_skips_writeback_when_generation_bumped(wired, in_dir,
+                                                           monkeypatch):
+    """Если watch_set пере-сидировал реестр (смена папки) во время lock-free
+    скана, устаревший write-back тика НЕ должен затирать seed."""
+    monkeypatch.setattr(serve, "WATCH_GEN", 0)
+    SEED = {"seedkey": {"size": 7, "mtime": 3.0}}
+
+    def racing_scan(folder, registry, pending):
+        serve.WATCH_GEN += 1                       # эмулируем watch_set в скане
+        serve.WATCH_PROCESSED.update(SEED)
+        return []
+    monkeypatch.setattr(serve, "scan_once", racing_scan)
+
+    assert serve._watch_tick(str(in_dir), {}) == 0
+    assert serve.WATCH_PROCESSED == SEED           # seed выжил, write-back пропущен
+
+
+def test_watch_tick_writeback_when_no_generation_change(wired, in_dir,
+                                                        monkeypatch):
+    """Контроль: без смены поколения тик пишет свой registry как обычно."""
+    monkeypatch.setattr(serve, "WATCH_GEN", 0)
+
+    def calm_scan(folder, registry, pending):
+        registry["donekey"] = {"size": 1, "mtime": 2.0}
+        return []
+    monkeypatch.setattr(serve, "scan_once", calm_scan)
+
+    assert serve._watch_tick(str(in_dir), {}) == 0
+    assert serve.WATCH_PROCESSED == {"donekey": {"size": 1, "mtime": 2.0}}

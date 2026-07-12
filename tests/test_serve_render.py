@@ -362,3 +362,30 @@ def test_probe_failure_keeps_mp4(monkeypatch, tmp_path):
                                      _SILENT, _SILENT)
     assert res["new_duration_probed"] is None
     assert res["mp4"] is not None
+
+
+# --- #50: burn karaoke default follows config.yaml when the key is absent ------
+def test_karaoke_absent_keeps_config_default(tmp_path):
+    """Без ключа karaoke в burn_style значение берётся из config.yaml (а не
+    форсится True), как у всех соседних полей burn_style."""
+    s = _mk_session(tmp_path)
+    s.cfg.subtitles.burn.karaoke = False
+    cfg, *_ = serve._resolve_render_opts(
+        s, {"burn_subtitles": True, "burn_style": {"font": "Arial"}})
+    assert cfg.subtitles.burn.karaoke is False
+
+
+def test_karaoke_explicit_true_overrides(tmp_path):
+    s = _mk_session(tmp_path)
+    s.cfg.subtitles.burn.karaoke = False
+    cfg, *_ = serve._resolve_render_opts(
+        s, {"burn_subtitles": True, "burn_style": {"karaoke": True}})
+    assert cfg.subtitles.burn.karaoke is True
+
+
+def test_karaoke_explicit_false_overrides(tmp_path):
+    s = _mk_session(tmp_path)
+    s.cfg.subtitles.burn.karaoke = True
+    cfg, *_ = serve._resolve_render_opts(
+        s, {"burn_subtitles": True, "burn_style": {"karaoke": False}})
+    assert cfg.subtitles.burn.karaoke is False

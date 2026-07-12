@@ -206,10 +206,10 @@ def test_suggest_routes_to_detect_all_with_sanitized_params(client, monkeypatch,
     seen: dict = {}
 
     def fake_detect_all(transcript, cutlist, params, llm, log=None,
-                        on_progress=None, *, user_folder=None):
+                        on_progress=None, *, user_folder=None, codegfx_style=None):
         seen.update(transcript=transcript, cutlist=cutlist, params=params,
                     llm=llm, log=log, on_progress=on_progress,
-                    user_folder=user_folder)
+                    user_folder=user_folder, codegfx_style=codegfx_style)
         return []
 
     monkeypatch.setattr(serve.enrich_llm, "detect_all", fake_detect_all)
@@ -611,6 +611,40 @@ def test_select_no_plan_409(client, monkeypatch, tmp_path):
     _install(monkeypatch, sess)
     assert client.post("/api/enrich/select",
                        json={"id": "x", "idx": 0}).status_code == 409
+
+
+# --- #44: select resyncs the FLAT fields the render path reads ----------------
+def test_select_resyncs_flat_fields_diffusion(client, monkeypatch, tmp_path):
+    sess = FakeSession(tmp_path, duration=120.0)
+    _install(monkeypatch, sess)
+    item = _img_with_candidates(
+        "enr_d1",
+        [{"source": "diffusion", "prompt": "p", "seed": 7},
+         {"source": "diffusion", "prompt": "q", "seed": 42}], selected=0)
+    _write_plan(sess, [item])
+    r = client.post("/api/enrich/select", json={"id": "enr_d1", "idx": 1})
+    assert r.status_code == 200
+    pl = _plan_file(sess)["items"][0]["payload"]
+    assert pl["asset_kind"] == "generate"
+    assert pl["gen_seed"] == 42
+    assert pl["gen_prompt_en"] == "q"
+
+
+def test_select_resyncs_flat_fields_stock(client, monkeypatch, tmp_path):
+    sess = FakeSession(tmp_path, duration=120.0)
+    _install(monkeypatch, sess)
+    asset = str((tmp_path / "stock.png").resolve())
+    (tmp_path / "stock.png").write_bytes(b"x")
+    item = _img_with_candidates(
+        "enr_s1",
+        [{"source": "none"}, {"source": "stock", "asset_path": asset}],
+        selected=0)
+    _write_plan(sess, [item])
+    r = client.post("/api/enrich/select", json={"id": "enr_s1", "idx": 1})
+    assert r.status_code == 200
+    pl = _plan_file(sess)["items"][0]["payload"]
+    assert pl["asset_kind"] == "user"
+    assert pl["asset_path"] == asset
 
 
 def test_state_includes_imagegen_ready(client, monkeypatch, tmp_path):
@@ -1135,3 +1169,42 @@ def test_state_includes_enrich_summary_and_opts(client, monkeypatch, tmp_path):
     sess.audio_hash = "ff" * 20
     j = client.get("/api/state").json()
     assert j["enrich"] == {"count": 0, "stale": True}
+
+
+# === #33: re-suggest re-links review by STABLE content key, not random id ======
+def test_suggest_rerun_content_key_carries_when_ids_change(client, monkeypatch,
+                                                           tmp_path):
+    """Детекторы дают КАЖДОМУ предложению свежий random id, поэтому мерж только
+    по id терял бы всё ревью. Матч по стабильному ключу (type, word_start,
+    word_end) переносит enabled/edited даже когда id сменился между прогонами."""
+    sess = FakeSession(tmp_path, llm=object(), duration=120.0)
+    _install(monkeypatch, sess)
+    # старый план: картинка на словах 10..12, выключена и правлена руками
+    old = enrich_mod.EnrichItem(
+        id="old1", type=enrich_mod.ENR_IMAGE, score=40, enabled=False,
+        word_start=10, word_end=12, t_start=10.0, t_end=13.0, edited=True,
+        payload=enrich_mod.ImagePayload(concept="правленый концепт"))
+    _write_plan(sess, [old])
+    # детекторы вернули СВЕЖИЙ item: ДРУГОЙ id, те же word-координаты, новый
+    # score; плюс несвязанная точка на слове 50 (не должна унаследовать disable).
+    fresh = enrich_mod.EnrichItem(
+        id="fresh_" + "a" * 6, type=enrich_mod.ENR_IMAGE, score=90,
+        word_start=10, word_end=12, t_start=10.0, t_end=13.0,
+        payload=enrich_mod.ImagePayload(concept="свежий концепт"))
+    other = enrich_mod.EnrichItem(
+        id="fresh_" + "b" * 6, type=enrich_mod.ENR_IMAGE, score=88,
+        word_start=50, word_end=52, t_start=50.0, t_end=53.0,
+        payload=enrich_mod.ImagePayload(concept="другая точка"))
+    monkeypatch.setattr(serve, "_run_enrich_detectors",
+                        lambda s, params, log: [fresh, other])
+    client.post("/api/enrich/suggest", json={})
+    _wait_done(sess)
+    assert sess.task["error"] is None
+    by_ws = {it["word_start"]: it for it in _plan_file(sess)["items"]}
+    matched = by_ws[10]
+    assert matched["enabled"] is False                 # тоггл юзера пережил
+    assert matched["edited"] is True
+    assert matched["payload"]["concept"] == "правленый концепт"  # правка пережила
+    assert matched["score"] == 90                      # свежее поле детектора
+    # несвязанная точка НЕ унаследовала disable старого пункта
+    assert by_ws[50]["enabled"] is True

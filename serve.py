@@ -981,13 +981,16 @@ def _resolve_render_opts(s: Session, opts: dict):
     if opts.get("encoder") in ("nvenc", "x264"):
         cfg.render.encoder = opts["encoder"]
     q = opts.get("quality")
-    if isinstance(q, (int, float)):
+    if isinstance(q, (int, float)) and not isinstance(q, bool):
         q = max(0, min(51, int(q)))   # H.264/HEVC QP/CRF range
         cfg.render.nvenc.qp = q
         cfg.render.nvenc.cq = q
         cfg.render.x264.crf = q
     if opts.get("audio_bitrate"):
-        cfg.render.audio_bitrate = str(opts["audio_bitrate"])
+        ab = str(opts["audio_bitrate"]).strip()
+        if not re.fullmatch(r"\d{2,4}k", ab):    # whitelist «128k»…«320k»
+            raise HTTPException(400, "audio_bitrate: ожидается вид «128k»…«320k»")
+        cfg.render.audio_bitrate = ab
     if opts.get("censor_method") in ("partial", "pitch", "lowpass", "reverse"):
         cfg.censor.method = opts["censor_method"]
     if "subtitles" in opts:
@@ -1020,7 +1023,8 @@ def _resolve_render_opts(s: Session, opts: dict):
             b.outline_color = str(bs["outline_color"])
         if bs.get("position") in ("bottom", "top", "center"):
             b.position = bs["position"]
-        b.karaoke = bool(bs.get("karaoke", True))
+        if "karaoke" in bs:                      # absent -> keep config.yaml value
+            b.karaoke = bool(bs["karaoke"])
         # C1 (пресеты стилей): числовые поля, которых нет среди «сырых» полей
         # UI — приходят только целым пресетом. Клампы — здравые пределы ASS;
         # мусор молча игнорируется (значение из config.yaml остаётся).
@@ -1172,11 +1176,15 @@ def _resolve_render_opts(s: Session, opts: dict):
             raise HTTPException(400, "scale_h must be an integer (144–4320)")
         if not (144 <= scale_h <= 4320):
             raise HTTPException(400, "scale_h must be between 144 and 4320")
+        if scale_h % 2:                          # yuv420p требует чётную высоту
+            scale_h -= 1
         if scale_h == s.media.height:            # identity -> let copy fast-path win
             scale_h = None
 
     # --- fps: None (source) or 0 < fps <= 120 --------------------------------
     fps = opts.get("fps") or None                # None = source fps
+    if isinstance(fps, bool):                    # JSON true/false — не fps
+        raise HTTPException(400, "fps must be a number (0 < fps <= 120)")
     if fps is not None:
         try:
             fps = float(fps)
@@ -1348,7 +1356,10 @@ def _run_render_pipeline(s: Session, cfg, scale_h, fps, out_dir: Path,
                     enr_ass = Path(s.work_dir) / f"enrich_{base.name}.ass"
                     enrich_cards.write_enrich_ass(
                         re_plan.cards, re_plan.cta_texts, out_w, out_h,
-                        enr_ass)
+                        enr_ass,
+                        subs_top_1080=(enrich_cards.subs_zone_top_1080(
+                            cfg.subtitles.burn, cfg.subtitles.max_lines)
+                            if cfg.subtitles.burn.enabled else None))
                     re_plan.cards_ass = str(enr_ass)
                 if re_plan.stills or re_plan.anims or re_plan.cards_ass:
                     render_enrich = re_plan
@@ -1675,12 +1686,22 @@ def _queue_process_one(job: QueueJob) -> None:
             log=lambda m="": stage(str(m).strip() or job.stage),
             on_progress=lambda f: prog(0.05 + f * 0.35))
 
-    # (2) detection. If the ctor LOADED an on-disk cutlist (prior editor
-    #     session), re-detect so stale edits can't leak in. If the ctor just
-    #     generated a FRESH cutlist from a cached transcript, skip the
-    #     redundant (LLM-heavy) second pass.
+    # (2) detection. Skip the redundant second pass when the ctor already
+    #     produced a FRESH cutlist from a cached transcript. ALSO skip (and do
+    #     NOT overwrite the file) when the ctor loaded an on-disk cutlist that
+    #     BELONGS to this exact input (its `source` == this file): that is the
+    #     user's curated cutlist, and _detect() would save over it, reverting
+    #     every enable/disable toggle (only TYPE_MANUAL cuts survive its merge).
+    #     Re-detect only for a genuinely foreign/stale cutlist (missing or
+    #     mismatched `source`).
     _chk()
-    if not getattr(ls, "_ctor_fresh_detect", False):
+    _loaded_cl = getattr(ls, "cutlist", None)
+    own_cutlist = (
+        _loaded_cl is not None
+        and os.path.normcase(str(getattr(_loaded_cl, "source", "") or ""))
+            == os.path.normcase(str(getattr(ls, "inp", "")))
+    )
+    if not getattr(ls, "_ctor_fresh_detect", False) and not own_cutlist:
         stage("Детекция вырезов…")
         ls._detect()
     prog(0.45)
@@ -1767,6 +1788,7 @@ WATCH_LOCK = threading.Lock()        # guards WATCH / WATCH_PROCESSED / WATCH_ST
 WATCH: dict = {"enabled": False, "folder": None, "render_opts_preset": "current"}
 WATCH_PROCESSED: dict[str, dict] = {}   # normcase(path) -> {"size": int, "mtime": float}
 WATCH_STATUS: dict = {"error": None, "last_scan": None}
+WATCH_GEN = 0                        # bumped under WATCH_LOCK on every watch_set
 _watch_thread: Optional[threading.Thread] = None
 _watch_stop = threading.Event()      # личный Event ТЕКУЩЕГО потока (см. _watch_apply)
 
@@ -1915,6 +1937,7 @@ def _watch_tick(folder_str: str, pending: dict[str, tuple[int, float]]) -> int:
     """
     log = logging.getLogger("fastvideoedit.watch")
     with WATCH_LOCK:
+        gen = WATCH_GEN
         before = {k: dict(v) for k, v in WATCH_PROCESSED.items()}
     registry = {k: dict(v) for k, v in before.items()}
 
@@ -1943,6 +1966,14 @@ def _watch_tick(folder_str: str, pending: dict[str, tuple[int, float]]) -> int:
         _save_queue()
 
     with WATCH_LOCK:
+        if gen != WATCH_GEN:
+            # watch_set пере-сидировал реестр (смена папки), пока шёл наш
+            # lock-free скан. `registry` построен из ДО-seed копии; запись
+            # затёрла бы seed, и новый наблюдатель загнал бы в очередь весь
+            # старый архив. Бросаем свой write-back — реестром владеет новое
+            # поколение.
+            WATCH_STATUS["last_scan"] = time.time()
+            return enqueued
         WATCH_PROCESSED.clear()
         WATCH_PROCESSED.update(registry)
         WATCH_STATUS["error"] = None
@@ -3016,6 +3047,7 @@ def watch_set(body: dict = Body(...)):
     Включение (или смена папки) СИДИРУЕТ реестр текущим содержимым папки:
     обрабатываются только файлы, появившиеся ПОСЛЕ включения, — как и обещает
     UI. В ответе ``seeded`` — сколько уже лежавших видео помечено «не трогать»."""
+    global WATCH_GEN
     enabled = bool(body.get("enabled", False))
     folder_raw = str(body.get("folder") or "").strip()
     folder: Optional[str] = folder_raw or None
@@ -3066,6 +3098,7 @@ def watch_set(body: dict = Body(...)):
     with WATCH_LOCK:
         WATCH["enabled"] = enabled
         WATCH["folder"] = folder
+        WATCH_GEN += 1                       # смена папки/seed — новое поколение
         WATCH_PROCESSED.update(seed)
         if not enabled:
             WATCH_STATUS["error"] = None
@@ -3310,6 +3343,36 @@ def get_clips():
             "rank_source": data.get("rank_source", "round_robin")}
 
 
+@app.get("/api/chapters")
+def get_chapters():
+    """Уже сгенерированные главы (work_dir/preview_chapters.txt) — для
+    восстановления вкладки «Главы» при перезагрузке, как GET /api/clips. Файла
+    нет -> пустой список (200, не 404). Read-only, без _guard_no_task."""
+    s = S()
+    p = s.work_dir / "preview_chapters.txt"
+    if not p.exists():
+        return {"chapters": []}
+    try:
+        return {"chapters": _parse_chapters_txt(str(p))}
+    except Exception:  # noqa: BLE001 — битый файл: пустая вкладка лучше 500
+        return {"chapters": []}
+
+
+@app.get("/api/metadata")
+def get_metadata():
+    """Уже сгенерированные метаданные (work_dir/preview_metadata.json) — для
+    восстановления вкладки «Мета». Файла нет -> ``metadata: null`` (200).
+    Read-only, без _guard_no_task."""
+    s = S()
+    p = s.work_dir / "preview_metadata.json"
+    if not p.exists():
+        return {"metadata": None}
+    try:
+        return {"metadata": json.loads(p.read_text(encoding="utf-8"))}
+    except Exception:  # noqa: BLE001 — битый файл: пустая вкладка лучше 500
+        return {"metadata": None}
+
+
 # F7: жёсткие пределы длительности клипа при правке границ из UI (сек).
 # Мягкое предупреждение «>60с — лимит Shorts» живёт на фронте; сервер
 # отсекает только бессмысленное (<5с) и заведомо не-Shorts (>90с).
@@ -3435,10 +3498,13 @@ def _run_enrich_detectors(s: Session, params: dict, log) -> list:
     не входит). Прогресс задачи — по детекторам (lists 45 / cta 15 /
     illustrations 30 / assets 10); сбойное окно/детектор/этап не валит задачу
     (warnings уходят в log)."""
+    _cg = getattr(s.cfg.render, "codegfx", None)
+    _cg_style = getattr(_cg, "codegfx_style", enrich_mod.SCHEMATIC_STYLE_DEF)
     return enrich_llm.detect_all(
         s.transcript, s.cutlist, enrich_mod.sanitize_params(params), s.llm,
         log=log, on_progress=s.set_progress,
-        user_folder=(params or {}).get("user_folder", ""))
+        user_folder=(params or {}).get("user_folder", ""),
+        codegfx_style=_cg_style)
 
 
 def _sd_configured(cfg: Config) -> bool:
@@ -3642,12 +3708,24 @@ def _merge_enrich_user_state(s: Session, items: list) -> list:
     if old is None or old.hash != s.audio_hash:
         return items
     prev_by_id = {it.id: it for it in old.items}
-    carried: set[str] = set()
+    # Детекторы дают КАЖДОМУ предложению свежий random id (item_from_dict ->
+    # new_item_id) на каждом прогоне, поэтому матч ТОЛЬКО по id НИКОГДА не
+    # переносит ревью LLM-предложений между запусками. Стабильный ключ — по
+    # ОРИГИНАЛЬНЫМ word-индексам (они не смещаются при смене катлиста — ровно
+    # тогда юзер и перезапускает анализ): (type, word_start, word_end). Ручные
+    # (source:"user") в ключ НЕ кладём — они переезжают явным extend ниже.
+    prev_by_key: dict[tuple, object] = {}
+    for it in old.items:
+        if it.source == "user":
+            continue
+        prev_by_key.setdefault((it.type, it.word_start, it.word_end), it)
+    carried_ids: set[str] = set()            # id СТАРЫХ items, уже перенесённых
     for it in items:
-        prev = prev_by_id.get(it.id)
+        prev = prev_by_id.get(it.id) or \
+            prev_by_key.get((it.type, it.word_start, it.word_end))
         if prev is None:
             continue
-        carried.add(it.id)
+        carried_ids.add(prev.id)
         it.enabled = prev.enabled            # решение юзера — закон
         if prev.edited:                      # правки текста/таймингов — тоже
             it.payload = prev.payload
@@ -3655,7 +3733,7 @@ def _merge_enrich_user_state(s: Session, items: list) -> list:
             it.t_end = prev.t_end
             it.edited = True
     items.extend(p for p in old.items
-                 if p.source == "user" and p.id not in carried)
+                 if p.source == "user" and p.id not in carried_ids)
     return items
 
 
@@ -3877,9 +3955,14 @@ def enrich_select(body: dict = Body(default={})):
     if idx >= len(cands):
         raise HTTPException(400, f"idx {idx} вне диапазона (кандидатов "
                                  f"{len(cands)})")
-    # Меняем selected и пересобираем item через санитайзер (клампы/синк source).
+    # Меняем selected И пересинхронизируем ПЛОСКИЕ поля (asset_kind/asset_path/
+    # gen_prompt_en/gen_seed) под выбранный кандидат — иначе рендер/стадия images
+    # продолжат смотреть на ПРЕДЫДУЩИЙ материализованный ассет (docstring обещает
+    # ровно этот синк). _legacy_sync_from_candidate — тот же синк, что делает
+    # анализ; читает d["selected"]/d["candidates"], поэтому зовём ПОСЛЕ set idx.
     d = target.payload.to_dict()
     d["selected"] = idx
+    enrich_llm._legacy_sync_from_candidate(d)
     new_pl = enrich_mod.ImagePayload.sanitize(d)
     target.payload = new_pl
     try:
