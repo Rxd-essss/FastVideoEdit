@@ -123,6 +123,8 @@ const TABS = [
 const TAB_KEY = 'fve_tab'
 // Вкладка-адресат фоновой задачи (busy-спиннер вместо бейджа, точка при ошибке).
 const TASK_TAB = { transcribe: 'cuts', detect: 'cuts', preview_chapters: 'chapters', preview_metadata: 'meta', preview_clips: 'clips', render_clips: 'clips', enrich: 'enrich' }
+// Русские подписи внутренних id задач для полосы прогресса (иначе в RU-интерфейсе течёт английский id).
+const TASK_RU = { transcribe: 'Транскрипция', detect: 'Поиск вырезов', render: 'Рендер', preview_chapters: 'Главы', preview_metadata: 'Метаданные', preview_clips: 'Подбор клипов', render_clips: 'Рендер клипов', enrich: 'Монтаж', autopack: 'Авто-пак' }
 // C4 — title кнопки «Авто-пак» в доступном состоянии (см. setRunning).
 const AUTOPACK_TITLE = 'Сырец → готовый ролик + пак Shorts одной кнопкой'
 let activeTab = 'cuts'
@@ -2164,9 +2166,9 @@ function taskLost() {
   toast('Связь с задачей потеряна — возможно, сервер перезапустился. Обновите страницу.', 'error', { sticky: true })
 }
 function followTask(name) {
-  setRunning(name); taskStart = Date.now()
+  setRunning(name); taskStart = Date.now(); st._etaBase = null
   $('#progress').classList.remove('hidden'); $('#progress').classList.add('indeterminate')
-  setProgress(35, `${name}…`)
+  setProgress(35, `${TASK_RU[name] || name}…`)
   if (es) es.close()
   st._sseErrs = 0
   es = new EventSource('/api/events')
@@ -2194,16 +2196,21 @@ function followTask(name) {
       $('#progress').classList.remove('indeterminate')
       setProgress(pct)
     }
-    // Simple ETA from percent over wall-clock.
+    // ETA из НАБЛЮДАЕМОГО темпа (Δ% с первого сообщения), а не от taskStart:
+    // после перезагрузки re-attach происходит на середине задачи, и elapsed
+    // от момента переподключения дал бы бессмысленный остаток.
+    if (st._etaBase == null && pct > 0 && pct < 100) st._etaBase = { pct, t: Date.now() }
     let eta = ''
-    if (pct >= 3 && pct < 100) {
-      const elapsed = (Date.now() - taskStart) / 1000
-      const remain = elapsed * (100 - pct) / pct
+    if (st._etaBase && pct > st._etaBase.pct && pct < 100) {
+      const dP = pct - st._etaBase.pct
+      const dT = (Date.now() - st._etaBase.t) / 1000
+      const remain = dT * (100 - pct) / dP
       // секунды при остатке <60с, иначе минуты — не «~1м» для 5 секунд
       if (remain >= 60) eta = `  · осталось ~${Math.round(remain / 60)}м`
       else if (remain > 1) eta = `  · осталось ~${Math.max(1, Math.round(remain))}с`
     }
-    setProgress(pct, `${t.stage || t.name || name || ''} ${Math.round(pct)}%${eta}`)
+    const label = t.stage || TASK_RU[t.name] || TASK_RU[name] || t.name || name || ''
+    setProgress(pct, `${label} ${Math.round(pct)}%${eta}`)
     if (!t.running) {
       es.close(); es = null; $('#progress').classList.add('hidden'); $('#progress').classList.remove('indeterminate')
       setRunning(null)
