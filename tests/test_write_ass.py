@@ -77,13 +77,16 @@ def test_write_ass_karaoke_sum_with_lead_in_gap(tmp_path):
 
 
 def test_ass_text_escape():
-    # Braces and backslashes are ASS-special; newlines become hard breaks \N.
+    # Newlines become the ASS hard break \N.
     assert _ass_text_escape("a\nb") == "a\\Nb"
     assert _ass_text_escape("a\r\nb") == "a\\Nb"
+    # Braces are swapped for fullwidth lookalikes (safe in libass AND VSFilter),
+    # so no real '{'/'}' survives to open an override block.
     out = _ass_text_escape("x {y} z")
-    assert "\\{" in out and "\\}" in out
-    # A literal backslash in the source must be doubled, not interpreted.
-    assert _ass_text_escape("a\\b") == "a\\\\b"
+    assert "{" not in out and "}" not in out
+    assert "｛" in out and "｝" in out
+    # A literal backslash must NOT be doubled -- ASS has no general '\' escape.
+    assert "\\\\" not in _ass_text_escape("a\\b")
 
 
 def test_write_ass_masks_profanity_in_karaoke(tmp_path):
@@ -122,3 +125,25 @@ def test_write_ass_karaoke_colors_in_style(tmp_path):
     fields = style.split(",")
     assert fields[3] == "&H0000FFFF"           # PrimaryColour = karaoke highlight
     assert fields[4] == "&H00FFFFFF"           # SecondaryColour = base text colour
+
+
+def test_ass_size_scales_with_playres(tmp_path):
+    # Presets are defined @1080; write_ass scales Fontsize/MarginV by PlayResY/1080
+    # so a style holds a constant fraction of frame height across resolutions.
+    st = AssStyleCfg(size=52, margin_v=40)
+
+    def _style_fields(pr):
+        out = tmp_path / f"s_{pr[1]}.ass"
+        write_ass([Cue(0, 1, "x")], out, st, karaoke=False, play_res=pr)
+        line = next(l for l in _read(out).splitlines()
+                    if l.startswith("Style: Default,"))
+        return line.split(",")
+
+    f1080 = _style_fields((1920, 1080))
+    assert f1080[2] == "52"                    # k=1.0 -> unchanged @1080
+    assert f1080[-2] == "40"                   # MarginV unchanged @1080
+    f2160 = _style_fields((1920, 2160))
+    assert f2160[2] == "104"                   # 52 * 2.0 (k=2.0)
+    assert f2160[-2] == "80"                   # 40 * 2.0
+    f720 = _style_fields((1280, 720))
+    assert f720[2] == "35"                     # round(52 * 0.6667)

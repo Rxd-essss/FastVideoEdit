@@ -65,11 +65,11 @@ def _style_line(txt: str) -> list[str]:
     # классика: снизу, «спетое» слово жёлтым (Primary = karaoke_color)
     ("classic", {"align": "2", "primary": "&H0000D4FF"}),
     # неон: бирюзовая подсветка, приподнят над низом (MarginV из пресета)
-    ("neon",    {"align": "2", "primary": "&H00FFE500", "margin_v": "160"}),
+    ("neon",    {"align": "2", "primary": "&H00FFE500", "margin_v": "284"}),
     # минимал: полупрозрачная обводка-плашка
     ("minimal", {"align": "2", "outline_c": "&H78000000"}),
     # крупный: по центру кадра, Impact
-    ("bold",    {"align": "5", "font": "Impact", "size": "78"}),
+    ("bold",    {"align": "5", "font": "Impact", "size": "139"}),
 ])
 def test_write_ass_per_preset(tmp_path, key, expect):
     p = next(x for x in serve.CAPTION_PRESETS if x["key"] == key)

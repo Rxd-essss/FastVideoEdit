@@ -168,10 +168,16 @@ def build_cues(words: list[Word], matcher: ProfanityMatcher,
                 # `limit` cap the EXTENSION only, never shrink the cue.
                 c.end = max(c.end, min(c.start + required, max(c.end, limit), total))
 
-    # Enforce no overlap (keep order, leave a small gap).
+    # Enforce no overlap. For CONTINUOUS speech (next cue begins within ~0.15s)
+    # chain end-to-start so the subtitle area doesn't blink off/on at the
+    # boundary; a real pause keeps the min_gap.
     for i in range(len(cues) - 1):
-        if cues[i].end > cues[i + 1].start - subs.min_gap:
-            cues[i].end = max(cues[i].start + 0.2, cues[i + 1].start - subs.min_gap)
+        nxt = cues[i + 1].start
+        if cues[i].end > nxt - subs.min_gap:
+            if nxt - cues[i].end < 0.15 and nxt > cues[i].start + 0.2:
+                cues[i].end = nxt
+            else:
+                cues[i].end = max(cues[i].start + 0.2, nxt - subs.min_gap)
     return cues
 
 
@@ -258,8 +264,12 @@ def _ass_text_escape(text: str) -> str:
     hard break ``\N``. We do NOT touch ``}`` (harmless without an opening brace)
     beyond the brace escape above.
     """
-    text = text.replace("\\", "\\\\")        # backslash first
-    text = text.replace("{", "\\{").replace("}", "\\}")
+    # ASS has no general '\' escape and '\{' is libass-only. Neutralise the
+    # ambiguous backslash and use fullwidth brace/solidus lookalikes so the text
+    # is safe in BOTH libass and VSFilter. Do the literal substitutions BEFORE
+    # inserting our own \N for real newlines (which needs a genuine backslash).
+    text = text.replace("\\", "⧵")       # reverse-solidus glyph
+    text = text.replace("{", "｛").replace("}", "｝")  # fullwidth braces
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = text.replace("\n", "\\N")
     return text
@@ -317,7 +327,9 @@ def _kinetic_keywords(disp_words: list[str], *,
     return {i for _l, _ni, i in cands[:max(0, max_n)]}
 
 
-def _kinetic_pop_tag(start_ms: int, accent: str) -> str:
+def _kinetic_pop_tag(start_ms: int, accent: str,
+                     restore_fill: str = "&H0000FFFF",
+                     restore_outline: str = "&H00000000") -> str:
     r"""``\t``-поп ключевого слова: вспухание ``KINETIC_SCALE``% + акцент за
     ``POP_IN``, держит ``POP_HOLD``, возврат к 100% за ``POP_OUT`` (§4b, R3).
 
@@ -331,13 +343,16 @@ def _kinetic_pop_tag(start_ms: int, accent: str) -> str:
     t3 = t2 + KINETIC_POP_OUT_MS
     return (f"\\t({t0},{t1},\\fscx{KINETIC_SCALE}\\fscy{KINETIC_SCALE}"
             f"\\1c{accent}\\3c{accent})"
-            f"\\t({t2},{t3},\\fscx100\\fscy100)")
+            f"\\t({t2},{t3},\\fscx100\\fscy100"
+            f"\\1c{restore_fill}\\3c{restore_outline})")
 
 
 def _karaoke_text(cue: Cue, words: list[Word], matcher: ProfanityMatcher,
                   mask: MaskingCfg, eps: float = 0.02, *,
                   kinetic: bool = True,
-                  accent: str = _KINETIC_DEFAULT_ACCENT) -> str:
+                  accent: str = _KINETIC_DEFAULT_ACCENT,
+                  karaoke_color: str = "&H0000FFFF",
+                  outline_color: str = "&H00000000") -> str:
     r"""Render one cue's text as a karaoke line: ``{\kNN}word`` per word.
 
     ``NN`` is the word's duration in centiseconds (ASS ``\k`` unit). Words are
@@ -403,11 +418,25 @@ def _karaoke_text(cue: Cue, words: list[Word], matcher: ProfanityMatcher,
     for i, (disp, cs) in enumerate(zip(disps, spans)):
         esc = _ass_text_escape(disp)
         if i in key_idx:
-            pop = _kinetic_pop_tag(elapsed_cs * 10, accent)
+            pop = _kinetic_pop_tag(elapsed_cs * 10, accent,
+                                   karaoke_color, outline_color)
             out_parts.append(f"{{\\k{cs}{pop}}}{esc}")
         else:
             out_parts.append(f"{{\\k{cs}}}{esc}")
         elapsed_cs += cs
+    # Reapply cue.text's balanced multi-line layout to the \k tokens: split the
+    # tokens positionally into the same per-line word counts _wrap chose and join
+    # the line groups with the ASS hard break \N so libass stops pixel-re-wrapping
+    # (max_lines / Russian break rules survive in the burn). Fall back to a flat
+    # line when the token count doesn't match cue.text (e.g. the overlap eps
+    # dropped a word) so we never shift words across lines.
+    line_counts = [len(ln.split(" ")) for ln in cue.text.split("\n")]
+    if len(line_counts) > 1 and sum(line_counts) == len(out_parts):
+        chunks, idx = [], 0
+        for n in line_counts:
+            chunks.append(" ".join(out_parts[idx:idx + n]))
+            idx += n
+        return "\\N".join(chunks)
     return " ".join(out_parts)
 
 
@@ -427,6 +456,11 @@ def write_ass(cues: list[Cue], path: str | Path, style: "AssStyleCfg", *,
     Cyrillic most reliably.
     """
     pr_x, pr_y = int(play_res[0] or 1920), int(play_res[1] or 1080)
+    # Presets are defined @1080 (serve.CAPTION_PRESETS). PlayResY == output height,
+    # so scale metrics by pr_y/1080 to keep a constant fraction of frame height
+    # across resolutions/formats (mirrors enrich_cards._px). k==1.0 at 1080 ->
+    # the 1080p render stays byte-identical.
+    k = pr_y / 1080.0
     align = _ASS_ALIGN.get(style.position, 2)
 
     header = [
@@ -448,13 +482,14 @@ def write_ass(cues: list[Cue], path: str | Path, style: "AssStyleCfg", *,
         # Secondary = base text colour, Primary = karaoke highlight colour.
         ("Style: Default,{font},{size},{primary},{secondary},{outline_c},"
          "&H64000000,0,0,0,0,100,100,0,0,1,{outline},{shadow},{align},"
-         "40,40,{margin_v},1").format(
-            font=style.font, size=int(style.size),
+         "{mlr},{mlr},{margin_v},1").format(
+            font=style.font, size=max(1, int(round(style.size * k))),
             primary=(style.karaoke_color if karaoke else style.primary_color),
             secondary=style.primary_color,
             outline_c=style.outline_color,
-            outline=_num(style.outline), shadow=_num(style.shadow),
-            align=align, margin_v=int(style.margin_v)),
+            outline=_num(style.outline * k), shadow=_num(style.shadow * k),
+            align=align, mlr=int(round(40 * k)),
+            margin_v=int(round(style.margin_v * k))),
         "",
         "[Events]",
         ("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, "
@@ -474,7 +509,9 @@ def write_ass(cues: list[Cue], path: str | Path, style: "AssStyleCfg", *,
             # the karaoke fill so the swelling word reads as an emphasis, not
             # just the sung colour). Karaoke \k fill stays untouched.
             text = _karaoke_text(c, words or [], kmatcher, kmask,
-                                 accent=_KINETIC_DEFAULT_ACCENT)
+                                 accent=_KINETIC_DEFAULT_ACCENT,
+                                 karaoke_color=style.karaoke_color,
+                                 outline_color=style.outline_color)
         else:
             text = _ass_text_escape(c.text)
         lines.append(

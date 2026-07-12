@@ -5,7 +5,7 @@ from vpipe.detect.profanity import ProfanityMatcher
 from vpipe.models import Word
 from vpipe.subtitles import (KINETIC_MAX_PER_CUE, KINETIC_SCALE, Cue,
                              _is_content_word, _karaoke_text, _kinetic_keywords,
-                             _ts, build_cues, mask_text, mask_word)
+                             _ts, _wrap, build_cues, mask_text, mask_word)
 
 
 def test_mask_word():
@@ -182,4 +182,112 @@ def test_max_cps_never_shrinks_cue_end_below_last_word():
     # = 5.95 < last word end 5.98. Pre-fix the reading-speed pass shrank end to 5.95.
     cues = build_cues(words, m, SubsCfg(), MaskingCfg(), total=6.0)
     assert cues[-1].end >= 5.98 - 1e-6         # never pulled below the last word
+
+
+# === _wrap: line-wrapping heuristic (direct coverage) ==========================
+# _wrap decides how every cue looks. These tests lock its two documented paths:
+#   * the common 2-line balance branch (subtitles.py:83-99)
+#   * the >2-line / fallback greedy fill (subtitles.py:101-117)
+# NOTE: the greedy fill's `len(lines) < max_lines - 1` guard caps the line count
+# at max_lines, so the trailing `lines[:max_lines]` slice never drops a word;
+# and the 2-line key `(over, bad_tail, diff)` puts overflow FIRST, so a split
+# that fits max_chars always wins when one exists. Both are asserted below.
+def _wrap_tokens(s):
+    return [t for t in s.replace("\n", " ").split(" ") if t]
+
+
+def test_wrap_single_line_when_it_fits():
+    # short enough for one line -> no break inserted
+    out = _wrap(["раз", "два"], max_chars=42, max_lines=2)
+    assert out == "раз два" and "\n" not in out
+
+
+def test_wrap_two_line_balances():
+    # No 2-line split fits max_chars=8 here (раз два три = 11 > 8), so _wrap picks
+    # the split that best BALANCES the two line lengths and lets libass re-wrap —
+    # it does NOT guarantee each line <= max_chars when nothing fits. The balanced
+    # split of "раз два три четыре" is "раз два" (7) / "три четыре" (10), imbalance 3.
+    out = _wrap(["раз", "два", "три", "четыре"], max_chars=8, max_lines=2)
+    assert out.count("\n") == 1
+    assert _wrap_tokens(out) == ["раз", "два", "три", "четыре"]   # nothing dropped
+    assert out.split("\n") == ["раз два", "три четыре"]           # minimal-imbalance split
+
+
+def test_wrap_avoids_bad_line_tail():
+    # never end line 1 right after the conjunction «и» when a fitting split exists
+    out = _wrap(["я", "и", "ты", "здесь"], max_chars=6, max_lines=2)
+    first = out.split("\n")[0]
+    assert not first.rstrip().endswith(" и")
+    assert first.strip() != "я и"
+    assert _wrap_tokens(out) == ["я", "и", "ты", "здесь"]
+
+
+def test_wrap_two_line_respects_max_chars_when_split_fits():
+    # 4x4-char words: a 2/2 split fits max_chars=9. `over` is the leading key
+    # term, so the fitting split always beats an overflowing one.
+    out = _wrap(["аааа", "бббб", "вввв", "гггг"], max_chars=9, max_lines=2)
+    for line in out.split("\n"):
+        assert len(line) <= 9 or len(line.split(" ")) == 1
+
+
+def test_wrap_multiline_preserves_all_words():
+    # >2-line greedy path (max_lines=3): every input word must survive, in order.
+    # The `len(lines) < max_lines - 1` guard caps the line count at max_lines, so
+    # the trailing `lines[:max_lines]` slice never silently deletes a word.
+    words = ["один", "два", "три", "четыре", "пять", "шесть", "семь"]
+    out = _wrap(words, max_chars=8, max_lines=3)
+    assert out.count("\n") <= 2                 # at most max_lines lines
+    assert _wrap_tokens(out) == words           # order preserved, nothing dropped
+
+
+# --- P2: karaoke carries _wrap's \N so libass stops re-wrapping -----------------
+def test_karaoke_wraps_to_two_lines():
+    # cue.text carries _wrap's balanced 2-line layout; the karaoke line must carry
+    # the ASS hard break \N so max_lines / Russian break rules survive the burn.
+    words = [Word("слово", 0.5, 0.9), Word("раз", 0.9, 1.3),
+             Word("два", 1.3, 1.7), Word("три", 1.7, 2.1),
+             Word("четыре", 2.1, 2.5), Word("пять", 2.5, 2.9)]
+    cue = Cue(0.5, 2.9, "слово раз два\nтри четыре пять")
+    out = _karaoke_text(cue, words, _NOPROF, MaskingCfg(), kinetic=False)
+    assert out.count("\\N") == 1               # exactly one hard break inserted
+    first, second = out.split("\\N")
+    assert len(_ks(first)) == 3 and len(_ks(second)) == 3
+
+
+def test_karaoke_single_line_no_newline():
+    # single-line cue (cue.text has no '\n') keeps the flat join -- regression
+    # guard for the fallback so existing single-line karaoke tests are untouched.
+    cue, words = _cue_words([("привет", 40), ("мир", 40)])
+    out = _karaoke_text(cue, words, _NOPROF, MaskingCfg(), kinetic=False)
+    assert "\\N" not in out
+
+
+# --- P3: kinetic pop restores fill+outline colour at pop end -------------------
+def test_kinetic_pop_restores_colours():
+    # the pop's second \t must animate colour back to the karaoke fill + outline,
+    # else the popped word AND the rest of the cue stay accent-amber.
+    cue, words = _cue_words([("отвратительно", 60),
+                             ("замечательно", 60)])
+    kin = _karaoke_text(cue, words, _NOPROF, MaskingCfg(), kinetic=True,
+                        accent="&H000B9EF5", karaoke_color="&H00AABBCC",
+                        outline_color="&H00112233")
+    assert "\\fscx100\\fscy100\\1c&H00AABBCC\\3c&H00112233" in kin
+
+
+# --- P4: continuous cues chain end-to-start (no boundary blink) -----------------
+def test_continuous_cues_chain_without_gap():
+    # back-to-back speech (cue0 ends exactly where cue1 starts) must chain, not
+    # leave the forced min_gap that blinks the subtitle off/on at the boundary.
+    words = [Word("Привет.", 0.5, 2.0), Word("мир", 2.0, 3.5)]
+    cues = build_cues(words, _NOPROF, SubsCfg(), MaskingCfg(), total=4.0)
+    assert len(cues) == 2
+    assert abs(cues[0].end - cues[1].start) < 1e-9      # touching, no blank frame
+
+
+def test_real_pause_keeps_gap():
+    # a genuine pause between cues keeps the min_gap (no chaining).
+    words = [Word("Привет.", 0.5, 2.0), Word("мир", 2.5, 4.0)]
+    cues = build_cues(words, _NOPROF, SubsCfg(), MaskingCfg(), total=5.0)
+    assert len(cues) == 2
+    assert cues[0].end <= cues[1].start - SubsCfg().min_gap
 
