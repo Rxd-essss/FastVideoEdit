@@ -163,7 +163,10 @@ def build_cues(words: list[Word], matcher: ProfanityMatcher,
             required = chars / max_cps
             if (c.end - c.start) < required:
                 limit = cue_next_start[i] - subs.min_gap
-                c.end = min(max(c.end, c.start + required), max(c.start, limit), total)
+                # Extend-only: never pull the end BELOW the original (that would
+                # drop the cue's own last word). The outer max(c.end, ...) makes
+                # `limit` cap the EXTENSION only, never shrink the cue.
+                c.end = max(c.end, min(c.start + required, max(c.end, limit), total))
 
     # Enforce no overlap (keep order, leave a small gap).
     for i in range(len(cues) - 1):
@@ -353,8 +356,14 @@ def _karaoke_text(cue: Cue, words: list[Word], matcher: ProfanityMatcher,
     (proven byte-compatible with the existing karaoke contract). Profane
     (masked) words never pop (no extra attention on a bleeped word).
     """
+    # Overlap (not full-containment) selection: build_cues trims cue ends below
+    # the last word's end for back-to-back speech (max_cps/overlap passes), so
+    # containment silently dropped the tail word. A word belongs to the cue iff
+    # its span OVERLAPS the cue window. The eps keeps the previous cue's last
+    # word (ends at cue.start) and the next cue's first word (starts at cue.end)
+    # out.
     in_cue = [w for w in words
-              if w.start >= cue.start - eps and w.end <= cue.end + eps]
+              if w.start < cue.end - eps and w.end > cue.start + eps]
     in_cue.sort(key=lambda w: w.start)
 
     # If we somehow can't line words up with the cue, fall back to plain text.

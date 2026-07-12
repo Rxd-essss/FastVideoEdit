@@ -149,3 +149,37 @@ def test_kinetic_pop_skips_profanity():
     # запиканное слово не получает \t-поп; вспухает только «отвратительно»
     masked_seg = [seg for seg in kin.split(" ") if "***" in seg][0]
     assert "\\t(" not in masked_seg
+
+
+# --- regression: karaoke must not drop the last word of a trimmed cue ----------
+def test_karaoke_keeps_last_word_when_cue_end_trimmed():
+    # build_cues trims cue.end below the last word's end for back-to-back speech;
+    # containment selection used to silently drop that tail word from the burn.
+    words = [Word("раз", 0.0, 1.0), Word("два", 1.0, 2.0)]
+    cue = Cue(0.0, 1.90, "раз два")            # cue.end 1.90 < last word end 2.00
+    txt = _karaoke_text(cue, words, _NOPROF, MaskingCfg())
+    assert "два" in txt
+    assert len(_ks(txt)) == 2                  # both words carry a \k tag
+
+
+def test_karaoke_excludes_neighbour_words_at_boundaries():
+    # the previous cue's last word (ends at cue.start) and the next cue's first
+    # word (starts at cue.end) must stay OUT — overlap selection uses a strict eps.
+    words = [Word("до", -1.0, 0.0), Word("тут", 0.5, 1.5), Word("после", 2.0, 3.0)]
+    cue = Cue(0.0, 2.0, "тут")
+    txt = _karaoke_text(cue, words, _NOPROF, MaskingCfg())
+    assert "тут" in txt and "до" not in txt and "после" not in txt
+    assert len(_ks(txt)) == 1
+
+
+# --- regression: max_cps must never shrink a cue below its own last word -------
+def test_max_cps_never_shrinks_cue_end_below_last_word():
+    m = ProfanityMatcher(ProfanityLists(roots=[], allow=[]))
+    words = [Word("информация", 3.00, 3.50), Word("передаётся", 3.50, 4.00),
+             Word("полностью", 4.00, 4.50), Word("локально", 4.50, 5.00),
+             Word("быстро", 5.00, 5.50), Word("надёжно", 5.50, 5.98)]
+    # One dense cue: required (≈54/17≈3.2s) > duration (2.98s); limit = total-min_gap
+    # = 5.95 < last word end 5.98. Pre-fix the reading-speed pass shrank end to 5.95.
+    cues = build_cues(words, m, SubsCfg(), MaskingCfg(), total=6.0)
+    assert cues[-1].end >= 5.98 - 1e-6         # never pulled below the last word
+
