@@ -294,6 +294,16 @@ class FFmpeg:
             if "-filter_complex" in args:
                 try:
                     graph = args[args.index("-filter_complex") + 1]
+                    # Cap the reconstructed graph: a long many-cut render has an
+                    # ~18-30KB graph that would otherwise BECOME task['error'],
+                    # flood the SSE payload and push the real ffmpeg line (kept
+                    # FIRST in `detail`) off the auto-dismissing toast. A
+                    # head+tail excerpt keeps it diagnosable; the full graph is
+                    # also on disk as the spilled .ffscript during the run.
+                    if len(graph) > 1200:
+                        graph = (graph[:600]
+                                 + f"\n… [{len(graph) - 1200} chars omitted] …\n"
+                                 + graph[-600:])
                     parts.append(f"\nfilter_complex graph:\n{graph}")
                 except (IndexError, ValueError):
                     pass

@@ -72,4 +72,52 @@ def test_run_atomic_zero_probe_does_not_reject(tmp_path):
     out = str(tmp_path / "o.mp4")
     ff = FakeFF(probe_dur=0.0)
     _run_atomic(ff, ["-i", "x", out], out, total=60.0)
-    assert os.path.exists(out)
+    assert os.path.exists(out)                # (replace-retry tests follow)
+
+
+# --- #72: os.replace retry + timestamped fallback on a locked target ----------
+def test_run_atomic_replace_happy(tmp_path):
+    # Target not locked: os.replace succeeds on the first try, returns out_path.
+    out = str(tmp_path / "o.mp4")
+    saved = _run_atomic(FakeFF(probe_dur=60.0), ["-i", "x", out], out, total=60.0)
+    assert saved == out
+    assert os.path.exists(out) and not os.path.exists(out + ".part")
+
+
+def test_run_atomic_replace_retry_then_succeeds(tmp_path, monkeypatch):
+    import time
+    out = str(tmp_path / "o.mp4")
+    real, n = os.replace, {"c": 0}
+
+    def flaky(src, dst):
+        n["c"] += 1
+        if n["c"] < 3:                        # locked for the first two attempts
+            raise PermissionError("locked")
+        return real(src, dst)
+
+    monkeypatch.setattr(os, "replace", flaky)
+    monkeypatch.setattr(time, "sleep", lambda *a, **k: None)
+    saved = _run_atomic(FakeFF(probe_dur=60.0), ["-i", "x", out], out, total=60.0)
+    assert saved == out                       # recovered before the fallback
+    assert n["c"] == 3 and os.path.exists(out)
+
+
+def test_run_atomic_replace_fallback(tmp_path, monkeypatch):
+    import time
+    out = str(tmp_path / "o.mp4")
+    real, n = os.replace, {"c": 0}
+
+    def flaky(src, dst):
+        if dst == out:                        # real target stays locked forever
+            n["c"] += 1
+            raise PermissionError("locked")
+        return real(src, dst)                 # the timestamped sibling is free
+
+    monkeypatch.setattr(os, "replace", flaky)
+    monkeypatch.setattr(time, "sleep", lambda *a, **k: None)
+    saved = _run_atomic(FakeFF(probe_dur=60.0), ["-i", "x", out], out, total=60.0)
+    assert saved != out and saved.endswith(".mp4")
+    assert os.path.exists(saved)              # finished encode kept under alt name
+    assert n["c"] == 5                        # 5 locked attempts, then fallback
+    assert not os.path.exists(out + ".part")  # temp consumed by the fallback
+    assert not os.path.exists(out)            # original target never written

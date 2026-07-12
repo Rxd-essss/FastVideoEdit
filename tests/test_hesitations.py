@@ -193,3 +193,53 @@ def test_run_detection_emits_and_ids_hesitations(monkeypatch):
     hes = [s for s in cl.segments if s.type == TYPE_HESITATION]
     assert len(hes) == 2
     assert sorted(s.id for s in hes) == ["he000", "he001"]
+    # ids are zero-padded and stable in start order (he000 < he001).
+
+
+# --- #80: Session._detect wav gate (audio16k.wav presence) -------------------
+# The acoustic hesitation detector only runs when work_dir/audio16k.wav exists;
+# Session._detect forwards audio_path=wav only when present, else None -> the
+# detector is SILENTLY skipped. Lock which runs get audio so a refactor can't
+# quietly change detection results between runs of the same video.
+import serve  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+from vpipe.models import CutList  # noqa: E402
+
+
+def _detect_stub(base, wav_present):
+    work = base / "work"
+    work.mkdir(parents=True, exist_ok=True)
+    out = base / "out"
+    out.mkdir(parents=True, exist_ok=True)
+    if wav_present:
+        (work / "audio16k.wav").write_bytes(b"RIFF0000WAVEfmt ")
+    return SimpleNamespace(
+        cfg=Config(), transcript=_transcript(),
+        fillers=FillerLists(), profanity=ProfanityLists(), llm=None,
+        work_dir=work, out_dir=out, inp=base / "clip.mp4",
+        audio_hash="h" * 12, cutlist=None,
+        cutlist_path=out / "clip.cutlist.json")
+
+
+def test_session_detect_forwards_audio_path_only_when_wav_exists(tmp_path,
+                                                                 monkeypatch):
+    seen = {}
+
+    def spy(tr, cfg, fill, prof, **kw):
+        seen["audio_path"] = kw.get("audio_path")
+        return CutList(source="clip", duration=10.0, segments=[])
+
+    monkeypatch.setattr(serve, "run_detection", spy)
+    monkeypatch.setattr(serve, "save_txt", lambda *a, **k: None)
+
+    # wav present -> audio_path is the 16 kHz wav (detector can run)
+    s = _detect_stub(tmp_path, wav_present=True)
+    serve.Session._detect(s)
+    assert seen["audio_path"] is not None
+    assert str(seen["audio_path"]).endswith("audio16k.wav")
+
+    # wav absent -> audio_path is None (hesitation detector silently skipped)
+    s2 = _detect_stub(tmp_path / "b", wav_present=False)
+    serve.Session._detect(s2)
+    assert seen["audio_path"] is None

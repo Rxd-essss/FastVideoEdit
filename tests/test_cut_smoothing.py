@@ -147,4 +147,64 @@ def test_effective_cut_no_drift_vs_raw_removed():
     raw = Timeline(raw_removed, media.duration).remap(t)
     assert eff == 11.0                       # matches the encoded video
     assert abs(raw - 11.03) < 1e-9           # old raw-removed path: 30 ms late
-    assert eff != raw
+    assert eff != raw                        # off-grid frame-snap tests: below
+
+
+# --- #22 frame-snap: quantise kept boundaries to the source frame grid --------
+def test_frame_snap_aligns_av():
+    """Every kept boundary snaps to the source frame grid (round(t*fps)/fps) so
+    the video trim and audio atrim share ONE timeline; removed_eff's duration
+    then equals the exact concat length (no one-sided silence pad to drift on)."""
+    from types import SimpleNamespace
+    from vpipe.models import ACTION_REMOVE, TYPE_MANUAL, CutList, CutSegment
+    from vpipe.render import effective_cut
+    from vpipe.timeline import Timeline
+
+    fps, dur = 25.0, 402.0                       # frame == 0.04 s
+    media = SimpleNamespace(fps=fps, duration=dur)
+    cfg = SimpleNamespace(render=SimpleNamespace(min_segment=0.0,
+                                                 frame_snap=True))
+    # 199 off-grid removes -> 200 kept segments at word-like (non-grid) times.
+    segs = [CutSegment(id=f"r{i}", start=i * 2.0 + 1.317, end=i * 2.0 + 1.911,
+                       type=TYPE_MANUAL, action=ACTION_REMOVE, enabled=True)
+            for i in range(199)]
+    cl = CutList(source="x", duration=dur, segments=segs)
+
+    kept, removed_eff = effective_cut(cl, media, cfg)
+    assert len(kept) == 200
+    for (a, b) in kept:                          # both ends on the frame grid
+        assert abs(a * fps - round(a * fps)) < 1e-6
+        assert abs(b * fps - round(b * fps)) < 1e-6
+    total_kept = sum(b - a for a, b in kept)
+    assert abs(Timeline(removed_eff, dur).new_duration() - total_kept) < 1e-6
+
+
+def test_frame_snap_off_is_legacy():
+    """frame_snap=False restores the exact (unsnapped) kept boundaries."""
+    from types import SimpleNamespace
+    from vpipe.models import ACTION_REMOVE, TYPE_MANUAL, CutList, CutSegment
+    from vpipe.render import effective_cut
+
+    media = SimpleNamespace(fps=25.0, duration=20.0)
+    cl = CutList(source="x", duration=20.0, segments=[
+        CutSegment(id="a", start=3.017, end=7.033, type=TYPE_MANUAL,
+                   action=ACTION_REMOVE, enabled=True),
+        CutSegment(id="b", start=11.049, end=13.081, type=TYPE_MANUAL,
+                   action=ACTION_REMOVE, enabled=True),
+    ])
+    on = SimpleNamespace(render=SimpleNamespace(min_segment=0.0,
+                                                frame_snap=True))
+    off = SimpleNamespace(render=SimpleNamespace(min_segment=0.0,
+                                                 frame_snap=False))
+
+    kept_off, _ = effective_cut(cl, media, off)
+    kept_on, _ = effective_cut(cl, media, on)
+    # OFF == the raw word boundaries, byte-for-byte the pre-patch behaviour.
+    assert kept_off == [(0.0, 3.017), (7.033, 11.049), (13.081, 20.0)]
+    # ON quantises them to the 1/25 s grid -> different values, all on-grid.
+    assert kept_on != kept_off
+    for (a, b) in kept_on:
+        assert abs(a * 25.0 - round(a * 25.0)) < 1e-9
+        assert abs(b * 25.0 - round(b * 25.0)) < 1e-9
+    # sanity: the OFF inputs are demonstrably NOT already on the frame grid.
+    assert abs(3.017 * 25.0 - round(3.017 * 25.0)) > 1e-3

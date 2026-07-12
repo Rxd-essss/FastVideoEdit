@@ -30,8 +30,17 @@ class Timeline:
     """Maps original timestamps to post-cut timestamps given removed intervals."""
 
     def __init__(self, removed: Iterable[tuple[float, float]], duration: float):
-        self.removed = merge_intervals(removed)
         self.duration = float(duration)
+        d = self.duration
+        # Clamp every interval into [0, duration] at this single chokepoint so an
+        # unvalidated PUT /api/cutlist or a hand-edited cutlist.json with a
+        # past-EOF or negative interval can't yield a degenerate kept segment
+        # entirely beyond the media (which would feed an empty stream to concat
+        # or silently shorten output). For a valid cutlist every interval is
+        # already inside [0, duration], so this is a byte-for-byte no-op.
+        clamped = [(max(0.0, min(float(a), d)), max(0.0, min(float(b), d)))
+                   for (a, b) in removed]
+        self.removed = merge_intervals([(a, b) for (a, b) in clamped if b > a])
         self.starts = [a for a, _ in self.removed]
         self.cum: list[float] = []   # removed duration BEFORE interval i begins
         c = 0.0

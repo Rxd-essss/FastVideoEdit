@@ -66,6 +66,8 @@ MIN_GAP_S = 2.0               # зазор между ЛЮБЫМИ окнами 
 SEAM_GAP_S = 0.5              # края окна не ближе 0.5 c к шву выреза
 CLEAN_HEAD_S = 30.0           # первые 30 c финального таймлайна — чистые
 CLEAN_TAIL_S = 20.0           # последние 20 c — чистые
+CLEAN_HEAD_FRAC = 0.15        # короткий ролик: зона головы = min(30 c, 15% ролика)
+CLEAN_TAIL_FRAC = 0.10        # короткий ролик: зона хвоста = min(20 c, 10% ролика)
 IN_CUT_DROP_FRAC = 0.5        # >50% окна в вырезах -> status in_cut (правило remap_words)
 MIN_WINDOW_S = 1.0            # окно, схлопнувшееся у швов короче 1 c -> off_limits
 MAX_STILLS = 6                # engine-лимит §2.1 п.5: PNG-входов на рендер
@@ -828,17 +830,16 @@ def save_enrich(plan: EnrichPlan, path: str | Path) -> None:
             "%Y-%m-%dT%H:%M:%SZ")
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(plan.to_dict(), ensure_ascii=False, indent=2),
-                   encoding="utf-8")
+    # audit D-1: уникальное имя tmp на вызов — параллельные save с общим .tmp на
+    # Windows ловили PermissionError на os.replace → ложный 500. Последний
+    # replace побеждает; tmp чистится в finally.
+    tmp = p.with_name(f"{p.name}.{uuid.uuid4().hex}.tmp")
     try:
+        tmp.write_text(json.dumps(plan.to_dict(), ensure_ascii=False, indent=2),
+                       encoding="utf-8")
         os.replace(tmp, p)
-    except OSError:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-        raise
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 # --- emoji asset (Tier 0 fallback, §4) -------------------------------------------
@@ -1199,13 +1200,19 @@ def plan_render(plan: EnrichPlan, timeline: Timeline,
             cands.append(c)
 
     # 2) чистые зоны / CTA>=60 c / отступ от швов ------------------------------
+    # На КОРОТКИХ роликах фиксированные 30/20 c зоны перекрываются и отвергают
+    # ЛЮБОЙ оверлей (весь план off_limits, «Включено 0 из N»). Масштабируем зоны
+    # под длину: не больше 15%/10% ролика — окно всегда существует. Для dur>=200
+    # c тождественно прежним 30/20 c (min(30,.15*dur)=30, min(20,.1*dur)=20).
+    clean_head = min(CLEAN_HEAD_S, CLEAN_HEAD_FRAC * dur)
+    clean_tail = min(CLEAN_TAIL_S, CLEAN_TAIL_FRAC * dur)
     placed: list[_Cand] = []
     for c in cands:
         it = c.item
-        if c.f0 < CLEAN_HEAD_S or c.f1 > dur - CLEAN_TAIL_S:
+        if c.f0 < clean_head or c.f1 > dur - clean_tail:
             _reject(it, ST_OFF_LIMITS,
-                    f"чистая зона: первые {CLEAN_HEAD_S:.0f} c и последние "
-                    f"{CLEAN_TAIL_S:.0f} c без оверлеев")
+                    f"чистая зона: первые {clean_head:.0f} c и последние "
+                    f"{clean_tail:.0f} c без оверлеев")
             continue
         if _is_cta(it.type) and c.f0 < CTA_MIN_T_FINAL:
             _reject(it, ST_OFF_LIMITS,
@@ -1261,7 +1268,8 @@ def plan_render(plan: EnrichPlan, timeline: Timeline,
         else:
             keep_cta.append(c)
     # 4c. общая плотность: <=2.5 оверлея/мин (жёсткий потолок 4) — трим по score.
-    budget = int(min(OVERLAYS_PER_MIN, OVERLAYS_PER_MIN_HARD) * dur / 60.0)
+    #     max(1,…): на очень коротком ролике (<24 c) budget иначе = 0 и режет ВСЁ.
+    budget = max(1, int(min(OVERLAYS_PER_MIN, OVERLAYS_PER_MIN_HARD) * dur / 60.0))
     if len(accepted) > budget:
         by_score = sorted(accepted, key=lambda c: (-c.item.score, c.f0,
                                                    c.item.id))

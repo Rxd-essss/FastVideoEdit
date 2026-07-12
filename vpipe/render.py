@@ -109,8 +109,19 @@ _CONTAINER_FMT = {".mp4": "mp4", ".mov": "mov", ".mkv": "matroska",
                   ".webm": "webm", ".m4v": "mp4"}
 
 
+# HDR transfer characteristics that must be tonemapped to SDR BT.709 before the
+# 8-bit yuv420p encode; otherwise the 10-bit PQ/HLG values are bit-truncated and
+# play back washed-out/desaturated (#60). SDR (bt709/empty) never matches, so
+# every SDR source keeps its byte-for-byte fast-paths untouched.
+_HDR_TRC = {"smpte2084", "arib-std-b67"}   # PQ (HDR10) / HLG
+
+
+def _is_hdr(media) -> bool:
+    return str(getattr(media, "color_trc", "") or "").lower() in _HDR_TRC
+
+
 def _run_atomic(ff: FFmpeg, args: list[str], out_path: str, *,
-                total=None, on_progress=None, desc="ffmpeg") -> None:
+                total=None, on_progress=None, desc="ffmpeg") -> str:
     """Run ffmpeg writing to ``out_path + '.part'`` then atomically replace.
 
     The final file appears only after ffmpeg exits 0, so a crashed/cancelled
@@ -161,7 +172,23 @@ def _run_atomic(ff: FFmpeg, args: list[str], out_path: str, *,
             raise FFmpegError(
                 f"{desc}: output truncated — got {got:.1f}s of an expected "
                 f"{total:.1f}s. The render was rejected (no file written).")
-    os.replace(tmp, out_path)
+    # os.replace can raise PermissionError on Windows when the previous output at
+    # out_path is held open (media player / an in-flight /api/output stream).
+    # Retry briefly, then fall back to a sibling timestamped name rather than
+    # discarding a finished multi-GB encode at 100%. Returns the path actually
+    # written so the caller can report the file the user should open.
+    for attempt in range(5):
+        try:
+            os.replace(tmp, out_path)
+            return out_path
+        except PermissionError:
+            if attempt < 4:
+                time.sleep(0.4)
+                continue
+            p = Path(out_path)
+            alt = str(p.with_name(f"{p.stem} ({int(time.time())}){p.suffix}"))
+            os.replace(tmp, alt)
+            return alt
 
 
 def video_encoder_args(cfg: Config, has_nvenc: bool, log=print) -> list[str]:
@@ -707,7 +734,10 @@ def _ass_path_for_filter(p: str) -> str:
     # Filtergraph option delimiters that could prematurely end the value.
     p = p.replace(",", "\\,").replace("[", "\\[").replace("]", "\\]")
     p = p.replace(";", "\\;")
-    p = p.replace("'", "\\'")   # a quote in the path must not close the value
+    # A literal single quote inside a single-quoted filter value must be written
+    # as the close-escape-reopen idiom '\'' -- a bare backslash does NOT escape it
+    # (the quote still terminates the value). Callers wrap the result in '...'.
+    p = p.replace("'", "'\\''")
     return p
 
 
@@ -937,9 +967,34 @@ def effective_cut(cl: CutList, media: MediaInfo, cfg: Config
     tl = Timeline(removed, media.duration)
     min_seg = sliver_min_seg(media, cfg)
     all_kept = tl.kept_segments()
-    kept = [(a, b) for (a, b) in all_kept if (b - a) >= min_seg]
-    dropped = [(a, b) for (a, b) in all_kept if (b - a) < min_seg]
-    removed_eff = merge_intervals(list(tl.removed) + dropped)
+    # Frame-snap (#22): quantise every kept boundary to the source frame grid
+    # BEFORE the sliver filter so the video trim (whole frames) and the audio
+    # atrim share ONE timeline -- concat then inserts no one-sided silence pad and
+    # the subtitle/chapter Timelines (all built from removed_eff below) ride the
+    # exact rendered positions. Opt out via render.frame_snap=False; skipped for
+    # audio-only / unknown-fps sources (media.fps<=0) so those stay byte-exact.
+    fps = (media.fps if (getattr(cfg.render, "frame_snap", True)
+                         and getattr(media, "fps", 0.0) > 0) else 0.0)
+    kept = []
+    for (a, b) in all_kept:
+        if fps:
+            a = round(a * fps) / fps
+            b = round(b * fps) / fps
+        if (b - a) >= min_seg:
+            kept.append((a, b))
+    # removed_eff = EXACT complement of the (snapped, sliver-filtered) kept set
+    # over [0, media.duration]. Computing it from the SNAPPED kept -- rather than
+    # merging the raw removed set with dropped slivers -- keeps subs/chapters on
+    # the same quantised grid the encoder uses (the two agree byte-for-byte when
+    # snapping is a no-op, e.g. boundaries already on the grid or frame_snap=off).
+    removed_eff, cursor = [], 0.0
+    for (a, b) in kept:
+        if a > cursor:
+            removed_eff.append((cursor, a))
+        cursor = b
+    if cursor < media.duration:
+        removed_eff.append((cursor, media.duration))
+    removed_eff = merge_intervals(removed_eff)
     return kept, removed_eff
 
 
@@ -1132,6 +1187,20 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
     # vpost = vpre (crop -> scale -> fps) + vsubs (subtitles last). Without
     # enrich overlays it is one comma chain — byte-for-byte the legacy vpost.
     vpre = []
+    # HDR (PQ/HLG) -> SDR: tonemap FIRST (on the full-range source) so the
+    # downstream crop/scale/subtitles composite on correct BT.709 colours and the
+    # final 8-bit yuv420p is not a washed-out truncation (#60). A non-empty vpre
+    # also forces the re-encode path, bypassing the untonemapped video-copy
+    # fast-path. Guarded on zscale (libzimg): if unavailable, warn and skip (no
+    # hard fail) so a build without zimg still renders.
+    if _is_hdr(media):
+        if ff.has_filter("zscale"):
+            vpre.append("zscale=t=linear:npl=100,tonemap=hable,"
+                        "zscale=t=bt709:m=bt709:r=tv,format=yuv420p")
+            log("  HDR-источник (PQ/HLG) — тонмаппинг в SDR (BT.709).")
+        else:
+            log("  HDR-источник (PQ/HLG), но фильтр zscale недоступен — "
+                "тонмаппинг пропущен (возможен размытый цвет).")
     # Vertical 9:16 crop+scale must run FIRST: crop -> scale -> fps -> subtitles.
     # crop_filter already bakes in the exact target scale (e.g. ...,scale=1080:1920),
     # so the caller passes scale_h=None and the generic scale step below is skipped.
@@ -1258,19 +1327,21 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
                     "-c:v", "copy", *_audio_args(cfg), *_faststart(cfg), out_path]
         else:
             log("  no cuts — remuxing (video copied).")
-            args = ["-i", media.path, "-map", "0:v", "-map", "0:a",
+            # FVE uses the FIRST audio track everywhere (extract/censor/render);
+            # bare 0:a copied ALL tracks here while every filtered path keeps one.
+            args = ["-i", media.path, "-map", "0:v", "-map", "0:a:0",
                     "-c:v", "copy", "-c:a", "copy", *_faststart(cfg), out_path]
         # finally: the ~220 MB DFN temp wavs must not survive a failed/cancelled
         # encode either (audit C-1) — same in the other two _run_atomic branches.
         _ck()   # last chance to abort before the encode/remux launches.
         _ck()   # last chance to abort before the encode/remux launches.
         try:
-            _run_atomic(ff, args, out_path, total=media.duration,
-                        on_progress=encode_prog, desc="remux")
+            saved = _run_atomic(ff, args, out_path, total=media.duration,
+                                on_progress=encode_prog, desc="remux")
         finally:
             if enhanced:
                 _cleanup_dfn_temp(work_dir)
-        return {"out": out_path, "new_duration": media.duration,
+        return {"out": saved, "new_duration": media.duration,
                 "removed": 0.0, "censored": len(censors),
                 "encoder": "copy", "denoise": bool(apost) or bool(enhanced),
                 "music": bool(music_path)}
@@ -1309,12 +1380,12 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
         log(f"  re-encoding (no cuts, {vpost_s or 'reencode'}) -> {enc_name}")
         _ck()   # last chance to abort before the (multi-hour) encode launches.
         try:
-            _run_atomic(ff, args, out_path, total=media.duration,
-                        on_progress=encode_prog, desc="render")
+            saved = _run_atomic(ff, args, out_path, total=media.duration,
+                                on_progress=encode_prog, desc="render")
         finally:
             if enhanced:
                 _cleanup_dfn_temp(work_dir)
-        return {"out": out_path, "new_duration": media.duration,
+        return {"out": saved, "new_duration": media.duration,
                 "removed": 0.0, "censored": len(censors),
                 "encoder": enc_name, "denoise": bool(apost) or bool(enhanced),
                 "music": bool(music_path)}
@@ -1382,12 +1453,12 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
     log(f"  encoding {len(kept)} kept segment(s) -> {new_dur:.1f}s ({enc_name})")
     _ck()   # last chance to abort before the (multi-hour) encode launches.
     try:
-        _run_atomic(ff, args, out_path, total=new_dur,
-                    on_progress=encode_prog, desc="render")
+        saved = _run_atomic(ff, args, out_path, total=new_dur,
+                            on_progress=encode_prog, desc="render")
     finally:
         if enhanced:
             _cleanup_dfn_temp(work_dir)
-    return {"out": out_path, "new_duration": new_dur, "removed": tl.total_removed,
+    return {"out": saved, "new_duration": new_dur, "removed": tl.total_removed,
             "censored": len(censors), "encoder": enc_name,
             "denoise": bool(apost) or bool(enhanced),
             "music": bool(music_path)}

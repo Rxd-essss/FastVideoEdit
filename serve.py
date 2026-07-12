@@ -257,7 +257,8 @@ class Session:
         self.transcript: Optional[Transcript] = None
         self.cutlist: Optional[CutList] = None
         self.task = {"name": None, "running": False, "percent": 0.0,
-                     "stage": "", "error": None, "done": False, "results": None}
+                     "stage": "", "error": None, "done": False, "results": None,
+                     "cancelled": False}
         self._ctor_fresh_detect = False   # True if __init__ ran a fresh _detect()
 
         # Load anything already on disk. Detection is NO LONGER run here: it used
@@ -1422,13 +1423,20 @@ def _run_render_pipeline(s: Session, cfg, scale_h, fps, out_dir: Path,
         except Exception as e:  # noqa: BLE001 — keep the rendered mp4
             sr = {"error": str(e)}
 
+    # #62: stem-key the txt sidecars so two videos rendered into the same
+    # out_dir can't overwrite each other's chapters/metadata. Regular render:
+    # sidecar_base is None -> sc == base (out_dir/<stem>), so the file is
+    # out_dir/<stem>.chapters.txt. The results dict still returns the real path
+    # (cr.get('path')/meta_path.resolve()); the UI links it with a static label.
+    sc = sidecar_base or base
+    chapters_out = _with_ext(sc, ".chapters.txt")
     cr: dict = {}
     chapters_ok = not cfg.chapters.enabled
     if cfg.chapters.enabled:
         try:
             on_stage("Главы…")
             cr = chapters_mod.generate(tr, removed_eff, cfg.chapters,
-                                       out_dir / "chapters.txt", llm=s.llm,
+                                       chapters_out, llm=s.llm,
                                        matcher=s.matcher, mask=cfg.masking,
                                        log=lambda *_: None, on_stage=on_stage)
             chapters_ok = True
@@ -1445,13 +1453,13 @@ def _run_render_pipeline(s: Session, cfg, scale_h, fps, out_dir: Path,
     if cfg.metadata.enabled and s.llm is not None:
         try:
             on_stage("Метаданные…")
-            chapters_txt = out_dir / "chapters.txt"
+            chapters_txt = chapters_out
             mr = metadata_mod.generate(
                 tr, removed_eff, cfg.metadata, s.llm,
                 chapters_path=chapters_txt if chapters_txt.exists() else None,
                 matcher=s.matcher, mask=cfg.masking, log=lambda *_: None)
             if mr.get("title") or mr.get("description"):
-                meta_path = out_dir / "metadata.txt"
+                meta_path = _with_ext(sc, ".metadata.txt")
                 meta_path.write_text(
                     "TITLE:\n" + mr.get("title", "") +
                     "\n\nHOOK:\n" + mr.get("hook", "") +
@@ -1709,11 +1717,34 @@ def _queue_process_one(job: QueueJob) -> None:
     # (3) render (+ optional subtitles/chapters), reusing the editor path.
     _chk()
     cfg, scale_h, fps, out_dir, base = _resolve_render_opts(ls, job.render_opts)
+    # Collision guard (#62): the batch queue defaults every job to the shared
+    # out_dir and derives the mp4 base purely from the stem, so a SECOND video
+    # sharing a stem would silently overwrite the first (both then report the
+    # same 'done' path). A per-output '.source' marker records which audio_hash
+    # owns <base>.mp4; when a DIFFERENT video owns it, uniquify with a hash
+    # suffix instead of clobbering. The interactive editor never runs this path,
+    # so its overwrite-on-re-render semantics are untouched.
+    _renamed = False
+    if base is not None:
+        mp4 = _with_ext(base, ".mp4")
+        marker = _with_ext(base, ".source")
+        prior = marker.read_text(encoding="utf-8").strip() if marker.exists() else ""
+        if mp4.exists() and prior and prior != str(ls.audio_hash):
+            base = base.parent / f"{base.name}-{str(ls.audio_hash)[:6]}"
+            job.stage = f"Имя занято другим видео — сохраняю как {base.name}.mp4"
+            _renamed = True
+        try:
+            _with_ext(base, ".source").write_text(str(ls.audio_hash),
+                                                  encoding="utf-8")
+        except OSError:
+            pass
     # Map the render's 0..1 onto the remaining 0.45..1.0 of the job bar.
     job.result = _run_render_pipeline(
         ls, cfg, scale_h, fps, out_dir, base,
         on_progress=lambda f: prog(0.45 + f * 0.55),
         on_stage=stage)
+    if _renamed and isinstance(job.result, dict):
+        job.result["renamed"] = base.name
     prog(1.0)
     job.status = "done"
 
@@ -1727,7 +1758,19 @@ def _queue_worker() -> None:
             if job is not None:
                 job.status = "running"
         if job is None:
-            break
+            # Drain: no pending job. Clear _queue_running atomically with a
+            # final pending re-check under TASK_LOCK — the SAME lock
+            # _start_queue_worker checks the flag under. Without this, a
+            # queue/add + queue/start landing between 'saw no pending' and
+            # 'cleared the flag' is a lost wakeup. Lock order TASK_LOCK->
+            # QUEUE_LOCK matches every other nesting (nothing takes QUEUE_LOCK
+            # then TASK_LOCK).
+            with TASK_LOCK:
+                with QUEUE_LOCK:
+                    if any(j.status == "pending" for j in QUEUE):
+                        continue
+                _queue_running = False
+            return
         # Persist the pending->running transition (outside QUEUE_LOCK, which
         # _save_queue re-acquires for its snapshot — calling it under the lock
         # would deadlock). A crash now leaves status='running' on disk, which
@@ -1903,7 +1946,19 @@ def scan_once(folder: Path, registry: dict[str, dict],
             pending.pop(key, None)
             continue                        # уже обработан и не менялся
         if pending.get(key) == (size, mtime):
-            # Двухфазная стабильность: размер/время не менялись целый скан.
+            # Двухфазная стабильность пройдена. Но «размер стабилен» ≠ «файл
+            # разлочен»: некоторые рекордеры/копиры держат ЭКСКЛЮЗИВНЫЙ лок уже
+            # после того, как файл перестал расти (мультиплексор финализирует
+            # длинный ролик). Промоутить сейчас — первый же job упадёт на
+            # probe/hash, уедет в error, а файл уже в registry и НИКОГДА не
+            # переедет снова. Пробуем открыть на shared-read: залочен —
+            # оставляем в pending, ждём следующего скана (ключ не трогаем,
+            # ретрай бесплатный).
+            try:
+                with open(path, "rb"):
+                    pass
+            except OSError:
+                continue
             pending.pop(key, None)
             registry[key] = {"size": size, "mtime": mtime}
             new_files.append(path)
@@ -2052,10 +2107,17 @@ def S() -> Session:
 
 
 def _guard_no_task() -> None:
-    """409 if a background task is in flight (mutating endpoints use this)."""
-    if SESSION is not None and SESSION.task["running"]:
+    """409 if a background task is in flight (mutating endpoints use this).
+
+    Read the running flags under TASK_LOCK (the same lock start_task /
+    _start_queue_worker set them under) so a mutating endpoint can't observe a
+    half-committed start."""
+    with TASK_LOCK:
+        task_running = SESSION is not None and SESSION.task["running"]
+        queue_running = _queue_running
+    if task_running:
         raise HTTPException(409, "Идёт фоновая задача — дождитесь её завершения")
-    if _queue_running:
+    if queue_running:
         raise HTTPException(409, "Очередь обрабатывает ролики — дождитесь её "
                                  "завершения или остановите очередь")
 
@@ -2385,6 +2447,38 @@ def get_cutlist():
 def put_cutlist(payload: dict = Body(...)):
     s = S()
     _guard_no_task()
+    # Validate every segment BEFORE from_dict (#61), which does d["id"] /
+    # float(d[...]) with no checks (KeyError-500 on a missing key) and silently
+    # accepts the NaN/±Infinity literals json.loads permits. An unguarded NaN is
+    # written into cutlist.json by save_json (allow_nan default True) and then
+    # bricks every later GET /api/cutlist (JSONResponse uses allow_nan=False ->
+    # 500), a 500 that survives restart. Mirror the /api/clips/render guard.
+    raw_segs = payload.get("segments", [])
+    if not isinstance(raw_segs, list):
+        raise HTTPException(400, "segments должен быть списком")
+    duration = float(s.media.duration)
+    for i, d in enumerate(raw_segs):
+        if not isinstance(d, dict):
+            raise HTTPException(400, f"Сегмент №{i + 1}: ожидается объект")
+        for k in ("id", "type", "action"):
+            if not isinstance(d.get(k), str) or not d.get(k):
+                raise HTTPException(
+                    400, f"Сегмент №{i + 1}: поле «{k}» должно быть непустой строкой")
+        try:
+            start, end = float(d.get("start")), float(d.get("end"))
+        except (TypeError, ValueError):
+            raise HTTPException(
+                400, f"Сегмент №{i + 1}: start/end должны быть числами (секунды)")
+        if not (math.isfinite(start) and math.isfinite(end)):
+            raise HTTPException(
+                400, f"Сегмент №{i + 1}: start/end должны быть конечными числами")
+        if end <= start:
+            raise HTTPException(400, f"Сегмент №{i + 1}: пустой/обратный диапазон")
+        if start < -0.001 or end > duration + 0.001:
+            raise HTTPException(400, f"Сегмент №{i + 1}: границы вне ролика")
+        # Clamp to [0, duration] so a past-EOF trim can't reach ffmpeg; from_dict
+        # re-reads these mutated values below.
+        d["start"], d["end"] = max(0.0, start), min(duration, end)
     cl = CutList.from_dict(payload)
     cl.duration = s.media.duration
     cl.source = str(s.inp)
@@ -3030,11 +3124,24 @@ def queue_remove(body: dict = Body(...)):
 
 
 @app.post("/api/queue/clear")
-def queue_clear():
-    """Drop every job that isn't currently running (pending/done/error)."""
+def queue_clear(body: Optional[dict] = Body(default=None)):
+    """Drop finished/queued jobs.
+
+    Back-compat: with no body, clears every non-running job (pending/done/error).
+    Pass {"statuses": ["done", "error"]} to clear ONLY those statuses, so pending
+    batch jobs the user queued survive — this is what the «Очистить завершённые»
+    button sends. Running jobs are never removed.
+    """
+    statuses = None
+    if isinstance(body, dict) and isinstance(body.get("statuses"), list):
+        statuses = {str(s) for s in body["statuses"]}
     with QUEUE_LOCK:
         before = len(QUEUE)
-        QUEUE[:] = [j for j in QUEUE if j.status == "running"]
+        if statuses is None:
+            QUEUE[:] = [j for j in QUEUE if j.status == "running"]
+        else:
+            QUEUE[:] = [j for j in QUEUE
+                        if j.status == "running" or j.status not in statuses]
         removed = before - len(QUEUE)
     _save_queue()
     return {"ok": True, "removed": removed}
@@ -3277,14 +3384,16 @@ def _save_clips_json(s: Session, cands: list) -> None:
         "clips": [asdict(c) for c in cands],
     }
     p = _clips_json_path(s)
+    tmp = p.with_name(f"{p.name}.{uuid.uuid4().hex}.tmp")   # audit D-1: уникальный tmp
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
                        encoding="utf-8")
         os.replace(tmp, p)
     except OSError:
         pass  # non-fatal: candidates are already in task['results']
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _load_clips_json(s: Session) -> Optional[dict]:
@@ -3458,13 +3567,18 @@ def clips_save(body: dict = Body(default={})):
     clip["dur_eff"] = round(max(0.0, dur_raw - tl.removed_overlap(start, end)), 3)
 
     p = _clips_json_path(s)
+    # audit D-1: уникальное имя tmp на вызов — параллельные save с общим .tmp на
+    # Windows ловили PermissionError на os.replace → ложный 500. Последний
+    # replace побеждает; tmp чистится в finally.
+    tmp = p.with_name(f"{p.name}.{uuid.uuid4().hex}.tmp")
     try:
-        tmp = p.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2),
                        encoding="utf-8")
         os.replace(tmp, p)
     except OSError as e:
         raise HTTPException(500, f"Не удалось сохранить clips.json: {e}")
+    finally:
+        tmp.unlink(missing_ok=True)
     return {"ok": True, "clip": clip}
 
 
@@ -4283,8 +4397,22 @@ def autopack(body: dict = Body(default={})):
         warnings: list[str] = []
         skipped: list[str] = []
         results: dict = {"warnings": warnings, "skipped": skipped}
+
+        def _publish() -> None:
+            # /api/state serializes s.task["results"] by LIVE reference on the
+            # event loop while this worker inserts keys; a size-changing insert
+            # during jsonable_encoder's dict iteration raises RuntimeError -> 500.
+            # Publish dict(results) (frozen key set) so readers only ever iterate
+            # a dict we won't mutate. Nested lists (warnings/clip_results) are
+            # append-only and nested dict (totals) is key-overwrite -> safe.
+            s.task["results"] = dict(results)
+
+        def _set_result(key: str, value) -> None:
+            results[key] = value
+            _publish()
+
         # Сразу в task: отмена/падение на любой стадии сохраняет уже сделанное.
-        s.task["results"] = results
+        _publish()
 
         def _chk() -> None:
             if s.task.get("cancelled"):
@@ -4330,19 +4458,19 @@ def autopack(body: dict = Body(default={})):
                 s.stage(f"Обогащение: применяю план "
                         f"(score ≥ {AUTOPACK_ENRICH_MIN_SCORE}, "
                         f"предложений: {n_apply})…")
-                results["enrich"] = {"applied": True,
-                                     "min_score": AUTOPACK_ENRICH_MIN_SCORE,
-                                     "count": n_apply}
+                _set_result("enrich", {"applied": True,
+                                       "min_score": AUTOPACK_ENRICH_MIN_SCORE,
+                                       "count": n_apply})
                 sub("enrich")(1.0)
             elif enrich_plan is not None:
                 warnings.append("Обогащение пропущено: план от другого видео "
                                 "(несвежий hash) — запустите «Предложить "
                                 "монтаж» заново")
-                results["enrich"] = {"applied": False}
+                _set_result("enrich", {"applied": False})
             else:
                 warnings.append("Обогащение пропущено: нет плана — сначала "
                                 "«Предложить монтаж»")
-                results["enrich"] = {"applied": False}
+                _set_result("enrich", {"applied": False})
 
         # --- (в) основной ролик (мультиформат C2) ------------------------------
         _chk()
@@ -4351,13 +4479,13 @@ def autopack(body: dict = Body(default={})):
             on_progress=sub("main"),
             on_stage=lambda m: s.stage(f"Основной ролик: {m}"),
             is_cancelled=lambda: bool(s.task.get("cancelled")))
-        results["main"] = res_main
+        _set_result("main", res_main)
         removed_now, _ = resolve(s.cutlist)
         totals = {"duration_before": round(float(s.media.duration), 1),
                   "duration_after": res_main.get("new_duration"),
                   "cuts": len(removed_now),
                   "clips_rendered": 0}
-        results["totals"] = totals
+        _set_result("totals", totals)
         _chk()
 
         # --- (г) подбор клипов --------------------------------------------------
@@ -4370,7 +4498,7 @@ def autopack(body: dict = Body(default={})):
         elif s.llm is None:
             # Зафиксированное решение (план §2.4): фолбэк-нарезки без LLM нет.
             warnings.append("ИИ выключен — клипы не предложены")
-            results["clips"] = []
+            _set_result("clips", [])
         else:
             _chk()
             s.stage("Клипы: подбор…")
@@ -4382,14 +4510,14 @@ def autopack(body: dict = Body(default={})):
             except Exception as e:  # noqa: BLE001 — Ollama умерла: частичный успех
                 _chk()              # отмена «через» suggest — честный cancelled
                 warnings.append(f"Подбор клипов не удался: {e}")
-                results["clips"] = {"error": str(e)}
+                _set_result("clips", {"error": str(e)})
             else:
                 sub("suggest")(1.0)
                 _save_clips_json(s, fresh)   # панель клипов оживёт без LLM
                 cands = [asdict(c) for c in fresh]
                 if not cands:
                     warnings.append("ИИ не нашёл подходящих клипов")
-                    results["clips"] = []
+                    _set_result("clips", [])
                     cands = None
 
         # --- (д) рендер топ-K клипов — общий цикл с /api/clips/render ----------
@@ -4397,7 +4525,7 @@ def autopack(body: dict = Body(default={})):
             top = _autopack_top_clips(cands, cl_duration, top_k)
             n = len(top)
             clip_results: list[dict] = []
-            results["clips"] = clip_results
+            _set_result("clips", clip_results)
             p = sub("clips")
             for i, c in enumerate(top):
                 if s.task.get("cancelled"):
@@ -4416,7 +4544,7 @@ def autopack(body: dict = Body(default={})):
             totals["clips_rendered"] = sum(1 for x in clip_results if x.get("ok"))
 
         _chk()
-        results["ok"] = True   # частичный успех (warnings) — тоже успех
+        _set_result("ok", True)   # частичный успех (warnings) — тоже успех
 
     s.start_task("autopack", run)
     return {"ok": True, "top_k": top_k, "formats": formats, "clips": do_clips}
@@ -4428,7 +4556,7 @@ async def events(request: Request):
 
     def _payload() -> str:
         t = s.task
-        return json.dumps({k: t[k] for k in
+        return json.dumps({k: t.get(k) for k in
                            ("name", "running", "percent", "stage",
                             "error", "done", "results", "cancelled")})
 

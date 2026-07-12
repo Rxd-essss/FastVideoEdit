@@ -183,7 +183,7 @@ def test_metadata_without_key_keeps_prior_behavior(monkeypatch, tmp_path):
                                      _SILENT, _SILENT)
     assert len(meta_calls) == 1                  # дефолт конфига: метаданные идут
     assert res["metadata"] == "Т"
-    assert (out_dir / "metadata.txt").exists()
+    assert (out_dir / "fake.metadata.txt").exists()   # #62: stem-keyed sidecar
 
 
 # --- 4. burn ASS from the override cutlist + per-clip file name ----------------

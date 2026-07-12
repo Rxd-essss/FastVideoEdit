@@ -172,7 +172,7 @@ def test_suggest_happy_creates_plan_with_hash_and_rev(client, monkeypatch,
     # файл создан, атомарно, с правильными hash/cutlist_rev/model/params
     p = serve._enrich_json_path(sess)
     assert p.name == "fake.enrich.json" and p.exists()
-    assert not p.with_suffix(".json.tmp").exists()
+    assert not list(sess.out_dir.glob("fake.enrich.json.*.tmp"))   # #79: no uuid-tmp scrap
     data = _plan_file(sess)
     assert data["version"] == 1
     assert data["hash"] == HASH

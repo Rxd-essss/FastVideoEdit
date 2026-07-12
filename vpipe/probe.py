@@ -20,6 +20,9 @@ class MediaInfo:
     acodec: str
     has_audio: bool
     sample_rate: int
+    color_trc: str = ""
+    color_primaries: str = ""
+    pix_fmt: str = ""
 
     def describe(self) -> str:
         return (f"{self.width}x{self.height} @ {self.fps:.3f} fps, "
@@ -99,6 +102,9 @@ def probe_media(ff: FFmpeg, path: str | Path) -> MediaInfo:
         acodec=a.get("codec_name", "") if a else "",
         has_audio=a is not None,
         sample_rate=int(a.get("sample_rate", 0)) if a else 0,
+        color_trc=v.get("color_transfer", "") if v else "",
+        color_primaries=v.get("color_primaries", "") if v else "",
+        pix_fmt=v.get("pix_fmt", "") if v else "",
     )
 
 
@@ -141,7 +147,12 @@ def extract_audio(ff: FFmpeg, src: str | Path, out_wav: str | Path,
     """Extract 16 kHz mono PCM WAV (what faster-whisper wants)."""
     out_wav = str(out_wav)
     Path(out_wav).parent.mkdir(parents=True, exist_ok=True)
-    ff.run(["-i", str(src), "-vn", "-ac", "1", "-ar", "16000",
+    # FVE uses the FIRST audio track everywhere (extract/censor/render): a
+    # multi-track OBS source (mic + desktop) otherwise lets ffmpeg's default
+    # stream selection pick the MOST-channels track for Whisper while render
+    # keeps [0:a] — the analyzed audio would not be the rendered one. `0:a:0?`
+    # = first audio stream; `?` non-fatal so video-only sources still work.
+    ff.run(["-i", str(src), "-map", "0:a:0?", "-vn", "-ac", "1", "-ar", "16000",
             "-c:a", "pcm_s16le", out_wav],
            total=total, on_progress=on_progress, desc="audio extraction")
     return out_wav
