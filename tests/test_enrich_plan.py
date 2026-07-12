@@ -394,6 +394,68 @@ def test_asset_kind_none_skipped_silently():
     assert a.status == enrich.ST_OK
 
 
+# --- «Монтаж V2» resolved_asset()-роутинг (schematic / diffusion кандидаты) -----
+def _img_with_candidates(iid, t, candidates, selected=0, source="none",
+                         wf=0.32, score=70, dur=3.0):
+    """ENR_IMAGE с кандидатами «Монтаж V2» (минуя плоский img(), напрямую)."""
+    return EnrichItem(
+        id=iid, type=enrich.ENR_IMAGE, score=score,
+        t_start=t, t_end=t + dur,
+        payload=ImagePayload(source=source, candidates=list(candidates),
+                             selected=selected, width_frac=wf))
+
+
+def test_schematic_candidate_renders_fullframe_still(png):
+    # schematic код-графики: PNG выбранного кандидата (preview) рендерится
+    # ПОЛНОКАДРОВО (1920x1080 cut-out с альфой), а не угловым PiP. До фикса
+    # plan_render свитчил по плоскому asset_kind ('none') и молча дропал точку.
+    tl = Timeline([], duration=300)
+    a = _img_with_candidates(
+        "a", 100.0, source="schematic",
+        candidates=[{"source": "schematic", "intent": "stat",
+                     "fields": {"stats": [{"value": "96", "unit": "%"}]},
+                     "style": "minimal", "preview": png}])
+    plan, re = run([a], tl)
+    assert len(re.stills) == 1
+    st = re.stills[0]
+    assert st.path == png
+    assert (st.x_expr, st.y_expr, st.scale_w) == ("0", "0", W)
+    assert st.kenburns is False                              # не джиттерим текст
+    assert a.status == enrich.ST_OK
+    assert st.t0 == pytest.approx(100.0)
+
+
+def test_schematic_candidate_without_png_dropped_with_note():
+    # выбран schematic, но PNG код-графики ещё не отрендерен (нет preview/
+    # asset_path) -> честный дроп из рендера со status_note, item остаётся.
+    tl = Timeline([], duration=300)
+    a = _img_with_candidates(
+        "a", 100.0, source="schematic",
+        candidates=[{"source": "schematic", "intent": "stat",
+                     "fields": {"stats": [{"value": "96", "unit": "%"}]},
+                     "style": "minimal"}])
+    plan, re = run([a], tl)
+    assert re.stills == []
+    assert "не готов" in a.status_note
+    assert a.enabled is True and a.status == enrich.ST_OK
+
+
+def test_diffusion_candidate_renders_corner_pip(png):
+    # регрессия: диффузия (SD-PNG) выбранного кандидата остаётся угловым PiP
+    # (полный кадр — ТОЛЬКО для schematic cut-out).
+    tl = Timeline([], duration=300)
+    a = _img_with_candidates(
+        "a", 100.0, source="diffusion", wf=0.32,
+        candidates=[{"source": "diffusion", "prompt": "x", "seed": -1,
+                     "asset_path": png}])
+    plan, re = run([a], tl)
+    assert len(re.stills) == 1
+    st = re.stills[0]
+    assert st.path == png
+    assert st.scale_w == round(W * 0.32)                     # не полнокадр
+    assert (st.x_expr, st.y_expr) == ("W-w-48", "48")
+
+
 def test_cta_subscribe_webm_overlay(cta_dir):
     f = cta_dir / "subscribe_like.webm"
     f.write_bytes(b"webm")

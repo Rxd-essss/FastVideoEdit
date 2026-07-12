@@ -1329,7 +1329,38 @@ def plan_render(plan: EnrichPlan, timeline: Timeline,
         # image / animation (PiP в верхнем углу)
         pl2 = it.payload
         path: Optional[str] = None
-        if pl2.asset_kind == "user":
+        is_schematic = False
+        # «Монтаж V2»: ассет ВЫБРАННОГО кандидата резолвит ЕДИНАЯ точка
+        # ImagePayload.resolved_asset() (schematic-PNG код-графики / диффузия /
+        # сток — по candidates[selected]), а НЕ плоский asset_kind: для schematic
+        # он НАМЕРЕННО "none" (_legacy_sync_from_candidate), рендер обязан брать
+        # PNG через resolved_asset (иначе флагманская код-графика молча выпадает
+        # из ролика). Старый плоский план / AnimationPayload (нет candidates) —
+        # по-прежнему по asset_kind.
+        _chosen = getattr(pl2, "chosen_candidate", None)
+        _cand = _chosen() if callable(_chosen) else None
+        if _cand is not None:
+            ap, src = pl2.resolved_asset()
+            if src in ("none", "kinetic"):
+                continue                # нет материального ассета — тихо
+            if src == "icon":
+                p = emoji_png_path(pl2.emoji or _cand.get("emoji", ""),
+                                   EMOJI_CACHE_DIR)
+                if p is None:
+                    it.status_note = (f"эмодзи-ассет {pl2.emoji or '(пусто)'} "
+                                      "не растеризовался (битый кодпойнт / нет "
+                                      "шрифта эмодзи)")
+                    lg(f"  enrich: {it.status_note} ({it.id})")
+                    continue
+                path = str(p)
+            elif ap and Path(ap).is_file():
+                path = ap
+                is_schematic = (src == "schematic")
+            else:
+                it.status_note = f"визуал не готов ({src}): {ap or '(нет файла)'}"
+                lg(f"  enrich: {it.status_note} ({it.id})")
+                continue                # дроп из рендера, item остаётся в плане
+        elif pl2.asset_kind == "user":
             if pl2.asset_path and Path(pl2.asset_path).is_file():
                 path = pl2.asset_path
             else:
@@ -1347,8 +1378,14 @@ def plan_render(plan: EnrichPlan, timeline: Timeline,
             path = str(p)
         else:                           # asset_kind=none: предложение без ассета
             continue
-        x, y = _pip_xy(pl2.position, H)
-        scale_w = max(1, round(W * pl2.width_frac))
+        # schematic код-графики — полнокадровый cut-out с альфой (contract
+        # §КОД-ГРАФИКА: PNG 1920x1080, прозрачный фон, «cut-out поверх talking-
+        # head»), а не угловой PiP; kenburns на карточке с текстом не нужен.
+        if is_schematic:
+            x, y, scale_w = "0", "0", W
+        else:
+            x, y = _pip_xy(pl2.position, H)
+            scale_w = max(1, round(W * pl2.width_frac))
         if it.type == ENR_ANIMATION and path.lower().endswith(".webm"):
             anims.append((it.score, AnimOverlay(
                 path=path, x_expr=x, y_expr=y, scale_w=scale_w,
@@ -1359,7 +1396,8 @@ def plan_render(plan: EnrichPlan, timeline: Timeline,
             stills.append((it.score, StillOverlay(
                 path=path, x_expr=x, y_expr=y, scale_w=scale_w,
                 t0=c.f0, t1=c.f1, fade_s=pl2.fade_ms / 1000.0,
-                kenburns=bool(getattr(pl2, "kenburns", False))), it))
+                kenburns=(False if is_schematic
+                          else bool(getattr(pl2, "kenburns", False)))), it))
 
     # 6) engine-лимиты §2.1 п.5: <=6 still + <=3 anim — трим по score.
     #    Страховочный (рендерный) лимит: item остаётся enabled/ok, причина —
