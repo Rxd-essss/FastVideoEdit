@@ -2,9 +2,20 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional
+
+
+def _atomic_write_text(path: "str | Path", text: str) -> None:
+    """Write via a sibling .tmp then os.replace, so a crash mid-write never
+    leaves a truncated/corrupt state file under the real name (out/ is always on
+    the same volume, where os.replace is atomic)."""
+    p = Path(path)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, p)
 
 # --- Cut types / actions -----------------------------------------------------
 TYPE_PAUSE = "pause"
@@ -96,8 +107,7 @@ class Transcript:
             version=int(d.get("version", 1)))
 
     def save(self, path: str | Path) -> None:
-        Path(path).write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=1),
-                              encoding="utf-8")
+        _atomic_write_text(path, json.dumps(self.to_dict(), ensure_ascii=False, indent=1))
 
     @staticmethod
     def load(path: str | Path) -> "Transcript":
@@ -162,8 +172,7 @@ class CutList:
             version=int(d.get("version", 1)))
 
     def save_json(self, path: str | Path) -> None:
-        Path(path).write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2),
-                              encoding="utf-8")
+        _atomic_write_text(path, json.dumps(self.to_dict(), ensure_ascii=False, indent=2))
 
     @staticmethod
     def load_json(path: str | Path) -> "CutList":
