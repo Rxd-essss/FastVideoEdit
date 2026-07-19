@@ -138,35 +138,49 @@ WHISPER_ALLOWED = {p["model"] for p in WHISPER_PRESETS}
 # Цвета — ASS &HAABBGGRR (AA=00 — непрозрачный); размеры/отступы — в пикселях
 # PlayRes (равен разрешению выхода). Подбор — под talking-head Shorts.
 CAPTION_PRESETS = [
+    {"key": "clean", "label": "Чистые",
+     "hint": "Ровный белый текст с чёткой обводкой. Без подсветки и анимаций — "
+             "самый нейтральный, «профессиональный» вид",
+     "style": {"font": "Arial", "size": 52,
+               "primary_color": "&H00FFFFFF", "outline_color": "&H00000000",
+               "karaoke_color": "&H00FFFFFF",   # highlight == text (нет цветного выделения)
+               "outline": 2.4, "shadow": 0.6,
+               "position": "bottom", "karaoke": False, "kinetic": False,
+               "margin_v": 60}},
     {"key": "classic", "label": "Классика",
-     "hint": "Белый текст, жёлтая подсветка слова, снизу",
+     "hint": "Белый текст, спокойная жёлтая подсветка активного слова (без прыжков)",
      "style": {"font": "Arial", "size": 52,
                "primary_color": "&H00FFFFFF", "outline_color": "&H00000000",
                "karaoke_color": "&H0000D4FF",   # #FFD400 — тёплый жёлтый
                "outline": 2.0, "shadow": 1.0,
-               "position": "bottom", "karaoke": True, "margin_v": 40}},
-    {"key": "neon", "label": "Неон",
-     "hint": "Крупнее, бирюзовая подсветка, приподнято над низом",
-     "style": {"font": "Verdana", "size": 62,
-               "primary_color": "&H00FFFFFF", "outline_color": "&H00000000",
-               "karaoke_color": "&H00FFE500",   # #00E5FF — бирюза
-               "outline": 3.0, "shadow": 0.0,
-               "position": "bottom", "karaoke": True, "margin_v": 160}},
+               "position": "bottom", "karaoke": True, "kinetic": False,
+               "margin_v": 40}},
     {"key": "minimal", "label": "Минимал",
-     "hint": "Мельче и спокойнее: мягкая полупрозрачная обводка-плашка",
+     "hint": "Мельче и спокойнее: мягкая полупрозрачная плашка-обводка, без анимаций",
      "style": {"font": "Tahoma", "size": 44,
                "primary_color": "&H00FFFFFF",
                "outline_color": "&H78000000",   # чёрный ≈53% непрозрачности
-               "karaoke_color": "&H006ED7F5",   # #F5D76E — приглушённое золото
+               "karaoke_color": "&H00FFFFFF",   # без цветного выделения
                "outline": 3.0, "shadow": 0.0,
-               "position": "bottom", "karaoke": True, "margin_v": 48}},
+               "position": "bottom", "karaoke": False, "kinetic": False,
+               "margin_v": 48}},
     {"key": "bold", "label": "Крупный",
-     "hint": "Для просмотра без звука — большой кегль по центру кадра",
+     "hint": "Для просмотра без звука — большой кегль по центру кадра, без прыжков",
      "style": {"font": "Impact", "size": 78,
                "primary_color": "&H00FFFFFF", "outline_color": "&H00000000",
                "karaoke_color": "&H0000D4FF",
                "outline": 3.0, "shadow": 2.0,
-               "position": "center", "karaoke": True, "margin_v": 40}},
+               "position": "center", "karaoke": True, "kinetic": False,
+               "margin_v": 40}},
+    {"key": "kinetic", "label": "Кинетик (TikTok)",
+     "hint": "Динамичный: слово-ключ вспухает и подсвечивается акцентом. "
+             "На любителя — включайте осознанно",
+     "style": {"font": "Verdana", "size": 62,
+               "primary_color": "&H00FFFFFF", "outline_color": "&H00000000",
+               "karaoke_color": "&H0000D4FF",
+               "outline": 3.0, "shadow": 0.0,
+               "position": "bottom", "karaoke": True, "kinetic": True,
+               "margin_v": 160}},
 ]
 
 # B5: the user-editable filler dictionary (repo root). The GET/PUT /api/fillers
@@ -1150,6 +1164,8 @@ def _resolve_render_opts(s: Session, opts: dict):
             b.position = bs["position"]
         if "karaoke" in bs:                      # absent -> keep config.yaml value
             b.karaoke = bool(bs["karaoke"])
+        if "kinetic" in bs:                      # keyword "pop" (default off)
+            b.kinetic = bool(bs["kinetic"])
         # C1 (пресеты стилей): числовые поля, которых нет среди «сырых» полей
         # UI — приходят только целым пресетом. Клампы — здравые пределы ASS;
         # мусор молча игнорируется (значение из config.yaml остаётся).

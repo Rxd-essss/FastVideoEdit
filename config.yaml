@@ -204,12 +204,17 @@ masking:
 llm:
   enabled: true
   backend: ollama         # ollama | llama_server
-  model: qwen3:8b         # лучший баланс надёжность/качество (A/B 2026-06:
-                          # qwen3.5:9b — главы/метаданные лучше, но JSON хрупче
-                          # и медленнее; MoE быстрее ×4, но ошибки в фактах)
+  model: qwen3.5:9b       # 2026-07: переключено на qwen3.5:9b (главы/метаданные
+                          # заметно лучше). JSON у неё капризнее — держит робастный
+                          # экстрактор enrich_llm; если ловите сбои парсинга,
+                          # откатитесь на qwen3:8b. Требует `ollama pull qwen3.5:9b`.
   host: http://localhost:11434
   temperature: 0
-  num_ctx: 16384          # bigger context so long videos don't truncate
+  num_ctx: 12288          # запас VRAM под qwen3.5:9b на 8 ГБ (KV-кэш при 16384
+                          # упирал пик в потолок 8 ГБ → частичный CPU-офлоад и
+                          # «капризный» JSON). Детекторы окнируют вход, так что
+                          # 12288 хватает. Ещё запас: OLLAMA_KV_CACHE_TYPE=q8_0 +
+                          # OLLAMA_FLASH_ATTENTION=1 (переменные окружения Ollama).
   timeout: 600            # seconds
   max_segments_per_call: 80   # split long transcripts into windows of this size
   segment_overlap: 5          # overlap between windows (catches boundary takes)

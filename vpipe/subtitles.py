@@ -520,6 +520,7 @@ def write_ass(cues: list[Cue], path: str | Path, style: "AssStyleCfg", *,
             # the karaoke fill so the swelling word reads as an emphasis, not
             # just the sung colour). Karaoke \k fill stays untouched.
             text = _karaoke_text(c, words or [], kmatcher, kmask,
+                                 kinetic=bool(getattr(style, "kinetic", False)),
                                  accent=_KINETIC_DEFAULT_ACCENT,
                                  karaoke_color=style.karaoke_color,
                                  outline_color=style.outline_color)

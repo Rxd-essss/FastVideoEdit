@@ -403,6 +403,10 @@ class AssStyleCfg(_Base):
     shadow: float = 1.0
     position: str = "bottom"           # "bottom" | "top" | "center"
     karaoke: bool = True
+    # Kinetic keyword "pop": the spoken keyword swells to 120% + flashes an accent
+    # colour. OFF by default — it reads as amateur ("колхоз") on most content;
+    # opt in per preset/render for a punchy TikTok look.
+    kinetic: bool = False
     margin_v: int = 40                 # vertical margin in PlayRes pixels
 
 
