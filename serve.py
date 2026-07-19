@@ -1520,6 +1520,16 @@ def _run_render_pipeline(s: Session, cfg, scale_h, fps, out_dir: Path,
                                        matcher=s.matcher, mask=cfg.masking,
                                        log=lambda *_: None, on_stage=on_stage)
             chapters_ok = True
+            # #36-restore: mirror into the preview cache — GET /api/chapters (the
+            # single reload-restore source) reads work_dir/preview_chapters.txt,
+            # while the render sidecar lives at out/<stem>.chapters.txt (#62).
+            # Best-effort: a cache write failure must not harm the render.
+            try:
+                if chapters_out.exists():
+                    (s.work_dir / "preview_chapters.txt").write_text(
+                        chapters_out.read_text(encoding="utf-8"), encoding="utf-8")
+            except OSError:
+                pass
         except Exception as e:  # noqa: BLE001 — keep the rendered mp4
             cr = {"error": str(e)}
 
@@ -1546,6 +1556,14 @@ def _run_render_pipeline(s: Session, cfg, scale_h, fps, out_dir: Path,
                     "\n\nDESCRIPTION:\n" + mr.get("description", "") +
                     "\n\nTAGS:\n" + ", ".join(mr.get("tags", [])) + "\n",
                     encoding="utf-8")
+                # #36-restore: mirror into the preview cache (same JSON shape the
+                # preview_metadata task writes) so GET /api/metadata restores the
+                # Мета tab after a render + reload. Best-effort.
+                try:
+                    (s.work_dir / "preview_metadata.json").write_text(
+                        json.dumps(mr, ensure_ascii=False), encoding="utf-8")
+                except OSError:
+                    pass
             metadata_ok = True
         except Exception as e:  # noqa: BLE001 — keep the rendered mp4
             mr = {"error": str(e)}

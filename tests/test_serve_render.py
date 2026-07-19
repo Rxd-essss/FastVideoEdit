@@ -389,3 +389,42 @@ def test_karaoke_explicit_false_overrides(tmp_path):
     cfg, *_ = serve._resolve_render_opts(
         s, {"burn_subtitles": True, "burn_style": {"karaoke": False}})
     assert cfg.subtitles.burn.karaoke is False
+
+
+# --- #36-restore: render mirrors chapters/metadata into the preview cache ------
+# Integration bug caught in the live E2E: #62 stem-keyed the render sidecars to
+# out/<stem>.chapters.txt, but GET /api/chapters+/api/metadata (the reload
+# restore, #35/#36) read work_dir/preview_*. After a render + reload the tabs
+# came back EMPTY. The pipeline now mirrors both into the preview cache.
+def test_render_mirrors_chapters_and_metadata_to_preview_cache(monkeypatch,
+                                                               tmp_path):
+    s = _mk_session(tmp_path)
+    s.llm = object()                      # enables the metadata branch
+    _patch_render(monkeypatch)
+
+    def fake_chapters(tr, removed, cfg, out_path, **kw):
+        Path(out_path).write_text("00:00 Интро\n00:10 Тема\n", encoding="utf-8")
+        return {"path": str(out_path), "chapters": 2}
+
+    def fake_metadata(tr, removed, cfg, llm, **kw):
+        return {"title": "Заголовок", "hook": "Хук",
+                "description": "Описание", "tags": ["a", "b"]}
+
+    monkeypatch.setattr(serve.chapters_mod, "generate", fake_chapters)
+    monkeypatch.setattr(serve.metadata_mod, "generate", fake_metadata)
+
+    cfg, scale_h, fps, out_dir, base = serve._resolve_render_opts(
+        s, {"subtitles": False, "chapters": True, "metadata": True})
+    res = serve._run_render_pipeline(s, cfg, scale_h, fps, out_dir, base,
+                                     _SILENT, _SILENT)
+    assert res["succeeded"]["chapters"] and res["succeeded"]["metadata"]
+    # render sidecars (stem-keyed, #62)
+    assert (out_dir / "fake.chapters.txt").exists()
+    assert (out_dir / "fake.metadata.txt").exists()
+    # preview cache mirrored — the reload-restore source (#35/#36)
+    pc = s.work_dir / "preview_chapters.txt"
+    pm = s.work_dir / "preview_metadata.json"
+    assert pc.exists() and "Интро" in pc.read_text(encoding="utf-8")
+    assert pm.exists()
+    data = json.loads(pm.read_text(encoding="utf-8"))
+    assert data["title"] == "Заголовок" and data["tags"] == ["a", "b"]
