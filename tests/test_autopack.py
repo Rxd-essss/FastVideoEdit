@@ -761,3 +761,34 @@ def test_autopack_top_clips_filters_garbage():
     assert [c["id"] for c in top] == ["ok1", "ok2"]
     assert top[0]["hook"] == "Хук"
     assert top[1] == {"id": "ok2", "start": 0.0, "end": 40.0, "hook": ""}
+
+
+# --- Shorts clips must ALWAYS be vertical 9:16 (bug: clips came out 16:9) ------
+def test_autopack_clips_forced_vertical_main_stays_horizontal(client, monkeypatch,
+                                                              tmp_path):
+    """Багрепорт: «шортсы автопака получаются 16:9 и опознаются YouTube как
+    видео». Клипы обязаны быть вертикальными 9:16 НЕЗАВИСИМО от горизонтальных
+    render_opts основного ролика; сам основной ролик вертикаль НЕ получает."""
+    events: list = []
+    sess = FakeSession(tmp_path, llm=object(), transcript=True, cutlist=True,
+                       events=events)
+    _install(monkeypatch, sess)
+    _patch_suggest(monkeypatch, events, result=[_cand("c01", 5.0, 35.0)])
+    calls = _patch_pipeline(monkeypatch, events)
+
+    # render_opts ГОРИЗОНТАЛЬНЫЕ — vertical не задан
+    r = client.post("/api/autopack",
+                    json={"top_k": 1, "render_opts": {"subtitles": False}})
+    assert r.status_code == 200
+    _wait_done(sess)
+    assert sess.task["error"] is None
+
+    clip_calls = [c for c in calls if c["override"] is not None]
+    main_calls = [c for c in calls if c["override"] is None]
+    assert clip_calls, "клипы не рендерились"
+    for c in clip_calls:                       # каждый Shorts — вертикальный
+        assert c["cfg"].render.vertical.enabled is True
+        assert c["cfg"].render.vertical.target == "1080x1920"
+    # основной ролик остаётся горизонтальным (vertical НЕ форсится на мастер)
+    assert main_calls and all(not c["cfg"].render.vertical.enabled
+                              for c in main_calls)

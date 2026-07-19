@@ -4592,8 +4592,15 @@ def autopack(body: dict = Body(default={})):
     # /api/clips/render) — иначе каждый клип гонял бы LLM и тёр metadata.txt.
     # music=None — подложка (C3) только в ОСНОВНОМ ролике, клипы без музыки;
     # enrich=None — обогащение Shorts-клипов вне скоупа v1 (ENRICH_PLAN §9).
+    # Shorts-клипы ВСЕГДА вертикальные 9:16 — YouTube опознаёт Shorts только по
+    # вертикали; горизонтальный клип он считает обычным видео. Форсируем crop
+    # НЕЗАВИСИМО от render_opts (они настраивают ГОРИЗОНТАЛЬНЫЙ основной ролик),
+    # иначе клипы наследуют 16:9 источника (баг: «шортсы 16:9»). Центр кадра —
+    # авто-детект лица, если пользователь не задал вручную.
     clip_opts = {**render_opts, "chapters": False, "metadata": False,
-                 "music": None, "enrich": None}
+                 "music": None, "enrich": None,
+                 "vertical": True, "vertical_target": "1080x1920",
+                 "vertical_center": render_opts.get("vertical_center", "auto")}
     # Основной ролик: обогащение управляется автопаком, а не сырыми
     # render_opts клиента — явный ключ в обе стороны (вкл со score-порогом /
     # выкл, если стадия не запланирована).
