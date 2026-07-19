@@ -56,6 +56,7 @@ def _cancel_pending_timer():
         if serve._tr_flush_timer is not None:
             serve._tr_flush_timer.cancel()
             serve._tr_flush_timer = None
+        serve._tr_flush_session = None
 
 
 def _put(client, text, si=0, wi=1):
@@ -116,3 +117,66 @@ def test_force_flush_is_noop_when_nothing_pending(sess, monkeypatch):
     n = _count_flushes(monkeypatch)
     serve._force_flush_pending_transcript()          # no timer pending
     assert n["c"] == 0                                # default hooks change nothing
+
+
+# --- W6 #10: flush is keyed by the CAPTURED session ---------------------------
+def test_force_flush_other_session_skips_and_preserves_pending(client, sess,
+                                                               monkeypatch):
+    """Смена клипа в окне дебаунса: force-flush НОВОЙ сессии не должен гасить
+    таймер СТАРОЙ и флашить не тот транскрипт (fail-before: таймер А отменялся,
+    флашилась нетронутая Б, правка А терялась навсегда)."""
+    monkeypatch.setenv("FVE_TRANSCRIPT_FLUSH_DEBOUNCE_SEC", "30")
+    monkeypatch.setattr(serve, "_tr_flush_timer", None)
+    monkeypatch.setattr(serve, "_tr_flush_session", None, raising=False)
+    flushed = []
+    monkeypatch.setattr(serve, "_flush_transcript_now",
+                        lambda s: flushed.append(s))
+    assert _put(client, "правка").status_code == 200   # таймер взведён для sess
+
+    other = SimpleNamespace(transcript=None, cache_dir=sess.cache_dir,
+                            audio_hash="cd" * 20, task={"running": False})
+    serve._force_flush_pending_transcript(other)       # start_task клипа Б
+    assert flushed == []                               # Б не флашится
+    with serve._TR_FLUSH_LOCK:
+        assert serve._tr_flush_timer is not None       # правка А ещё в очереди
+    serve._force_flush_pending_transcript(sess)        # сама А — флашится
+    assert flushed == [sess]
+
+
+def test_shutdown_force_flush_targets_captured_session(client, sess,
+                                                       monkeypatch):
+    """W6 #10: shutdown-хук (s=None) флашит ЗАХВАЧЕННУЮ таймером сессию, а не
+    глобальную SESSION (после смены клипа это разные объекты)."""
+    monkeypatch.setenv("FVE_TRANSCRIPT_FLUSH_DEBOUNCE_SEC", "30")
+    monkeypatch.setattr(serve, "_tr_flush_timer", None)
+    monkeypatch.setattr(serve, "_tr_flush_session", None, raising=False)
+    flushed = []
+    monkeypatch.setattr(serve, "_flush_transcript_now",
+                        lambda s: flushed.append(s))
+    assert _put(client, "правка").status_code == 200
+    monkeypatch.setattr(serve, "SESSION",
+                        SimpleNamespace(transcript=None))   # клип сменили
+    serve._force_flush_pending_transcript()                 # shutdown/atexit
+    assert flushed == [sess]                                # не новая SESSION
+
+
+def test_natural_fire_clears_pending_state(sess, monkeypatch):
+    """W6 #10: сработавший таймер чистит глобалы — последующий force-flush
+    больше не пересериализует мульти-МБ транскрипт впустую (докстринг
+    «No-op when no timer is pending»)."""
+    import time as _t
+    monkeypatch.setattr(serve, "_tr_flush_timer", None)
+    monkeypatch.setattr(serve, "_tr_flush_session", None, raising=False)
+    flushed = []
+    monkeypatch.setattr(serve, "_flush_transcript_now",
+                        lambda s: flushed.append(s))
+    serve._schedule_transcript_flush(sess, 0.01)
+    deadline = _t.time() + 5.0
+    while _t.time() < deadline:
+        with serve._TR_FLUSH_LOCK:
+            if serve._tr_flush_timer is None and flushed:
+                break
+        _t.sleep(0.01)
+    assert flushed == [sess]
+    serve._force_flush_pending_transcript(sess)
+    assert flushed == [sess]                              # второго флаша нет

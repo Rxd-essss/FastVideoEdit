@@ -140,12 +140,14 @@ PANEL_EASE_OUT = 0.6         # accel<1 в \t = ease-out (свип/рост)
 def ass_escape(text: str) -> str:
     r"""Явный escape ASS-текста (конвенция репо — subtitles._ass_text_escape).
 
-    ``{`` открывает override-блок, ``\`` — вводит escape, поэтому оба
-    нейтрализуем; буквальные переводы строк становятся жёстким ``\N``.
+    W6: ASS не имеет общего ``\``-escape (а ``\{`` понимает только libass) —
+    бэкслеш и фигурные скобки нейтрализуем глифами-двойниками, как исправленный
+    subtitles._ass_text_escape (#31: удвоение рендерило ДВА бэкслеша);
+    буквальные переводы строк становятся жёстким ``\N``.
     """
     text = text if isinstance(text, str) else ""
-    text = text.replace("\\", "\\\\")        # бэкслеши первыми
-    text = text.replace("{", "\\{").replace("}", "\\}")
+    text = text.replace("\\", "⧵")           # reverse-solidus glyph, не удвоение
+    text = text.replace("{", "｛").replace("}", "｝")   # fullwidth braces
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = text.replace("\n", "\\N")
     return text
@@ -474,7 +476,11 @@ def build_enrich_ass(cards: Sequence[CardPlan], ctas: Sequence[CtaTextPlan],
     W, H = int(W), int(H)
     if W <= 0 or H <= 0:
         raise ValueError(f"build_enrich_ass: некорректное разрешение {W}x{H}")
-    k = H / 1080.0
+    # W6 #5: масштаб от КОРОТКОЙ стороны (зеркало subtitles.write_ass). Геометрия
+    # затюнена @1080; при 9:16 (1080x1920) прежний k=H/1080=1.78 выносил панель
+    # за левый край (px = 1080 - 1529 - 160 = -609, текст целиком вне кадра).
+    # Для 16:9 min(W,H)=H — бит-в-бит прежнее поведение.
+    k = min(W, H) / 1080.0
     # #52: кромка зоны burn-сабов от РЕАЛЬНОГО стиля (None ⇒ хардкод-дефолт).
     subs_top = SUBS_TOP_1080 if subs_top_1080 is None else float(subs_top_1080)
     ov = style_overrides if isinstance(style_overrides, dict) else {}

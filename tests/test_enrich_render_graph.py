@@ -519,6 +519,19 @@ def test_punch_dims_from_scale_h_and_crop_filter():
                        "crop=600:1067:660:0,scale=1080:1920") == (1080, 1920)
 
 
+def test_punch_dims_even_for_yuv420p():
+    """W6 #6: 1366x768 @ scale_h=720 давал round(1366*720/768)=1281 — нечётную
+    ширину, которую yuv420p-энкодер отвергает («width not divisible by 2»):
+    с punch-zoom падал ВЕСЬ рендер. Размеры обязаны быть чётными, как у
+    генерического scale=-2 (fail-before: (1281, 720))."""
+    m = MediaInfo(path="in.mp4", duration=120.0, fps=30.0, width=1366,
+                  height=768, vcodec="h264", acodec="aac",
+                  has_audio=True, sample_rate=48000)
+    w, h = _punch_dims(m, 720, None)
+    assert (w, h) == (1280, 720)
+    assert w % 2 == 0 and h % 2 == 0
+
+
 def test_punch_filter_empty_without_windows():
     assert _punch_filter([], 1920, 1080) == ""
     assert _punch_filter([_zw()], 0, 0) == ""           # без дименшенов — no-op

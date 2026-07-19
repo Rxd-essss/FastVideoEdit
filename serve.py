@@ -12,7 +12,6 @@ from __future__ import annotations
 import argparse
 import atexit
 import copy
-import hashlib
 import json
 from contextlib import asynccontextmanager
 import logging
@@ -213,6 +212,7 @@ _queue_cancel = threading.Event()    # set by /api/queue/stop to abort the run
 # task-start + shutdown/atexit force-flush hooks then bound the loss window.
 _TR_FLUSH_LOCK = threading.Lock()
 _tr_flush_timer: Optional[threading.Timer] = None
+_tr_flush_session = None    # сессия, захваченная взведённым таймером (W6 #10)
 
 
 def _tr_flush_debounce_sec() -> float:
@@ -242,27 +242,51 @@ def _flush_transcript_now(s) -> None:
 def _schedule_transcript_flush(s, delay: float) -> None:
     """Coalesce a burst of edits: (re)arm a single daemon timer that flushes the
     captured session after ``delay`` idle seconds."""
-    global _tr_flush_timer
+    global _tr_flush_timer, _tr_flush_session
     with _TR_FLUSH_LOCK:
         if _tr_flush_timer is not None:
             _tr_flush_timer.cancel()
-        _tr_flush_timer = threading.Timer(delay, _flush_transcript_now, args=(s,))
+        _tr_flush_session = s
+        _tr_flush_timer = threading.Timer(delay, _fire_transcript_flush, args=(s,))
         _tr_flush_timer.daemon = True
         _tr_flush_timer.start()
+
+
+def _fire_transcript_flush(s) -> None:
+    """Timer callback: СНАЧАЛА чистим pending-глобалы (иначе после первого
+    срабатывания каждый последующий force-flush заново сериализовал бы
+    мульти-МБ транскрипт — «No-op when no timer is pending» ломался), потом
+    флашим захваченную таймером сессию."""
+    global _tr_flush_timer, _tr_flush_session
+    with _TR_FLUSH_LOCK:
+        _tr_flush_timer = None
+        _tr_flush_session = None
+    _flush_transcript_now(s)
 
 
 def _force_flush_pending_transcript(s=None) -> None:
     """Force a DEBOUNCED-but-unwritten transcript edit to disk NOW. No-op when no
     timer is pending (i.e. debounce disabled) so default behavior is unchanged.
-    Called on task start and at shutdown/exit."""
-    global _tr_flush_timer
+    Called on task start and at shutdown/exit.
+
+    W6 #10: флашится сессия, ЗАХВАЧЕННАЯ взведённым таймером, и никогда другая:
+    смена клипа в окне дебаунса иначе отменяла таймер клипа А и флашила
+    нетронутый транскрипт клипа Б — правка А молча терялась. Если ``s`` — не
+    pending-сессия, таймер А оставляем взведённым (сам дофлашит A)."""
+    global _tr_flush_timer, _tr_flush_session
     with _TR_FLUSH_LOCK:
         pending = _tr_flush_timer is not None
+        target = _tr_flush_session
+        if (pending and s is not None and target is not None
+                and target is not s):
+            return          # чужая правка в очереди — её таймер не трогаем
         if _tr_flush_timer is not None:
             _tr_flush_timer.cancel()
             _tr_flush_timer = None
+        _tr_flush_session = None
     if pending:
-        _flush_transcript_now(s if s is not None else SESSION)
+        _flush_transcript_now(target if target is not None
+                              else (s if s is not None else SESSION))
 
 
 def _quarantine_corrupt(path: Path) -> None:
@@ -320,7 +344,8 @@ class Session:
         self.task = {"name": None, "running": False, "percent": 0.0,
                      "stage": "", "error": None, "done": False, "results": None,
                      "cancelled": False}
-        self._ctor_fresh_detect = False   # True if __init__ ran a fresh _detect()
+        self._ctor_fresh_detect = False   # always False: the ctor never detects
+                                          # (kept: queue guard + tests read it)
 
         # Load anything already on disk. Detection is NO LONGER run here: it used
         # to block /api/open for MINUTES on a synchronous LLM+VAD pass (no
@@ -346,6 +371,18 @@ class Session:
                 # later _detect() can't merge its stale manual cuts.
                 if self._cutlist_matches(loaded):
                     self.cutlist = loaded
+                else:
+                    # W6 #1: отвергнутый файл вскоре ПЕРЕЗАПИШЕТ ленивый фоновый
+                    # _detect() (open_session/очередь). Это могут быть часы
+                    # ручной курации юзера — сначала best-effort копия в .bak,
+                    # чтобы разметка была восстановима.
+                    try:
+                        bak = self.cutlist_path.with_name(
+                            self.cutlist_path.name + ".bak")
+                        os.replace(self.cutlist_path, bak)
+                        print(f"  чужой/устаревший катлист отложен как {bak.name}")
+                    except OSError:
+                        pass
 
     # --- helpers -------------------------------------------------------------
     def _detect(self, cfg: Optional[Config] = None) -> CutList:
@@ -380,10 +417,17 @@ class Session:
         different or re-recorded video sharing an out_dir."""
         h = getattr(cl, "audio_hash", "")
         if h:                                  # new cutlists carry the hash
+            # W6 #1: равенство хэша ДОСТАТОЧНО — хэш уже доказывает, что катлист
+            # от ЭТОГО видео; probe-клап (короткий стрим) легитимно сдвигает
+            # media.duration, и дрейф длительности тут не повод дропать.
             return h == self.audio_hash
-        # legacy cutlist (no hash): exact source path + duration.
-        src_ok = (not cl.source) or cl.source == str(self.inp)
-        dur_ok = (not cl.duration) or abs(cl.duration - self.media.duration) <= 0.5
+        # legacy cutlist (no hash): source path (normcase — Windows, как в
+        # own_cutlist-проверке очереди) + duration. Толеранс 2.0 c: probe-клап
+        # ужимает duration до КОРОТЧАЙШЕГО стрима, так что легаси-катлист этого
+        # же файла может отличаться на v/a-перекос (0.5–2 c у OBS/телефона).
+        src_ok = (not cl.source) or (os.path.normcase(cl.source)
+                                     == os.path.normcase(str(self.inp)))
+        dur_ok = (not cl.duration) or abs(cl.duration - self.media.duration) <= 2.0
         return src_ok and dur_ok
 
     def set_progress(self, frac: float) -> None:
@@ -1303,7 +1347,8 @@ def _run_render_pipeline(s: Session, cfg, scale_h, fps, out_dir: Path,
                          base: Path, on_progress, on_stage,
                          cutlist_override: Optional[CutList] = None,
                          edge_fade: float = 0.0,
-                         sidecar_base: Optional[Path] = None) -> dict:
+                         sidecar_base: Optional[Path] = None,
+                         should_cancel=None) -> dict:
     """Render mp4 + (optional) subtitles + chapters, returning the results dict.
 
     ``on_progress(frac)`` / ``on_stage(msg)`` are callbacks so the same body
@@ -1461,7 +1506,10 @@ def _run_render_pipeline(s: Session, cfg, scale_h, fps, out_dir: Path,
         log=lambda m="": on_stage(str(m).strip() or "Рендер видео…"),
         scale_h=scale_h, fps=fps, ass_path=ass_path, crop_filter=crop_filter,
         edge_fade=edge_fade,
-        should_cancel=lambda: bool(s.task.get("cancelled")), **enrich_kw)
+        # W6 #8: очередь передаёт свой стоп-сигнал (у её throwaway-Session флаг
+        # task['cancelled'] никто не ставит); редактор — прежний дефолт.
+        should_cancel=(should_cancel
+                       or (lambda: bool(s.task.get("cancelled")))), **enrich_kw)
 
     # R1 render-output-validate: the mp4 is the irreplaceable artifact, but
     # ffmpeg can exit 0 and still write a SHORT file (crash-interrupted source,
@@ -1789,8 +1837,9 @@ def _queue_process_one(job: QueueJob) -> None:
             raise RuntimeError("Очередь остановлена")
 
     _chk()
-    # Build a throwaway Session for this clip. The constructor probes media,
-    # loads any cached transcript, and (if a transcript exists) auto-detects.
+    # Build a throwaway Session for this clip. The constructor probes media and
+    # loads any cached transcript/cutlist; it NEVER auto-detects (deferred-
+    # detect refactor) — step (2) below runs detection explicitly when needed.
     ls = Session(job.path, APP["cfg"], job.out_dir, APP["use_llm"])
 
     def prog(frac: float) -> None:
@@ -1815,8 +1864,9 @@ def _queue_process_one(job: QueueJob) -> None:
             log=lambda m="": stage(str(m).strip() or job.stage),
             on_progress=lambda f: prog(0.05 + f * 0.35))
 
-    # (2) detection. Skip the redundant second pass when the ctor already
-    #     produced a FRESH cutlist from a cached transcript. ALSO skip (and do
+    # (2) detection. The ctor NEVER detects now (deferred-detect refactor:
+    #     _ctor_fresh_detect stays False on a real Session — the flag/guard are
+    #     kept for the queue-worker test fakes). Skip detection (and do
     #     NOT overwrite the file) when the ctor loaded an on-disk cutlist that
     #     BELONGS to this exact input (its `source` == this file): that is the
     #     user's curated cutlist, and _detect() would save over it, reverting
@@ -1858,16 +1908,24 @@ def _queue_process_one(job: QueueJob) -> None:
             base = base.parent / f"{base.name}-{str(ls.audio_hash)[:6]}"
             job.stage = f"Имя занято другим видео — сохраняю как {base.name}.mp4"
             _renamed = True
+    # Map the render's 0..1 onto the remaining 0.45..1.0 of the job bar.
+    # W6 #8: пробрасываем стоп очереди в render() — иначе Stop во время 2-pass
+    # loudnorm-замера / DFN-экстракта глотался как graceful degradation и ПОСЛЕ
+    # остановки стартовал полный многочасовой энкод (задача завершалась 'done').
+    job.result = _run_render_pipeline(
+        ls, cfg, scale_h, fps, out_dir, base,
+        on_progress=lambda f: prog(0.45 + f * 0.55),
+        on_stage=stage,
+        should_cancel=lambda: (_queue_cancel.is_set()
+                               or bool(getattr(ls, "task", {}).get("cancelled"))))
+    # W6 #14 (#62): маркер владения пишем ПОСЛЕ удачного рендера — упавший
+    # рендер иначе оставлял маркер без mp4 (ложное владение именем).
+    if base is not None:
         try:
             _with_ext(base, ".source").write_text(str(ls.audio_hash),
                                                   encoding="utf-8")
         except OSError:
             pass
-    # Map the render's 0..1 onto the remaining 0.45..1.0 of the job bar.
-    job.result = _run_render_pipeline(
-        ls, cfg, scale_h, fps, out_dir, base,
-        on_progress=lambda f: prog(0.45 + f * 0.55),
-        on_stage=stage)
     if _renamed and isinstance(job.result, dict):
         job.result["renamed"] = base.name
     prog(1.0)
@@ -2421,16 +2479,24 @@ async def upload(request: Request, name: str = "video.mp4"):
     total = 0
     try:
         with open(tmp, "wb") as f:
+            # #93: f.write is a blocking syscall; on a single-loop uvicorn a
+            # multi-GB upload would otherwise stall every other in-flight
+            # response in bursts (loopback receive outruns disk write). Offload
+            # writes so the event loop stays responsive — но W6 #15: сетевые
+            # ~64КБ-чанки копим в ~1МБ буфер: один thread-hop на чанк стоил
+            # ~0.1–0.3 мс диспетчеризации (порядка минуты на 30 ГБ).
+            buf = bytearray()
             async for chunk in request.stream():
                 total += len(chunk)
                 if total > MAX_UPLOAD_BYTES:
                     raise HTTPException(413, "Файл слишком большой (>30 ГБ). "
                                              "/ File too large (>30 GB).")
-                # #93: f.write is a blocking syscall; on a single-loop uvicorn a
-                # multi-GB upload would otherwise stall every other in-flight
-                # response in bursts (loopback receive outruns disk write).
-                # Offload each write so the event loop stays responsive.
-                await anyio.to_thread.run_sync(f.write, chunk)
+                buf += chunk
+                if len(buf) >= (1 << 20):
+                    await anyio.to_thread.run_sync(f.write, bytes(buf))
+                    buf.clear()
+            if buf:
+                await anyio.to_thread.run_sync(f.write, bytes(buf))
         os.replace(tmp, dest)
     except BaseException:
         try:
@@ -2601,11 +2667,16 @@ def put_cutlist(payload: dict = Body(...)):
                 400, f"Сегмент №{i + 1}: start/end должны быть конечными числами")
         if end <= start:
             raise HTTPException(400, f"Сегмент №{i + 1}: пустой/обратный диапазон")
-        if start < -0.001 or end > duration + 0.001:
+        if start < -0.001 or start >= duration + 0.001:
             raise HTTPException(400, f"Сегмент №{i + 1}: границы вне ролика")
+        # W6 #2: end > duration НЕ отвергаем — это легитимный детекторный хвост
+        # (Whisper таймкодит ПОЛНОЕ аудио, probe-клап мог укоротить duration;
+        # сервер сам отдаёт такие сегменты в GET). 400 здесь ломал автосейв
+        # НАВСЕГДА: UI шлёт ВСЕ сегменты, один хвост = каждый PUT падает.
         # Clamp to [0, duration] so a past-EOF trim can't reach ffmpeg; from_dict
         # re-reads these mutated values below.
-        d["start"], d["end"] = max(0.0, start), min(duration, end)
+        d["start"] = max(0.0, min(duration, start))
+        d["end"] = min(duration, end)
     cl = CutList.from_dict(payload)
     cl.duration = s.media.duration
     cl.source = str(s.inp)
@@ -4212,6 +4283,18 @@ def enrich_select(body: dict = Body(default={})):
     d = target.payload.to_dict()
     d["selected"] = idx
     enrich_llm._legacy_sync_from_candidate(d)
+    # W6 #12: _attach_emoji в анализе покрывает ТОЛЬКО кандидата, выбранного на
+    # его проходе. icon-кандидат, выбранный ЗДЕСЬ позже, оставался с пустым
+    # emoji — рендер гарантированно дропал оверлей (emoji_png_path('') -> None).
+    # Подбираем эмодзи тем же хелпером; best-effort — сбой не валит выбор.
+    _cands = d.get("candidates") or []
+    if (idx < len(_cands) and isinstance(_cands[idx], dict)
+            and _cands[idx].get("source") == "icon"
+            and not _cands[idx].get("emoji")):
+        try:
+            enrich_llm._attach_emoji(d, enrich_llm._load_emoji_map())
+        except Exception:  # noqa: BLE001 — подбор эмодзи best-effort
+            pass
     new_pl = enrich_mod.ImagePayload.sanitize(d)
     target.payload = new_pl
     try:
@@ -4790,6 +4873,34 @@ def _sweep_uploads(cfg, keep_days: float = 7.0) -> None:
         pass
 
 
+def _img_cache_roots(cfg) -> set:
+    """W6 #11 (#96): каталоги, куда РЕАЛЬНО пишут генераторы картинок. Ни один
+    из писателей не читает cfg.paths.cache_dir (serve не передаёт cache_dir):
+    codegfx якорит свой CACHE_DIR на repo-root, imagegen резолвит свой от CWD
+    (см. _enrich_preview_roots — превью уже вынуждено перечислять оба корня).
+    Свип метёт именно их; cfg-путь оставлен для дефолт-раскладки (всё совпадает)
+    и на будущее cache_dir-aware поколение писателей."""
+    roots: set = set()
+    for sub in ("enrich_img", "codegfx"):
+        try:
+            roots.add((Path(cfg.paths.cache_dir) / sub).resolve())
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        roots.add(Path(imagegen_mod.CACHE_DIR).resolve())     # CWD-relative writer
+    except Exception:  # noqa: BLE001 — движок опционален
+        pass
+    try:
+        from vpipe.codegfx import render as _cg
+        base = Path(_cg.CACHE_DIR)
+        if not base.is_absolute():
+            base = Path(_cg._REPO_ROOT) / base                # repo-root writer
+        roots.add(base.resolve())
+    except Exception:  # noqa: BLE001 — движок опционален
+        pass
+    return roots
+
+
 def _sweep_img_cache(cfg) -> None:
     """Opt-in, default-OFF age sweep of the IMAGE caches only (enrich_img /
     codegfx) (#96). ``cache_img_max_age_days == 0`` (default) => never evict —
@@ -4800,8 +4911,7 @@ def _sweep_img_cache(cfg) -> None:
         if max_age <= 0:
             return
         cutoff = time.time() - max_age * 86400
-        for sub in ("enrich_img", "codegfx"):
-            d = Path(cfg.paths.cache_dir) / sub
+        for d in _img_cache_roots(cfg):
             if not d.exists():
                 continue
             for p in d.rglob("*.png"):

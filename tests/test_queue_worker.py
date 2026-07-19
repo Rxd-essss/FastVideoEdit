@@ -71,6 +71,68 @@ def _patch_pipeline(monkeypatch, *, raise_in_render=None, on_render=None):
     monkeypatch.setattr(serve, "_run_render_pipeline", _rrp)
 
 
+# --- W6 #8/#14: стоп очереди доезжает до render(); маркер — после успеха -----
+def test_queue_stop_signal_threaded_into_render(monkeypatch):
+    """fail-before: kwarg should_cancel вообще не передавался из очереди —
+    Stop во время loudnorm-замера/DFN глотался и энкод стартовал после
+    остановки."""
+    _fake_session(monkeypatch, transcript=True, fresh=True)
+    captured = {}
+    monkeypatch.setattr(
+        serve, "_resolve_render_opts",
+        lambda s, opts: (getattr(s, "cfg", None), None, None,
+                         Path("o"), Path("o/clip")))
+
+    def _rrp(*a, **k):
+        captured.update(k)
+        return {"mp4": "out.mp4"}
+
+    monkeypatch.setattr(serve, "_run_render_pipeline", _rrp)
+    job = serve.QueueJob(id="sc", path="clip.mp4", out_dir="/o")
+    serve._queue_process_one(job)
+    sc = captured.get("should_cancel")
+    assert callable(sc)
+    assert sc() is False
+    serve._queue_cancel.set()              # /api/queue/stop
+    assert sc() is True                    # render() увидит стоп и прервётся
+
+
+def test_queue_marker_written_only_after_successful_render(monkeypatch,
+                                                           tmp_path):
+    """W6 #14 (#62): fail-before — .source-маркер писался ДО рендера и при
+    падении оставался, ложно claim-я имя за видео без mp4."""
+    _fake_session(monkeypatch, transcript=True, fresh=True)
+    out = tmp_path / "out"
+    out.mkdir()
+    base = out / "clip"
+    monkeypatch.setattr(serve, "_resolve_render_opts",
+                        lambda s, opts: (None, None, None, out, base))
+
+    def _boom(*a, **k):
+        raise RuntimeError("encode blew up")
+
+    monkeypatch.setattr(serve, "_run_render_pipeline", _boom)
+    job = serve.QueueJob(id="mk", path="clip.mp4", out_dir=str(out))
+    with pytest.raises(RuntimeError):
+        serve._queue_process_one(job)
+    assert not serve._with_ext(base, ".source").exists()
+
+
+def test_queue_marker_written_after_success(monkeypatch, tmp_path):
+    _fake_session(monkeypatch, transcript=True, fresh=True)
+    out = tmp_path / "out"
+    out.mkdir()
+    base = out / "clip"
+    monkeypatch.setattr(serve, "_resolve_render_opts",
+                        lambda s, opts: (None, None, None, out, base))
+    monkeypatch.setattr(serve, "_run_render_pipeline",
+                        lambda *a, **k: {"mp4": "out.mp4"})
+    job = serve.QueueJob(id="ok", path="clip.mp4", out_dir=str(out))
+    serve._queue_process_one(job)
+    assert serve._with_ext(base, ".source").read_text(
+        encoding="utf-8").strip() == "h"
+
+
 # --- _queue_process_one (direct) --------------------------------------------
 def test_process_one_success(monkeypatch):
     _fake_session(monkeypatch, transcript=True, fresh=True)

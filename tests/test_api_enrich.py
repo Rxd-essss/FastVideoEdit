@@ -650,6 +650,26 @@ def test_select_resyncs_flat_fields_stock(client, monkeypatch, tmp_path):
     assert pl["asset_path"] == asset
 
 
+def test_select_icon_attaches_emoji(client, monkeypatch, tmp_path):
+    """W6 #12: icon-кандидат, выбранный ПОСЛЕ анализа, обязан получить эмодзи —
+    анализ (_attach_emoji) покрывает только выбранного НА ТОТ МОМЕНТ кандидата;
+    без эмодзи рендер гарантированно дропает оверлей (emoji_png_path('')→None).
+    fail-before: payload.emoji оставался пустым."""
+    sess = FakeSession(tmp_path, duration=120.0)
+    _install(monkeypatch, sess)
+    monkeypatch.setattr(serve.enrich_llm, "_load_emoji_map",
+                        lambda path=None: {"реестр": "u1f5c3"})
+    item = _img_with_candidates(
+        "enr_i1", [{"source": "none"}, {"source": "icon"}], selected=0)
+    _write_plan(sess, [item])
+    r = client.post("/api/enrich/select", json={"id": "enr_i1", "idx": 1})
+    assert r.status_code == 200
+    pl = _plan_file(sess)["items"][0]["payload"]
+    assert pl["asset_kind"] == "emoji"
+    assert pl["emoji"] == "u1f5c3"
+    assert pl["candidates"][1]["emoji"] == "u1f5c3"
+
+
 def test_state_includes_imagegen_ready(client, monkeypatch, tmp_path):
     sess = FakeSession(tmp_path)
     _install(monkeypatch, sess)

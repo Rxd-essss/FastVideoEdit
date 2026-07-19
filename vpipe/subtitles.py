@@ -420,7 +420,16 @@ def _karaoke_text(cue: Cue, words: list[Word], matcher: ProfanityMatcher,
         if i in key_idx:
             pop = _kinetic_pop_tag(elapsed_cs * 10, accent,
                                    karaoke_color, outline_color)
-            out_parts.append(f"{{\\k{cs}{pop}}}{esc}")
+            # W6 #3: ASS-теги (включая \t) действуют от точки вставки до КОНЦА
+            # строки события — без явного сброса поп вспухал/перекрашивал ВСЕ
+            # следующие слова на время окна анимации. Статический restore-блок
+            # сразу после ключевого слова скоупит поп: поздний статический тег
+            # переопределяет анимируемое значение для последующего текста, а
+            # \t-пара продолжает анимировать само слово. \1c = PrimaryColour
+            # стиля (karaoke_color), так что караоке-заливка не меняется.
+            reset = (f"{{\\fscx100\\fscy100"
+                     f"\\1c{karaoke_color}\\3c{outline_color}}}")
+            out_parts.append(f"{{\\k{cs}{pop}}}{esc}{reset}")
         else:
             out_parts.append(f"{{\\k{cs}}}{esc}")
         elapsed_cs += cs
@@ -456,11 +465,13 @@ def write_ass(cues: list[Cue], path: str | Path, style: "AssStyleCfg", *,
     Cyrillic most reliably.
     """
     pr_x, pr_y = int(play_res[0] or 1920), int(play_res[1] or 1080)
-    # Presets are defined @1080 (serve.CAPTION_PRESETS). PlayResY == output height,
-    # so scale metrics by pr_y/1080 to keep a constant fraction of frame height
-    # across resolutions/formats (mirrors enrich_cards._px). k==1.0 at 1080 ->
-    # the 1080p render stays byte-identical.
-    k = pr_y / 1080.0
+    # Presets are defined @1080 (serve.CAPTION_PRESETS) and hand-tuned for BOTH
+    # 1920x1080 and the 1080x1920 Shorts frame. Scale by the SHORT side / 1080:
+    # landscape k = pr_y/1080 (4K -> 2.0), portrait 9:16 k = 1080/1080 = 1.0 —
+    # a pr_y/1080 scale blew vertical fonts up 1.78x past the UNSCALED
+    # max_line_chars wrap budget and overflowed the 1080-px frame width (W6 #4).
+    # k==1.0 at 1080p/vertical -> those renders stay byte-identical.
+    k = min(pr_x, pr_y) / 1080.0
     align = _ASS_ALIGN.get(style.position, 2)
 
     header = [

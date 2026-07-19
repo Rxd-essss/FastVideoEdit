@@ -1441,11 +1441,18 @@ def plan_render(plan: EnrichPlan, timeline: Timeline,
     #    CTA: детектор их уже отметил). Окно зума центрируем на старте точки,
     #    кламп 2–3 c, анти-кринж лимиты (≤1/30-60 c, не подряд, не в чистых
     #    зонах, не пересекать оверлейные окна) — все числа в КОДЕ.
-    re_plan.punches = _plan_punches(accepted, dur)
+    #    Чистые зоны — те же МАСШТАБИРОВАННЫЕ (short-video) значения, что и у
+    #    оверлеев в шаге 2, иначе на роликах < ~2 мин зум молча не срабатывал
+    #    никогда (W6: оверлей легально стоит с 13.5 c, а зум резался о 30 c).
+    re_plan.punches = _plan_punches(accepted, dur,
+                                    clean_head=clean_head,
+                                    clean_tail=clean_tail)
     return re_plan
 
 
-def _plan_punches(accepted: list["_Cand"], dur: float) -> list[ZoomWindow]:
+def _plan_punches(accepted: list["_Cand"], dur: float,
+                  clean_head: float = CLEAN_HEAD_S,
+                  clean_tail: float = CLEAN_TAIL_S) -> list[ZoomWindow]:
     r"""Окна punch-zoom из принятых emphasis-точек с анти-кринж лимитами (§4a).
 
     Источник (анти-расход, R3): НЕ зовём LLM — берём принятые «сильные моменты»
@@ -1469,7 +1476,7 @@ def _plan_punches(accepted: list["_Cand"], dur: float) -> list[ZoomWindow]:
         t1 = min(dur - PUNCH_LEAD_S, center + half)
         if t1 - t0 < PUNCH_DUR_MIN - 1e-9:
             continue                                # схлопнулось у краёв
-        if t0 < CLEAN_HEAD_S or t1 > dur - CLEAN_TAIL_S:
+        if t0 < clean_head or t1 > dur - clean_tail:
             continue                                # чистые зоны без эффектов
         # пересечение с ЧУЖИМ оверлейным окном (не своим источником) — отказ.
         if any(other is not c and t0 < other.f1 and t1 > other.f0

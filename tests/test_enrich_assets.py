@@ -32,6 +32,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import serve
+from conftest import requires_ffmpeg
 from vpipe import enrich as enrich_mod
 from vpipe import enrich_llm
 from vpipe.enrich import emoji_png_path
@@ -453,6 +454,8 @@ def test_cta_webm_size_under_200kb(name):
 
 
 @pytest.mark.parametrize("name", CTA_FILES)
+@requires_ffmpeg
+@pytest.mark.ffmpeg
 def test_cta_webm_has_alpha(name):
     """Чистовой CTA-пак несёт АЛЬФУ. Тонкость VP9: НАТИВНЫЙ декодер ffprobe
     рапортует `yuv420p` (альфа лежит скрытым вторичным планом + Matroska
@@ -526,6 +529,8 @@ def test_anim_presets_v11_entrance():
 
 
 @pytest.mark.parametrize("name", CTA_FILES)
+@requires_ffmpeg
+@pytest.mark.ffmpeg
 def test_cta_webm_alpha_round_trips_to_png(name):
     """Лакмус VP9-альфы: декодируем кадр обратно в PNG через -c:v libvpx-vp9 и
     проверяем, что прозрачность восстановилась (угол холста alpha=0, но контент
@@ -537,7 +542,8 @@ def test_cta_webm_alpha_round_trips_to_png(name):
     if not ffmpeg:
         pytest.skip("ffmpeg нет в PATH — пропускаю round-trip альфы")
     import tempfile
-    from PIL import Image
+    Image = pytest.importorskip(
+        "PIL.Image", reason="Pillow не установлен — пропускаю round-trip альфы")
     with tempfile.TemporaryDirectory() as td:
         png = Path(td) / "fr.png"
         # последний кадр (покой) — заведомо непрозрачный контент
@@ -550,7 +556,7 @@ def test_cta_webm_alpha_round_trips_to_png(name):
             pytest.skip(f"декод не удался: {r.stderr.strip()[:120]}")
         img = Image.open(png).convert("RGBA")
         a = img.split()[3]
-        nz = sum(1 for px in a.get_flattened_data() if px > 0)
+        nz = sum(1 for px in a.getdata() if px > 0)   # getdata: любая Pillow
         assert img.getpixel((0, 0))[3] == 0, "угол должен быть прозрачным"
         assert nz > 500, "контент должен быть непрозрачным (альфа восстановилась)"
 
@@ -558,6 +564,8 @@ def test_cta_webm_alpha_round_trips_to_png(name):
 @pytest.mark.parametrize("name,frames", [
     ("subscribe_like.webm", 36), ("subscribe_slide_avatar.webm", 36),
     ("comment.webm", 30), ("like.webm", 30), ("bell.webm", 30)])
+@requires_ffmpeg
+@pytest.mark.ffmpeg
 def test_cta_webm_frame_count(name, frames):
     """V11 §5: pill-ассеты длятся ~1.44с (36 кадров @25), иконки ~1.2с (30)."""
     f = CTA_DIR / name
@@ -573,6 +581,8 @@ def test_cta_webm_frame_count(name, frames):
     assert out == str(frames), f"{name}: nb_read_frames={out!r}, ждали {frames}"
 
 
+@requires_ffmpeg
+@pytest.mark.ffmpeg
 def test_make_enrich_assets_deterministic(tmp_path):
     """Генератор детерминирован: повторный прогон даёт байт-в-байт те же webm
     (single-thread VP9 + -bitexact + stripped metadata). ROBUST: нет ffmpeg/

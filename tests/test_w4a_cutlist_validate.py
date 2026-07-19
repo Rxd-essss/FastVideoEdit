@@ -66,7 +66,8 @@ def test_put_cutlist_rejects_nonfinite(client, raw):
     {"segments": [{"id": "x", "start": 1, "end": 10, "action": "remove"}]},
     {"segments": [{"id": "x", "start": 10, "end": 5, "type": "manual", "action": "remove"}]},
     {"segments": [{"id": "x", "start": -1, "end": 10, "type": "manual", "action": "remove"}]},
-    {"segments": [{"id": "x", "start": 1, "end": 100, "type": "manual", "action": "remove"}]},
+    # start ЗА пределами ролика (не просто хвост end>duration) — по-прежнему 400
+    {"segments": [{"id": "x", "start": 41, "end": 100, "type": "manual", "action": "remove"}]},
     {"segments": "notalist"},
 ])
 def test_put_cutlist_rejects_bad_segments(client, payload):
@@ -80,3 +81,16 @@ def test_put_cutlist_valid_then_get_ok(client):
     # No poisoning: the follow-up GET serializes via JSONResponse(allow_nan=False)
     g = client.get("/api/cutlist")
     assert g.status_code == 200
+
+
+def test_put_cutlist_clamps_detector_tail_past_duration(client):
+    """W6 #2: детекторный хвост (end > clamped duration — Whisper видел ПОЛНОЕ
+    аудио) КЛАМПИТСЯ к duration, а не 400. fail-before: один такой сегмент
+    навсегда ломал автосохранение («границы вне ролика» на каждый PUT)."""
+    r = client.put("/api/cutlist",
+                   json={"segments": [_seg(start=35.0, end=100.0)]})
+    assert r.status_code == 200
+    g = client.get("/api/cutlist")
+    assert g.status_code == 200
+    seg = g.json()["segments"][0]
+    assert seg["start"] == 35.0 and seg["end"] == 40.0    # clamped to duration

@@ -274,6 +274,23 @@ def test_kinetic_pop_restores_colours():
     assert "\\fscx100\\fscy100\\1c&H00AABBCC\\3c&H00112233" in kin
 
 
+# --- W6 #3: pop is SCOPED to the keyword — static reset right after it ---------
+def test_kinetic_pop_scoped_with_static_reset_after_keyword():
+    # ASS-теги действуют от вставки до КОНЦА строки события: без статического
+    # restore-блока сразу за ключевым словом каждое СЛЕДУЮЩЕЕ слово тоже
+    # вспухало до 120% и получало акцент-обводку на время окна попа.
+    cue, words = _cue_words([("отвратительно", 60), ("и", 18), ("тут", 20)])
+    kin = _karaoke_text(cue, words, _NOPROF, MaskingCfg(), kinetic=True,
+                        accent="&H000B9EF5", karaoke_color="&H00AABBCC",
+                        outline_color="&H00112233")
+    # статический сброс СРАЗУ после ключевого слова (fail-before: отсутствовал)
+    assert ("отвратительно{\\fscx100\\fscy100"
+            "\\1c&H00AABBCC\\3c&H00112233}") in kin
+    # хвост строки после ключевого слова — чистые {\kNN}-блоки без анимации
+    tail = kin.split("отвратительно", 1)[1]
+    assert "\\t(" not in tail
+
+
 # --- P4: continuous cues chain end-to-start (no boundary blink) -----------------
 def test_continuous_cues_chain_without_gap():
     # back-to-back speech (cue0 ends exactly where cue1 starts) must chain, not

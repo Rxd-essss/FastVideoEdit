@@ -307,7 +307,9 @@ def test_cta_empty_question_no_event():
 
 # --- экранирование -----------------------------------------------------------------------------
 def test_ass_escape_braces_backslashes_newlines():
-    assert ass_escape("a{b}c\\d\ne") == "a\\{b\\}c\\\\d\\Ne"
+    # W6: единая конвенция с subtitles._ass_text_escape (#31) — глифы-двойники,
+    # а не удвоение (ASS не имеет общего '\'-escape: '\\' рендерился ДВУМЯ).
+    assert ass_escape("a{b}c\\d\ne") == "a｛b｝c⧵d\\Ne"
     assert ass_escape("x\r\ny\rz") == "x\\Ny\\Nz"
     assert ass_escape("чисто") == "чисто"
     assert ass_escape(None) == ""                       # мусор -> пусто
@@ -318,10 +320,20 @@ def test_escaping_applied_to_card_and_cta_texts():
     card.items[0].text = "Пункт\\первый"
     cta = make_cta(text="Вопрос {спорный}\nвторая строка")
     ass = build_enrich_ass([card], [cta], 1920, 1080)
-    assert "Заголовок \\{смело\\}" in ass
-    assert "Пункт\\\\первый" in ass
-    assert "Вопрос \\{спорный\\}\\Nвторая строка" in ass
+    assert "Заголовок ｛смело｝" in ass
+    assert "Пункт⧵первый" in ass
+    assert "Вопрос ｛спорный｝\\Nвторая строка" in ass
     assert "{смело}" not in ass and "{спорный}" not in ass
+
+
+# --- W6 #5: вертикаль 9:16 — панель остаётся в кадре ----------------------------
+def test_panel_stays_in_frame_on_vertical_9x16():
+    # k масштабируется от КОРОТКОЙ стороны: при 1080x1920 прежний k=H/1080=1.78
+    # давал pw=1529 > W и px=-609 — панель, заголовок и пункты уезжали за левый
+    # край кадра (fail-before: в ASS были отрицательные координаты).
+    ass = build_enrich_ass([make_card()], [], 1080, 1920)
+    assert "\\pos(-" not in ass and "\\move(-" not in ass
+    assert "m -" not in ass and "l -" not in ass   # пути рисуются в кадре
 
 
 # === стиль A «панель» (§3, дефолт V11) ==========================================

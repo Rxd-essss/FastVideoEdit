@@ -175,6 +175,31 @@ def test_stall_watchdog_leaves_healthy_encode_alone():
         os.remove(script)
 
 
+# Finished encode: progress=end, then a long SILENT faststart moov relocation.
+_TRAILER_SCRIPT = (
+    "import sys, time\n"
+    "sys.stdout.write('out_time_us=1000000\\n')\n"
+    "sys.stdout.write('progress=end\\n')\n"
+    "sys.stdout.flush()\n"
+    "time.sleep(4)\n"
+)
+
+
+def test_stall_watchdog_disarmed_after_progress_end():
+    # W6 #9: после progress=end ffmpeg может минутами МОЛЧА двигать moov-атом
+    # (faststart). FAILS before the fix: окно 1.5 c истекало в тихом 4-секундном
+    # трейлере, сторож убивал ГОТОВЫЙ энкод и _run_proc бросал stall-FFmpegError
+    # (выше по стеку _run_atomic удалил бы .part на ~100%).
+    ff = _watchdog_ff(1.5)
+    script = _write_script(_TRAILER_SCRIPT)
+    try:
+        seen = []
+        ff._run_proc([sys.executable, script], [], 100.0, seen.append, "render")
+        assert seen[-1] == 1.0            # завершился чисто, без stall-ошибки
+    finally:
+        os.remove(script)
+
+
 # --- issue 18: cancel_all + progress parsing (fakes, no real ffmpeg) ----------
 def test_cancel_all_terminates_running_only():
     class _P:

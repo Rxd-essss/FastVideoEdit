@@ -703,3 +703,20 @@ def test_punch_empty_without_emphasis():
     tl = Timeline([], duration=300)
     plan, re = run([img("i1", 100.0, kind="none")], tl)   # image без ассета
     assert re.punches == []
+
+
+def test_punch_clean_zones_scale_on_short_video():
+    """W6: короткий ролик (90 c) — оверлеи живут по МАСШТАБИРОВАННЫМ зонам
+    (15%/10% => 13.5/9 c), и punch-zoom обязан использовать ТЕ ЖЕ зоны: с
+    фиксированными 30/20 c зум молча не срабатывал никогда на контенте < 52 c
+    и почти никогда < 2 мин (fail-before: re.punches == [])."""
+    tl = Timeline([], duration=90)
+    c = card("crd", 20.0, [("Раз", -1, 21.0), ("Два", -1, 23.0)], score=90)
+    plan, re = run([c], tl)
+    assert len(re.cards) == 1              # карточка размещена (зоны 13.5/9)
+    assert len(re.punches) == 1            # и зум не съеден жёсткими 30/20
+    p = re.punches[0]
+    assert p.t0 >= min(enrich.CLEAN_HEAD_S,
+                       enrich.CLEAN_HEAD_FRAC * 90) - 1e-6
+    assert p.t1 <= 90 - min(enrich.CLEAN_TAIL_S,
+                            enrich.CLEAN_TAIL_FRAC * 90) + 1e-6

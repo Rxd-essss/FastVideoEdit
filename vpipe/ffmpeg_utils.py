@@ -220,10 +220,17 @@ class FFmpeg:
         # default never trips a real render.
         last_progress = [time.monotonic()]
         stalled = [False]
+        # W6 #9: progress=end -> энкод ЗАВЕРШЁН. Дальше ffmpeg может минутами
+        # МОЛЧА двигать moov-атом (faststart, вторая проходка) при тишине на
+        # обоих пайпах — сторож обязан сняться, иначе готовый многочасовой
+        # рендер убивается на ~100% и _run_atomic удаляет .part.
+        finished = [False]
         win = getattr(self, "stall_timeout", 0.0) or 0.0
 
         def _watchdog() -> None:
             while proc.poll() is None:
+                if finished[0]:
+                    return              # здоровая тихая фаза после progress=end
                 if time.monotonic() - last_progress[0] > win:
                     stalled[0] = True
                     try:
@@ -266,8 +273,10 @@ class FFmpeg:
                         on_progress(min(1.0, max(0.0, (us / 1e6) / total)))
                     except (ValueError, ZeroDivisionError):
                         pass
-                elif line == "progress=end" and on_progress:
-                    on_progress(1.0)
+                elif line == "progress=end":
+                    finished[0] = True  # W6 #9: снять сторожа (moov-трейлер)
+                    if on_progress:
+                        on_progress(1.0)
             proc.wait()
             t.join(timeout=1.0)
         finally:

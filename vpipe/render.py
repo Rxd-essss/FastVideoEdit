@@ -15,7 +15,6 @@ import re
 import shutil
 import subprocess
 import time
-import time
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -803,7 +802,12 @@ def _punch_dims(media: MediaInfo, scale_h: Optional[int],
     src_w = int(media.width or 1920)
     src_h = int(media.height or 1080)
     out_w = int(round(src_w * out_h / src_h)) if src_h else 1920
-    return max(1, out_w), max(1, out_h)
+    # W6 #6: yuv420p требует ЧЁТНЫХ размеров. Генерический путь скейлит через
+    # scale=-2 (авто-чёт), а punch-scale задаёт W:H явно — нечётная ширина
+    # (1366x768@720 -> 1281) роняла ВЕСЬ рендер («width not divisible by 2»).
+    out_w -= out_w % 2
+    out_h -= out_h % 2
+    return max(2, out_w), max(2, out_h)
 
 
 def _punch_filter(punches: list["ZoomWindow"], out_w: int, out_h: int) -> str:

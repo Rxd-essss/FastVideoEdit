@@ -179,3 +179,52 @@ def test_open_session_defers_detect(monkeypatch, tmp_path):
     assert s.cutlist is None
     assert "detect" in started              # detection launched as a background task
     assert "_detect_ran" not in started     # NOT run synchronously inside __init__
+
+
+# --- (f) W6 #1: probe duration-clamp must not destroy the user's own cutlist --
+def test_legacy_cutlist_survives_probe_duration_clamp(monkeypatch, tmp_path):
+    """probe-клап до КОРОТЧАЙШЕГО стрима сдвигает media.duration на 0.5–2 c
+    (аудио живёт дольше видео) — легаси-катлист ЭТОГО ЖЕ файла обязан
+    загрузиться (fail-before: толеранс 0.5 c дропал собственную курацию, и
+    ленивый _detect() затирал файл)."""
+    _patch_probe(monkeypatch, duration=20.0)       # clamped (shortest stream)
+    out_dir = tmp_path / "out"
+    video = tmp_path / "лекция.mp4"
+    cl = CutList(source=str(video), duration=21.3, segments=[_seg("keep")])
+    _write_cutlist(out_dir, "лекция", cl)          # legacy: no audio_hash
+    video.write_bytes(b"x")
+    s = serve.Session(str(video), _cfg(tmp_path), str(out_dir), False)
+    assert s.cutlist is not None
+    assert any(seg.id == "keep" for seg in s.cutlist.segments)
+
+
+def test_hash_match_ignores_duration_drift(monkeypatch, tmp_path):
+    """W6 #1: совпавший audio_hash ДОСТАТОЧЕН — дрейф длительности от
+    probe-клапа не дропает катлист этого же видео."""
+    _patch_probe(monkeypatch, duration=20.0)
+    out_dir = tmp_path / "out"
+    cl = CutList(source="whatever.mp4", duration=21.7, segments=[_seg("keep")])
+    cl.audio_hash = "THISHASH"
+    _write_cutlist(out_dir, "лекция", cl)
+    video = tmp_path / "лекция.mp4"
+    video.write_bytes(b"x")
+    s = serve.Session(str(video), _cfg(tmp_path), str(out_dir), False)
+    assert s.cutlist is not None
+    assert any(seg.id == "keep" for seg in s.cutlist.segments)
+
+
+def test_rejected_cutlist_backed_up_not_lost(monkeypatch, tmp_path):
+    """W6 #1: отвергнутый гардом катлист переименовывается в .bak ДО того, как
+    ленивый фоновый _detect() перезапишет файл (fail-before: файл оставался под
+    живым именем и молча затирался — курация невосстановима)."""
+    _patch_probe(monkeypatch)
+    out_dir = tmp_path / "out"
+    cl = CutList(source="somewhere.mp4", duration=999.0, segments=[_seg()])
+    cl.audio_hash = "OTHER"                        # чужое видео
+    _write_cutlist(out_dir, "лекция", cl)
+    video = tmp_path / "лекция.mp4"
+    video.write_bytes(b"x")
+    s = serve.Session(str(video), _cfg(tmp_path), str(out_dir), False)
+    assert s.cutlist is None
+    assert (out_dir / "лекция.cutlist.json.bak").exists()
+    assert not (out_dir / "лекция.cutlist.json").exists()

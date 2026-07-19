@@ -188,11 +188,16 @@ init().catch((e) => {
 })
 
 async function init() {
-  bindFiles()
-  bindQueue()
-  bindPrivacy()
-  bindModels()
-  bindTabs()      // ДО ранних return'ов: таб-бар жив и кликабелен в пустой сессии
+  // Ретрай init() после сбоя /api/state НЕ должен вешать слушатели второй раз
+  // (двойной upload/queue-add, табы прыгают через один): bind* — строго однократно.
+  if (!st._bound) {
+    st._bound = true
+    bindFiles()
+    bindQueue()
+    bindPrivacy()
+    bindModels()
+    bindTabs()    // ДО ранних return'ов: таб-бар жив и кликабелен в пустой сессии
+  }
   checkHealth()   // A7: карточка «ffmpeg не найден» (не блокирует загрузку — fire-and-forget)
   let s
   try { const r = await fetch('/api/state'); if (!r.ok) throw new Error('HTTP ' + r.status); s = await r.json() }
@@ -2160,6 +2165,7 @@ function taskLost() {
   // Бэкенд умер/перезапустился в ходе задачи: гасим спиннер, разблокируем UI и
   // показываем sticky-тост с подсказкой вместо замершего навсегда прогресс-бара.
   if (es) { es.close(); es = null }
+  clearTimeout(st._sseWatch); st._sseWatch = 0
   st._sseErrs = 0
   $('#progress').classList.add('hidden'); $('#progress').classList.remove('indeterminate')
   setRunning(null)
@@ -2172,24 +2178,36 @@ function followTask(name) {
   if (es) es.close()
   st._sseErrs = 0
   es = new EventSource('/api/events')
-  es.onerror = () => {
-    // Разовые сбои — пусть EventSource переподключается сам. Но мёртвый/
-    // перезапущенный бэкенд даёт бесконечные ошибки переподключения (или первый
-    // reconnect ловит 409 и поток закрывается навсегда). После нескольких
-    // подряд ошибок пробуем /api/state: та же задача жива (ждём) vs задачи нет
-    // (восстанавливаем UI).
-    st._sseErrs = (st._sseErrs || 0) + 1
-    if (st._sseErrs < 3) return
+  // Единая проверка «жива ли задача»: та же задача идёт — ждём дальше; исчезла
+  // — taskLost(); завершилась в момент сбоя — переоткрыть /api/events (отдаст
+  // финальный снимок). Зовут её и счётчик ошибок ES, и сторож молчания ниже.
+  const probeTask = () => {
     st._sseErrs = 0
     fetch('/api/state').then((r) => r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status))).then((s) => {
       const t = s && s.task
-      if (s.no_session || !t || t.name !== name) { taskLost() }                 // сессия/задача исчезла
-      else if (t.running) { /* сервер жив, та же задача идёт — ES продолжит ретраи */ }
-      else { if (es) { es.close(); es = null }; followTask(name) }               // завершилась в момент сбоя → переоткрыть, /api/events отдаст финальный снимок
-    }).catch(() => taskLost())                                                  // сам /api/state недоступен → сервер лёг
+      if (s.no_session || !t || t.name !== name) { taskLost() }        // сессия/задача исчезла
+      else if (t.running) { armWatch() }                               // сервер жив, задача идёт — ждём
+      else { if (es) { es.close(); es = null }; clearTimeout(st._sseWatch); followTask(name) }
+    }).catch(() => taskLost())                                         // сам /api/state недоступен → сервер лёг
+  }
+  // Сторож молчания (20 с без message): фатально ЗАКРЫТЫЙ поток (reconnect
+  // словил не-200, например 409 после рестарта сервера — readyState=CLOSED,
+  // браузер больше НЕ ретраит) не даёт ни message, ни новых error — без
+  // таймера порог счётчика ошибок недостижим и UI зависал бы навсегда.
+  const armWatch = () => { clearTimeout(st._sseWatch); st._sseWatch = setTimeout(probeTask, 20000) }
+  armWatch()
+  es.onerror = () => {
+    // Разовые сбои — пусть EventSource переподключается сам; после нескольких
+    // подряд ошибок пробуем /api/state. Поток закрыт ФАТАЛЬНО (CLOSED) —
+    // onerror больше не повторится: пробуем сразу, не ждём порога.
+    st._sseErrs = (st._sseErrs || 0) + 1
+    if (es && es.readyState === EventSource.CLOSED) st._sseErrs = 3
+    if (st._sseErrs < 3) return
+    probeTask()
   }
   es.onmessage = (ev) => {
     st._sseErrs = 0
+    armWatch()
     let t; try { t = JSON.parse(ev.data) } catch { return }
     const pct = Math.max(0, Math.min(100, t.percent || 0))
     if (pct > 0) {
@@ -2212,6 +2230,7 @@ function followTask(name) {
     const label = t.stage || TASK_RU[t.name] || TASK_RU[name] || t.name || name || ''
     setProgress(pct, `${label} ${Math.round(pct)}%${eta}`)
     if (!t.running) {
+      clearTimeout(st._sseWatch); st._sseWatch = 0
       es.close(); es = null; $('#progress').classList.add('hidden'); $('#progress').classList.remove('indeterminate')
       setRunning(null)
       if (t.error) {
@@ -3484,14 +3503,23 @@ const ENR_INTENT_RU = {
 function enrichVisual(it) {
   const p = it.payload || {}
   if (Array.isArray(p.candidates) && p.candidates.length) {
-    const cands = p.candidates.filter((c) => c && (c.preview || c.asset_path))
+    // Кандидатов без готового ассета фильтруем, но ПОМНИМ их исходные индексы
+    // (orig_indices): p.selected и POST /api/enrich/select живут в индексах
+    // НЕфильтрованного серверного массива (в нём всегда есть none-кандидат без
+    // превью) — слать/читать фильтрованный индекс = молча выбрать соседа.
+    const cands = []
+    const origIdx = []
+    p.candidates.forEach((c, i) => { if (c && (c.preview || c.asset_path)) { cands.push(c); origIdx.push(i) } })
     const want = Number.isInteger(p.selected) ? p.selected : 0
-    const sel = Math.max(0, Math.min(want, Math.max(0, cands.length - 1)))
+    // Серверный индекс → локальный; если выбранный сервером кандидат без
+    // ассета (отфильтрован) — подсвечиваем первый доступный.
+    const sel = Math.max(0, origIdx.indexOf(want))
     const chosenC = cands[sel] || {}
     return {
       source: chosenC.source || p.source || 'none',
       intent: chosenC.intent || p.intent || null,
       candidates: cands,
+      orig_indices: origIdx,
       chosen: sel,
       schematic_style: chosenC.style || p.schematic_style || null,
     }
@@ -3505,7 +3533,7 @@ function enrichVisual(it) {
   if (p.asset_path && (p.asset_kind === 'generate' || p.asset_kind === 'user')) {
     cands.push({ source, preview: p.asset_path })
   }
-  return { source, intent: null, candidates: cands, chosen: 0, schematic_style: p.schematic_style || null }
+  return { source, intent: null, candidates: cands, orig_indices: cands.map((_, i) => i), chosen: 0, schematic_style: p.schematic_style || null }
 }
 
 // Превью-URL кандидата → src для <img>. Бэкенд кладёт относительное имя ассета,
@@ -3635,16 +3663,25 @@ async function enrichChooseCandidate(id, idx) {
   const it = enrichLocal(id); if (!it) return
   const v = enrichVisual(it)
   if (idx < 0 || idx >= v.candidates.length || idx === v.chosen) return
-  const prevSel = Number.isInteger(it.payload && it.payload.selected) ? it.payload.selected : v.chosen
-  it.payload = { ...(it.payload || {}), selected: idx }
+  // idx — индекс в ФИЛЬТРОВАННОМ стрипе; серверу и payload.selected нужен
+  // индекс исходного массива кандидатов (orig_indices — карта соответствия).
+  const srvIdx = (v.orig_indices && Number.isInteger(v.orig_indices[idx])) ? v.orig_indices[idx] : idx
+  const prevSel = Number.isInteger(it.payload && it.payload.selected) ? it.payload.selected
+    : ((v.orig_indices && Number.isInteger(v.orig_indices[v.chosen])) ? v.orig_indices[v.chosen] : v.chosen)
+  it.payload = { ...(it.payload || {}), selected: srvIdx }
   // Стрип следует за выбором (окно прокрутки центрируется на выбранном).
   st.enrichCandPage[id] = Math.max(0, Math.min(idx, Math.max(0, v.candidates.length - 2)))
   renderEnrich({ silent: true })
+  // Сериализация с debounce-сохранением правок: недописанные правки уходят
+  // ПЕРЕД select, иначе два конкурентных load-modify-write enrich.json на
+  // сервере молча затирают друг друга (lost update: откат выбора или потеря
+  // правки текста).
+  if (enrSaveTimer || enrPending.size) { clearTimeout(enrSaveTimer); enrSaveTimer = 0; await enrichFlushSave() }
   let res
   try {
     res = await fetch('/api/enrich/select', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id, idx }),
+      body: JSON.stringify({ id, idx: srvIdx }),
     })
   } catch (e) {
     it.payload = { ...(it.payload || {}), selected: prevSel }
@@ -3661,8 +3698,10 @@ async function enrichChooseCandidate(id, idx) {
   let j; try { j = await res.json() } catch { j = null }
   if (j && Number.isInteger(j.selected)) it.payload.selected = j.selected
   if (j && j.source) it.payload.source = j.source
-  // Полный GET — плоские поля/статусы соседей станут консистентны.
-  loadEnrichFromCache()
+  // Полный GET — плоские поля/статусы соседей станут консистентны. Но если за
+  // время select появились НОВЫЕ несохранённые правки — не перерисовываем
+  // устаревшим снимком (снесло бы фокус/ввод юзера); их flush сам дообновит.
+  if (!enrPending.size && !enrSaveTimer) loadEnrichFromCache()
 }
 
 // Кнопки смены СТИЛЯ схемы (§2.4: minimal/neon/business/whiteboard). Выбор темы =
@@ -4055,15 +4094,16 @@ function enrichToggleUserFolder() {
   $('#enGenInfoRow').classList.toggle('hidden', !(usesGen && st.imagegenReady))
   $('#enGenWarnRow').classList.toggle('hidden', !(usesGen && !st.imagegenReady))
 }
-// Свести V2-источники к легаси image_source для текущего бэкенда (он ещё не знает
-// про sources). auto→"auto"; только сток→"user_folder"; иначе разрешена генерация
-// →"generate"; ничего из картиночных движков → "emoji"-эквивалент НЕ шлём (его
-// больше нет) — отдаём "auto" и полагаемся на роутер/честный none. См. отчёт.
+// Свести V2-источники к легаси image_source — ЕДИНСТВЕННОМУ ключу, который
+// сервер реально белосписочит (_sanitize_enrich_opts: auto/emoji/user_folder/
+// generate; ключ sources он игнорирует). Критично: выключенные «Фото-сцены
+// (ИИ)» ОБЯЗАНЫ давать значение без SD (emoji/user_folder), иначе сервер
+// запустит генерацию (~4 ГБ модель, минуты GPU) вопреки явному запрету юзера.
+// Схемы image_source не гейтит — schematic-кандидаты строятся при любом значении.
 function enrichLegacyImageSource(s) {
-  if (s.auto) return 'auto'
-  if (s.stock && !s.schematic && !s.diffusion) return 'user_folder'
-  if (s.diffusion) return 'generate'
-  return 'auto'
+  if (!s.diffusion) return s.stock ? 'user_folder' : 'emoji'
+  if (s.auto || s.stock) return 'auto'
+  return 'generate'
 }
 function openEnrichModal() {
   if (!st.hasSession) return

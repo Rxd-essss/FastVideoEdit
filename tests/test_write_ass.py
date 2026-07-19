@@ -165,8 +165,9 @@ def test_write_ass_karaoke_colors_in_style(tmp_path):
 
 
 def test_ass_size_scales_with_playres(tmp_path):
-    # Presets are defined @1080; write_ass scales Fontsize/MarginV by PlayResY/1080
-    # so a style holds a constant fraction of frame height across resolutions.
+    # Presets are defined @1080; write_ass scales Fontsize/MarginV by the SHORT
+    # side (min(PlayResX, PlayResY)/1080): 4K doubles, while the hand-tuned
+    # vertical 1080x1920 Shorts frame keeps k=1 (W6 #4).
     st = AssStyleCfg(size=52, margin_v=40)
 
     def _style_fields(pr):
@@ -179,8 +180,14 @@ def test_ass_size_scales_with_playres(tmp_path):
     f1080 = _style_fields((1920, 1080))
     assert f1080[2] == "52"                    # k=1.0 -> unchanged @1080
     assert f1080[-2] == "40"                   # MarginV unchanged @1080
-    f2160 = _style_fields((1920, 2160))
-    assert f2160[2] == "104"                   # 52 * 2.0 (k=2.0)
-    assert f2160[-2] == "80"                   # 40 * 2.0
+    f4k = _style_fields((3840, 2160))
+    assert f4k[2] == "104"                     # 52 * 2.0 (k = min side / 1080)
+    assert f4k[-2] == "80"                     # 40 * 2.0
     f720 = _style_fields((1280, 720))
     assert f720[2] == "35"                     # round(52 * 0.6667)
+    # W6 #4: portrait 9:16 scales by the SHORT side -> k=1.0, NOT 1.78 — the
+    # presets were tuned against the 1080-wide Shorts frame; pr_y/1080 blew the
+    # fonts past the 42-char wrap budget and overflowed the frame width.
+    fvert = _style_fields((1080, 1920))
+    assert fvert[2] == "52"
+    assert fvert[-2] == "40"
