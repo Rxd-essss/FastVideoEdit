@@ -13,6 +13,8 @@ Run the real tier locally with:
 """
 import os
 import shutil
+import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -34,15 +36,20 @@ requires_ffmpeg = pytest.mark.skipif(
     reason="set FVE_FFMPEG_TESTS=1 with ffmpeg on PATH to run the integration tier")
 
 
-# Emoji rasterisation needs a COLOUR-emoji font (Segoe UI Emoji on desktop
-# Windows). CI runners -- Linux and Windows Server alike -- ship none, so those
-# tests skip there while still running on the dev's real machine. Production
-# already degrades cleanly (emoji_png_path -> None -> overlay dropped).
-def _has_emoji_font() -> bool:
-    from vpipe.enrich import _emoji_font_path
-    return _emoji_font_path() is not None
+# Emoji rasterisation needs a COLOUR-emoji glyph to actually render. This probes
+# the real capability, not just a font FILE: Linux CI ships no emoji font, and
+# Windows Server ships seguiemj.ttf yet Pillow still yields an EMPTY glyph there
+# (no usable COLR/CBDT) -- both must skip. The dev's desktop Windows renders it,
+# so the tests still run for real there. Prod already degrades (path -> None).
+def can_rasterize_emoji() -> bool:
+    from vpipe.enrich import emoji_png_path
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            return emoji_png_path("u26a1", Path(d)) is not None
+    except Exception:  # noqa: BLE001 — any failure = capability absent
+        return False
 
 
 requires_emoji_font = pytest.mark.skipif(
-    not _has_emoji_font(),
-    reason="no colour-emoji font on this host (CI) — glyph rasterisation unavailable")
+    not can_rasterize_emoji(),
+    reason="colour-emoji glyph does not rasterise on this host (CI) — feature unavailable")

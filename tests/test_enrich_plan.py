@@ -382,10 +382,12 @@ def test_emoji_png_path_interface(tmp_path):
     p.write_bytes(b"png")
     assert enrich.emoji_png_path("u26a1", cache) == p
     # валидный noto-кодпойнт без кэша -> растеризуется в НЕпустой PNG (P5).
-    # Растеризация нуждается в цветном emoji-шрифте (нет на CI) — только там,
-    # где он есть; логика выше (None/кэш-хит) проверяется на любой машине.
-    if enrich._emoji_font_path() is None:
-        pytest.skip("no colour-emoji font on this host (CI) — rasterisation unavailable")
+    # Растеризация нуждается в РАБОЧЕМ цветном emoji-глифе (нет на CI — ни файла
+    # на Linux, ни живого COLR на Windows Server); логика выше (None/кэш-хит)
+    # проверяется на любой машине.
+    from conftest import can_rasterize_emoji
+    if not can_rasterize_emoji():
+        pytest.skip("colour-emoji glyph does not rasterise on this host (CI)")
     p2 = enrich.emoji_png_path("u1f5c3", cache)
     assert p2 is not None and p2.is_file() and p2.stat().st_size > 0
 
