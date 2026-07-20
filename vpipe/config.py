@@ -350,6 +350,30 @@ class CodegfxCfg(_Base):
     codegfx_size: str = "1920x1080"        # канвас рендера, «WxH»
 
 
+class VisionRouteCfg(_Base):
+    """Vision-роутер монтажа («variant C»): локальная VLM СМОТРИТ реальные кадры
+    момента и ветит/переназначает предложенный текстовым планировщиком визуал —
+    убивает «слоп» (схема поверх говорящей головы ИЛИ поверх уже-визуального
+    экрана: скринкаст/вайтборд/код). Своя VRAM-фаза (после текстовых детекторов,
+    до SD) — на 8 ГБ модели идут строго последовательно.
+
+    Opt-in: ``enabled`` дефолт ВЫКЛ — стадия меняет решения монтажа, поэтому не
+    включается без явного согласия («главное — ничего не сломать»). Недоступная
+    Ollama / нескачанная модель → стадия честно пропускается (монтаж не падает).
+    ``model`` — qwen3-vl:4b-instruct (Q4 ~3.3 ГБ, влезает в 8 ГБ с запасом; есть
+    2b дешевле и 8b качественнее). ``frames`` — сколько кадров момента показать
+    (t-1c / t+0.5c / t+2c). ``reroute`` — не только вето, но и смена kind среди
+    УЖЕ найденных планировщиком кандидатов (никогда не выдумывает ассет).
+    ``min_confidence`` — порог доверия вердикту (0 = доверять всем)."""
+    enabled: bool = False
+    model: str = "qwen3-vl:4b-instruct"
+    frames: int = 3                        # кадров на момент (1..5)
+    frame_size: int = 512                  # длинная сторона кадра, px (меньше = быстрее)
+    reroute: bool = True                   # вето + смена kind (False = только вето)
+    min_confidence: int = 0                # 0..100; вердикт ниже — игнорируем
+    timeout_s: int = 90                    # на один вердикт (cold-load первого ~45с)
+
+
 class RenderCfg(_Base):
     encoder: str = "nvenc"
     nvenc: NvencCfg = Field(default_factory=NvencCfg)
@@ -362,6 +386,7 @@ class RenderCfg(_Base):
     enrich: EnrichRenderCfg = Field(default_factory=EnrichRenderCfg)
     imagegen: ImageGenCfg = Field(default_factory=ImageGenCfg)
     codegfx: CodegfxCfg = Field(default_factory=CodegfxCfg)
+    vision_route: VisionRouteCfg = Field(default_factory=VisionRouteCfg)
     # Smoothing at every cut seam. Without it the kept audio segments are
     # hard-concatenated and each join is a waveform discontinuity → an audible
     # click and an overall "choppy" feel. A short equal-length fade-out/fade-in

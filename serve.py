@@ -74,6 +74,7 @@ from vpipe import metadata as metadata_mod
 from vpipe import netguard
 from vpipe import render as render_mod
 from vpipe import subtitles as subs_mod
+from vpipe import vision_route as vision_route_mod
 from vpipe.config import (Config, load_config, load_fillers, load_profanity)
 from vpipe.cutlist import resolve, save_txt
 from vpipe.export_nle import write_edl, write_fcpxml
@@ -3871,6 +3872,53 @@ def _wait_ollama_unloaded(s: Session, log, *, tries: int = 20,
         "продолжаю (sd-cli с --max-vram).")
 
 
+def _run_vision_route(s: Session, items: list, params: dict, log) -> Optional[dict]:
+    """Vision-route (МОНТАЖ variant C, opt-in): показать VLM реальные кадры
+    каждого визуального кандидата и заветить/переназначить «слоп» (схема поверх
+    лица ИЛИ поверх уже-визуального экрана). Своя VRAM-фаза: выгружаем текстовую
+    LLM → занимаем слот vision-моделью → судим → выгружаем VLM (перед SD-этапом).
+
+    Выключено по умолчанию (render.vision_route.enabled=false — не меняем монтаж
+    без спроса). Недоступная Ollama / нескачанная модель / сбой → тихий пропуск:
+    стадия best-effort, монтаж никогда здесь не падает. Возврат — stats или None
+    (стадия не запускалась)."""
+    vr = getattr(s.cfg.render, "vision_route", None)
+    if vr is None or not getattr(vr, "enabled", False):
+        return None
+    targets = [it for it in items
+               if getattr(it, "type", "") in vision_route_mod.VISUAL_TYPES
+               and getattr(it, "enabled", True)]
+    if not targets:
+        return None
+    # VRAM (§2): сначала освободить текстовую модель, затем занять слот VLM.
+    _wait_ollama_unloaded(s, log)
+    vcfg = s.cfg.llm.model_copy(update={
+        "model": vr.model, "timeout": int(vr.timeout_s), "num_ctx": 8192,
+        "think": False, "keep_alive": 0, "temperature": 0.0})
+    vclient = get_client(vcfg)
+    if vclient is None or not vclient.available():
+        log("  vision-route: Ollama недоступна — стадия пропущена")
+        return None
+    if not vclient.has_model(vr.model):
+        log(f"  vision-route: модель {vr.model} не установлена — стадия "
+            f"пропущена (ollama pull {vr.model})")
+        return None
+    s.stage(f"Монтаж: vision-роутер ({len(targets)} кандидатов)…")
+    stats = None
+    try:
+        stats = vision_route_mod.route(
+            items, s.inp, s.ff.ffmpeg, vclient, vr, log=log,
+            on_progress=s.set_progress)
+    except Exception as e:  # noqa: BLE001 — best-effort: не валим монтаж
+        log(f"  vision-route: стадия упала ({e}) — продолжаю без неё")
+    finally:
+        try:
+            vclient.unload(vr.model)          # освободить VRAM перед SD-этапом
+        except Exception:  # noqa: BLE001
+            pass
+    return stats
+
+
 def _codegfx_cache_path(cache_root: Path, intent: str, style: str,
                         fields: dict) -> Path:
     """Детерминированный путь PNG код-схемы: cache/codegfx/<sha1>.png (intent+
@@ -4101,6 +4149,10 @@ def enrich_suggest(body: dict = Body(default={})):
     def run():
         s.stage("Монтаж: анализ…")
         items = _run_enrich_detectors(s, opts, log=s.stage)
+        # Vision-route (variant C, opt-in): VLM смотрит реальные кадры и ветит/
+        # переназначает «слоп» ДО дорогой генерации ассетов. Своя VRAM-фаза
+        # (выгрузит текстовую LLM, отсудит, выгрузит VLM). Выкл по умолчанию.
+        _run_vision_route(s, items, params, log=s.stage)
         # Этап images (ТРЕК-2 §2): SD-генерация для точек asset_kind="generate".
         # ПОСЛЕ детекторов (VRAM-менеджер выгрузит Ollama), ДО мержа/планировщика:
         # генерим только свежие точки детектора, мерж затем хранит ревью юзера.

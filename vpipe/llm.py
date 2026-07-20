@@ -110,7 +110,8 @@ class OllamaClient:
                 if m.get("name")]
 
     def _build_payload(self, system: str, user: str, schema: dict,
-                       temperature: float, keep_alive=None) -> dict:
+                       temperature: float, keep_alive=None,
+                       images: Optional[list] = None) -> dict:
         # qwen3 (and other reasoning models) otherwise emit a <think>...</think>
         # block that consumes the whole context/output budget on structured
         # calls. Disable it both ways: the top-level "think" flag (newer Ollama)
@@ -119,10 +120,14 @@ class OllamaClient:
             sys_prompt = system
         else:
             sys_prompt = system.rstrip() + " /no_think"
+        # Vision models take base64 frames in the user message's ``images`` array
+        # (Ollama /api/chat). Absent -> a plain text call, unchanged.
+        user_msg = {"role": "user", "content": user}
+        if images:
+            user_msg["images"] = list(images)
         payload = {
             "model": self.cfg.model,
-            "messages": [{"role": "system", "content": sys_prompt},
-                         {"role": "user", "content": user}],
+            "messages": [{"role": "system", "content": sys_prompt}, user_msg],
             "stream": False,
             "format": schema,
             "think": bool(getattr(self.cfg, "think", False)),
@@ -185,20 +190,22 @@ class OllamaClient:
             # this opener didn't yield a parseable object — try the next "{"
             search_from = start + 1
 
-    def chat_json(self, system: str, user: str, schema: dict, keep_alive=None) -> dict:
+    def chat_json(self, system: str, user: str, schema: dict, keep_alive=None,
+                  images: Optional[list] = None) -> dict:
         """One-shot chat that must return JSON validating against ``schema``.
 
         Retries once (at temperature 0) on a parse miss, and tries to salvage a
         balanced ``{...}`` substring before giving up. Transport failures raise
         ``LLMUnavailable`` so callers can fall back gracefully. ``keep_alive``
         overrides the config default for this call (e.g. keep the model warm
-        between chapter windows, then unload on the last one).
+        between chapter windows, then unload on the last one). ``images`` (list
+        of base64 strings) turns this into a vision call for a VLM model.
         """
         last_content = ""
         for attempt in range(2):
             temperature = self.cfg.temperature if attempt == 0 else 0.0
             payload = self._build_payload(system, user, schema, temperature,
-                                          keep_alive=keep_alive)
+                                          keep_alive=keep_alive, images=images)
             try:
                 resp = self._post("/api/chat", payload)
             except (urllib.error.URLError, TimeoutError, OSError) as e:
