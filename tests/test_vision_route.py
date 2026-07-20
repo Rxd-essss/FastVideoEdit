@@ -81,8 +81,8 @@ def test_veto_disables_item_with_note():
     stats = vr.route([it], "v.mp4", "ffmpeg", client, _cfg())
     assert it.enabled is False
     assert "vision:" in it.status_note and "talking_head" in it.status_note
-    assert stats == {"judged": 1, "veto": 1, "reroute": 0, "keep": 0,
-                     "skipped": 0, "error": 0}
+    assert stats == {"judged": 1, "veto": 1, "convert": 0, "reroute": 0,
+                     "keep": 0, "skipped": 0, "error": 0}
 
 
 def test_insert_true_but_kind_none_is_a_veto():
@@ -130,6 +130,68 @@ def test_reroute_off_only_vetoes():
                       "reason": "фото"})
     vr.route([it], "v.mp4", "ffmpeg", client, _cfg(reroute=False))
     assert it.payload.selected == 0                 # no switch when reroute off
+
+
+# --- cross-type image -> list_card (variant γ) -------------------------------
+def _card_factory_stub(calls):
+    def factory(item, title, bullets):
+        calls.append((title, list(bullets)))
+        item.type = "list_card"            # emulate the real swap
+        item.payload = SimpleNamespace(title=title, items=bullets)
+        return True
+    return factory
+
+
+def test_convert_image_to_list_card_when_vlm_asks():
+    it = _img_item([{"source": "schematic"}])
+    client = FakeVLM({"scene": "screen_share", "insert": True,
+                      "kind": "list_card",
+                      "card": {"title": "Windows vs Linux",
+                               "items": ["реестр HKEY_*", "/etc файлы",
+                                         "winget upgrade --all"]},
+                      "reason": "лучше списком"})
+    calls = []
+    stats = vr.route([it], "v.mp4", "ffmpeg", client, _cfg(),
+                     card_factory=_card_factory_stub(calls))
+    assert it.type == "list_card"                    # cross-type conversion fired
+    assert calls == [("Windows vs Linux",
+                      ["реестр HKEY_*", "/etc файлы", "winget upgrade --all"])]
+    assert stats["convert"] == 1 and stats["veto"] == 0 and stats["reroute"] == 0
+
+
+def test_convert_needs_valid_card_else_keeps():
+    # kind=list_card but card missing/too few bullets -> no conversion, keep
+    it = _img_item([{"source": "schematic"}])
+    client = FakeVLM({"scene": "screen_share", "insert": True,
+                      "kind": "list_card", "card": {"title": "x", "items": ["one"]},
+                      "reason": "..."})
+    calls = []
+    stats = vr.route([it], "v.mp4", "ffmpeg", client, _cfg(),
+                     card_factory=_card_factory_stub(calls))
+    assert it.type == "image" and calls == []        # not enough bullets -> untouched
+    assert stats["convert"] == 0 and stats["keep"] == 1
+
+
+def test_convert_skipped_without_factory():
+    # no card_factory -> falls back to candidate reroute (none matches) -> keep
+    it = _img_item([{"source": "schematic"}])
+    client = FakeVLM({"scene": "screen_share", "insert": True,
+                      "kind": "list_card",
+                      "card": {"title": "t", "items": ["a", "b"]}, "reason": ""})
+    stats = vr.route([it], "v.mp4", "ffmpeg", client, _cfg())  # no factory
+    assert it.type == "image" and stats["keep"] == 1
+
+
+def test_valid_card_helper():
+    assert vr._valid_card({"card": {"title": "T", "items": ["a", "b"]}}) == \
+        ("T", ["a", "b"])
+    assert vr._valid_card({"card": {"title": "", "items": ["a", "b"]}}) is None
+    assert vr._valid_card({"card": {"title": "T", "items": ["only"]}}) is None
+    assert vr._valid_card({"kind": "diagram"}) is None       # no card key
+    # caps to 4 bullets
+    got = vr._valid_card({"card": {"title": "T",
+                                   "items": ["1", "2", "3", "4", "5", "6"]}})
+    assert got is not None and len(got[1]) == 4
 
 
 def test_list_card_is_veto_only():

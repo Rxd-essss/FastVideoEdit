@@ -58,6 +58,16 @@ VERDICT_SCHEMA = {
                  "enum": ["diagram", "image", "list_card", "none"]},
         "confidence": {"type": "integer", "minimum": 0, "maximum": 100},
         "reason": {"type": "string"},
+        # Заполняется ТОЛЬКО когда kind=list_card: заголовок + 2-4 пункта,
+        # дословно по смыслу кадра/реплики (кросс-тип image→list_card без SD).
+        "card": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "items": {"type": "array", "items": {"type": "string"},
+                          "minItems": 2, "maxItems": 4},
+            },
+        },
     },
     "required": ["scene", "insert", "kind", "reason"],
 }
@@ -76,6 +86,9 @@ SYSTEM = (
     "которую он поясняет, а на экране её нет) — insert=true и выбери подходящий "
     "kind: diagram (схема/структура), image (фото/иллюстрация), list_card "
     "(список пунктов), либо none если ничего не подходит.\n"
+    "4. Если выбрал kind=list_card — ОБЯЗАТЕЛЬНО заполни поле card: title (ёмкий "
+    "заголовок) и items (2-4 коротких пункта) СТРОГО по смыслу кадра и реплики "
+    "(реальные слова/факты с экрана, не вода).\n"
     "Отвечай СТРОГО одним JSON-объектом по схеме."
 )
 
@@ -161,9 +174,28 @@ def _reroute_image(item, kind: str) -> Optional[str]:
     return None
 
 
-def _apply(item, v: dict, *, reroute: bool, min_conf: int) -> str:
+def _valid_card(v: dict) -> Optional[tuple]:
+    """Extract (title, bullets) from a verdict's ``card`` if it's usable for a
+    cross-type image→list_card conversion (title + ≥2 non-empty bullets)."""
+    card = v.get("card")
+    if not isinstance(card, dict):
+        return None
+    title = str(card.get("title", "")).strip()
+    bullets = [str(x).strip() for x in (card.get("items") or [])
+               if isinstance(x, (str, int, float)) and str(x).strip()]
+    if title and len(bullets) >= 2:
+        return title, bullets[:4]
+    return None
+
+
+def _apply(item, v: dict, *, reroute: bool, min_conf: int,
+           card_factory=None) -> str:
     """Apply one verdict to one item in place. Returns a short outcome tag:
-    keep / veto / reroute:<src> / low_conf / noop."""
+    keep / veto / convert:list_card / reroute:<src> / low_conf / noop.
+
+    ``card_factory(item, title, bullets) -> bool`` (optional) performs the
+    enrich-specific image→list_card mutation; kept as an injected callback so
+    this module stays decoupled from the enrich payload types."""
     conf = v.get("confidence")
     if isinstance(conf, int) and conf < int(min_conf):
         return "low_conf"                        # not confident enough to act
@@ -177,7 +209,13 @@ def _apply(item, v: dict, *, reroute: bool, min_conf: int) -> str:
         return "veto"
     if insert is True:
         if reroute and getattr(item, "type", "") == "image":
-            newsrc = _reroute_image(item, kind)
+            # Кросс-тип: схема/картинка → текстовая карточка-список (без SD).
+            if kind == "list_card" and card_factory is not None:
+                card = _valid_card(v)
+                if card and card_factory(item, card[0], card[1]):
+                    item.status_note = f"vision→list_card: {scene}"
+                    return "convert:list_card"
+            newsrc = _reroute_image(item, kind)  # switch among existing candidates
             if newsrc:
                 item.status_note = f"vision→{kind}: {scene}"
                 return f"reroute:{newsrc}"
@@ -187,16 +225,18 @@ def _apply(item, v: dict, *, reroute: bool, min_conf: int) -> str:
 
 def route(items: list, video, ffmpeg_bin: str, client, cfg,
           log: LogFn = _noop,
-          on_progress: Optional[Callable[[int, int], None]] = None) -> dict:
+          on_progress: Optional[Callable[[int, int], None]] = None,
+          card_factory=None) -> dict:
     """Judge each enabled visual candidate against real frames and apply the
     verdict in place. ``client`` is a ready OllamaClient bound to the vision
-    model. ``cfg`` is a VisionRouteCfg. Returns stats
-    ``{judged, veto, reroute, keep, skipped, error}``.
+    model. ``cfg`` is a VisionRouteCfg. ``card_factory(item, title, bullets)``
+    (optional) does the enrich-specific image→list_card mutation. Returns stats
+    ``{judged, veto, convert, reroute, keep, skipped, error}``.
 
     Best-effort throughout: any per-item failure (no frames, transport error,
     parse miss) increments ``error`` and leaves the item untouched.
     """
-    stats = {"judged": 0, "veto": 0, "reroute": 0, "keep": 0,
+    stats = {"judged": 0, "veto": 0, "convert": 0, "reroute": 0, "keep": 0,
              "skipped": 0, "error": 0}
     video = Path(video)
     targets = [it for it in items
@@ -230,9 +270,12 @@ def route(items: list, video, ffmpeg_bin: str, client, cfg,
             continue
         stats["judged"] += 1
         outcome = _apply(it, v, reroute=bool(cfg.reroute),
-                         min_conf=int(cfg.min_confidence))
+                         min_conf=int(cfg.min_confidence),
+                         card_factory=card_factory)
         if outcome == "veto":
             stats["veto"] += 1
+        elif outcome.startswith("convert"):
+            stats["convert"] += 1
         elif outcome.startswith("reroute"):
             stats["reroute"] += 1
         elif outcome == "keep":
@@ -243,6 +286,7 @@ def route(items: list, video, ffmpeg_bin: str, client, cfg,
         except Exception:  # noqa: BLE001
             pass
     log(f"  vision-route: судил {stats['judged']}, вето {stats['veto']}, "
-        f"пере-роут {stats['reroute']}, оставил {stats['keep']}, "
-        f"без кадров {stats['skipped']}, ошибок {stats['error']}")
+        f"→карточка {stats['convert']}, пере-роут {stats['reroute']}, "
+        f"оставил {stats['keep']}, без кадров {stats['skipped']}, "
+        f"ошибок {stats['error']}")
     return stats

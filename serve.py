@@ -3903,12 +3903,31 @@ def _run_vision_route(s: Session, items: list, params: dict, log) -> Optional[di
         log(f"  vision-route: модель {vr.model} не установлена — стадия "
             f"пропущена (ollama pull {vr.model})")
         return None
+    def _card_factory(it, title: str, bullets: list) -> bool:
+        """Кросс-тип image→list_card: заменяем payload картинки на карточку-список
+        из title+bullets, что VLM собрал по кадру. t_word пунктов размазан по
+        [t_start,t_end] — пункты проявляются последовательно, как у обычных
+        list_card. Меняем и type айтема; остальной пайплайн рисует его нативно."""
+        t0 = float(getattr(it, "t_start", 0.0) or 0.0)
+        t1 = float(getattr(it, "t_end", t0) or t0)
+        span = max(0.0, t1 - t0)
+        n = max(1, len(bullets))
+        cards = [enrich_mod.CardItem(
+            text=str(b).strip()[:enrich_mod.CARD_ITEM_TEXT_MAX],
+            word_idx=int(getattr(it, "word_start", -1) or -1),
+            t_word=max(0.0, t0 + (span * i / n if n > 1 else 0.0)))
+            for i, b in enumerate(bullets)]
+        it.payload = enrich_mod.ListCardPayload(
+            title=str(title).strip()[:80], items=cards)
+        it.type = enrich_mod.ENR_LIST_CARD
+        return True
+
     s.stage(f"Монтаж: vision-роутер ({len(targets)} кандидатов)…")
     stats = None
     try:
         stats = vision_route_mod.route(
             items, s.inp, s.ff.ffmpeg, vclient, vr, log=log,
-            on_progress=s.set_progress)
+            on_progress=s.set_progress, card_factory=_card_factory)
     except Exception as e:  # noqa: BLE001 — best-effort: не валим монтаж
         log(f"  vision-route: стадия упала ({e}) — продолжаю без неё")
     finally:
