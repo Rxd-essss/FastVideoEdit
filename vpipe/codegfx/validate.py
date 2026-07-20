@@ -25,6 +25,7 @@ from typing import Any, Optional
 # --- лимиты (анти-слоп, числа в КОДЕ — §8) ----------------------------------
 MAX_ROWS = 6          # compare rows / list items / process steps / timeline / tree nodes / map points
 MAX_STATS = 4         # stat: не больше 4 крупных чисел в ряд (вёрстка)
+_HAS_DIGIT = re.compile(r"\d")   # stat.value обязан содержать цифру (см. _b_stat)
 MAX_COLS = 2          # compare: ровно 2 колонки (Linux vs Windows)
 TEXT_MAX = 200        # потолок любой строки (зеркало enrich.CAND_TEXT_MAX)
 CODE_MAX = 1200       # код длиннее — обрезаем (терминал-карточка не безразмерна)
@@ -99,7 +100,11 @@ def _b_stat(f: dict) -> Optional[dict]:
         s = _as_dict(s)
         val = _txt(s.get("value"))
         lab = _txt(s.get("label"))
-        if not val:                        # число обязательно
+        # «Число обязательно» — теперь ПО-НАСТОЯЩЕМУ: value без единой цифры
+        # ("половина", "две три", "на треть быстрее") — это НЕ стат, а слоп
+        # (LLM игнорирует запрет «только числа»); дропаем, чтобы stat-карточка
+        # не показывала псевдо-числа. Пустой value — тоже мимо.
+        if not val or not _HAS_DIGIT.search(val):
             continue
         st = {"value": val, "label": lab}
         unit = _txt(s.get("unit"), 8)

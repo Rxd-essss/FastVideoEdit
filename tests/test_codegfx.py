@@ -139,6 +139,26 @@ def test_stat_requires_a_value():
     assert good["bar"] == 96                      # «96%» → int 96
 
 
+def test_stat_rejects_non_numeric_value():
+    # value без единой цифры — это слоп («половина», «две три»), не число: дроп.
+    assert cv.build_payload("stat", {"stats": [{"value": "половина",
+                                                "label": "рынка"}]},
+                            "minimal") is None
+    assert cv.build_payload("stat", {"stats": [{"value": "две три"},
+                                               {"value": "десятками"}]},
+                            "minimal") is None
+    # смесь: мусор дропается, число выживает
+    out = cv.build_payload("stat", {"stats": [{"value": "половина"},
+                                              {"value": "21 процент",
+                                               "label": "прирост"}]}, "minimal")
+    assert out is not None and len(out["stats"]) == 1
+    assert out["stats"][0]["value"] == "21 процент"     # цифра есть → валидно
+    # число с суффиксом/символом тоже валидно
+    for good in ("90%", "2017", "~2000", "11 000", "3.5×"):
+        o = cv.build_payload("stat", {"stats": [{"value": good}]}, "minimal")
+        assert o is not None and o["stats"][0]["value"] == good
+
+
 def test_stat_caps_to_four():
     f = {"stats": [{"value": str(i)} for i in range(10)]}
     out = cv.build_payload("stat", f, "minimal")
