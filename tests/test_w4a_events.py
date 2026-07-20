@@ -23,6 +23,9 @@ from vpipe.config import load_config                      # noqa: E402
 
 
 def _patch_probe(monkeypatch, audio_hash="EVHASH", duration=20.0):
+    # Session.__init__ builds a real FFmpeg (resolves the binary eagerly) — stub
+    # it so the ctor is hermetic and runs on CI where no ffmpeg is installed.
+    monkeypatch.setattr(serve, "FFmpeg", lambda *a, **k: SimpleNamespace())
     monkeypatch.setattr(serve, "hash_input", lambda *a, **k: audio_hash)
     monkeypatch.setattr(serve, "probe_media",
                         lambda *a, **k: SimpleNamespace(

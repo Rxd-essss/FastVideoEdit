@@ -32,7 +32,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import serve
-from conftest import requires_ffmpeg
+from conftest import requires_emoji_font, requires_ffmpeg
 from vpipe import enrich as enrich_mod
 from vpipe import enrich_llm
 from vpipe.enrich import emoji_png_path
@@ -72,6 +72,7 @@ def _nonzero_alpha(path: Path) -> int:
     return sum(1 for px in img.split()[3].get_flattened_data() if px > 0)
 
 
+@requires_emoji_font
 def test_emoji_rasterizes_nonempty_png_with_transparency(tmp_path):
     p = emoji_png_path("u26a1", tmp_path)              # ⚡
     assert p is not None and p.is_file()
@@ -86,6 +87,7 @@ def test_emoji_rasterizes_nonempty_png_with_transparency(tmp_path):
     assert _nonzero_alpha(p) > 1000
 
 
+@requires_emoji_font
 def test_emoji_cache_idempotent_no_rewrite(tmp_path):
     p1 = emoji_png_path("u1f5c3", tmp_path)            # 🗃
     assert p1 is not None
@@ -96,6 +98,7 @@ def test_emoji_cache_idempotent_no_rewrite(tmp_path):
     assert not p1.with_suffix(".png.tmp").exists()     # .tmp прибран
 
 
+@requires_emoji_font
 def test_emoji_multi_codepoint_flag(tmp_path):
     # имя из нескольких кодпойнтов через «_» (флаг 🇺🇸) — оба разворачиваются
     p = emoji_png_path("u1f1fa_u1f1f8", tmp_path)

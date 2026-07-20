@@ -7,6 +7,7 @@
 """
 import json
 import math
+import os
 
 import pytest
 
@@ -16,6 +17,12 @@ from vpipe.enrich import (EnrichItem, EnrichPlan, ImagePayload, ListCardPayload,
                           item_from_dict, load_enrich, save_enrich)
 from vpipe.models import (ACTION_CENSOR, ACTION_REMOVE, CutList, CutSegment,
                           TYPE_PAUSE)
+
+# Absolute-path prefix valid on THIS OS. enrich._abs_path keeps only
+# Path(s).is_absolute() strings, so a Windows drive literal ("D:/…") is dropped
+# to "" on POSIX/CI — build the prefix from the platform so the fixtures stay
+# absolute (hence preserved) on both Windows and Linux.
+_A = "D:/" if os.name == "nt" else "/"
 
 
 # --- raw-dict builders (как пишет detектор/LLM-слой) ---------------------------
@@ -29,7 +36,7 @@ def raw_image(**over):
          "payload": {"concept": "структура реестра",
                      "image_query_en": "windows registry diagram",
                      "style_hint": "diagram", "asset_kind": "user",
-                     "asset_path": "D:/assets/registry.png", "emoji": "",
+                     "asset_path": _A + "assets/registry.png", "emoji": "",
                      "position": "top_right", "width_frac": 0.32,
                      "kenburns": False, "fade_ms": 220}}
     d.update(over)
@@ -104,7 +111,7 @@ def test_roundtrip_all_six_types():
     assert img.word_start == 1240 and img.word_end == 1262
     assert img.quote.startswith("реестр")
     assert img.payload.style_hint == "diagram"
-    assert img.payload.asset_path == "D:/assets/registry.png"
+    assert img.payload.asset_path == _A + "assets/registry.png"
 
     card = plan.items[2]
     assert card.payload.title == "Чем хорош реестр"
@@ -219,7 +226,7 @@ def test_asset_path_relative_rejected():
         assert item_from_dict(a).payload.asset_path == ""
     # абсолютный путь живёт как раньше (см. test_roundtrip_all_six_types)
     assert item_from_dict(raw_image()).payload.asset_path == \
-        "D:/assets/registry.png"
+        _A + "assets/registry.png"
 
 
 def test_nan_inf_guards():
@@ -471,14 +478,14 @@ def _schematic_cand(**over):
                     "col_b": "Windows",
                     "rows": [{"feature": "Доля серверов", "a": "96 %",
                               "b": "4 %", "winner": "a"}]},
-         "preview": "D:/cache/codegfx/abc.png"}
+         "preview": _A + "cache/codegfx/abc.png"}
     d.update(over)
     return d
 
 
 def _diffusion_cand(**over):
     d = {"source": "diffusion", "prompt": "modern data center, cinematic",
-         "seed": 12345, "asset_path": "D:/cache/enrich_img/s0.png"}
+         "seed": 12345, "asset_path": _A + "cache/enrich_img/s0.png"}
     d.update(over)
     return d
 
@@ -519,15 +526,15 @@ def test_v2_back_compat_old_image_payload():
     """Старый image-payload БЕЗ candidates читается как раньше (back-compat)."""
     old = item_from_dict(raw_image()).payload     # asset_kind=user, без V2-полей
     assert old.candidates == [] and old.selected == 0
-    assert old.asset_path == "D:/assets/registry.png"
+    assert old.asset_path == _A + "assets/registry.png"
     assert old.asset_kind == "user"
     # source выводится из плоского asset_kind через resolved_asset()
     ap, src = old.resolved_asset()
-    assert ap == "D:/assets/registry.png" and src == "stock"
+    assert ap == _A + "assets/registry.png" and src == "stock"
     # generate → diffusion; emoji → icon; none → none
     gen = ImagePayload.sanitize({"asset_kind": "generate",
-                                 "asset_path": "D:/cache/x.png"})
-    assert gen.resolved_asset() == ("D:/cache/x.png", "diffusion")
+                                 "asset_path": _A + "cache/x.png"})
+    assert gen.resolved_asset() == (_A + "cache/x.png", "diffusion")
     emj = ImagePayload.sanitize({"asset_kind": "emoji", "emoji": "u26a1"})
     assert emj.resolved_asset() == ("", "icon")
     assert ImagePayload.sanitize({}).resolved_asset() == ("", "none")
@@ -613,11 +620,11 @@ def test_v2_resolved_asset_from_chosen_candidate():
     p = item_from_dict(d).payload
     # schematic: asset_path нет -> preview как путь (PNG движка)
     ap, src = p.resolved_asset()
-    assert src == "schematic" and ap == "D:/cache/codegfx/abc.png"
+    assert src == "schematic" and ap == _A + "cache/codegfx/abc.png"
     # переключение selected -> diffusion asset_path
     d["payload"]["selected"] = 1
     p2 = item_from_dict(d).payload
-    assert p2.resolved_asset() == ("D:/cache/enrich_img/s0.png", "diffusion")
+    assert p2.resolved_asset() == (_A + "cache/enrich_img/s0.png", "diffusion")
     # none-кандидат -> ("", "none")
     d2 = raw_image()
     d2["payload"]["candidates"] = [{"source": "none"}]

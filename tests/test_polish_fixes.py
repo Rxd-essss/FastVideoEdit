@@ -11,6 +11,7 @@ Covers the parts that don't need ffmpeg/whisper/GPU:
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -178,7 +179,11 @@ def test_output_preview_no_path_traversal(client, cfg, monkeypatch):
     # FastAPI's path param won't pass raw '../', but assert the resolver itself
     # rejects anything that escapes the configured roots.
     roots = serve._enrich_preview_roots()
-    assert all(not (r / "..\\outside.png").resolve().is_relative_to(r)
+    # os.path.join gives a real parent-escaping component on the host (``..\`` on
+    # Windows, ``../`` on POSIX); a literal backslash is NOT a separator on Linux,
+    # so the hard-coded ``..\\`` used to resolve INSIDE the root there and fail.
+    escape = os.path.join("..", "outside.png")
+    assert all(not (r / escape).resolve().is_relative_to(r)
                for r in roots)
 
 

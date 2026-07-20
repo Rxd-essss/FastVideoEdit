@@ -381,7 +381,11 @@ def test_emoji_png_path_interface(tmp_path):
     p = cache / f"u26a1_{enrich.EMOJI_PNG_SIZE}.png"
     p.write_bytes(b"png")
     assert enrich.emoji_png_path("u26a1", cache) == p
-    # валидный noto-кодпойнт без кэша -> растеризуется в НЕпустой PNG (P5)
+    # валидный noto-кодпойнт без кэша -> растеризуется в НЕпустой PNG (P5).
+    # Растеризация нуждается в цветном emoji-шрифте (нет на CI) — только там,
+    # где он есть; логика выше (None/кэш-хит) проверяется на любой машине.
+    if enrich._emoji_font_path() is None:
+        pytest.skip("no colour-emoji font on this host (CI) — rasterisation unavailable")
     p2 = enrich.emoji_png_path("u1f5c3", cache)
     assert p2 is not None and p2.is_file() and p2.stat().st_size > 0
 

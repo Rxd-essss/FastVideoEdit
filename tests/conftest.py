@@ -32,3 +32,17 @@ _RUN_FFMPEG = (os.environ.get("FVE_FFMPEG_TESTS") == "1"
 requires_ffmpeg = pytest.mark.skipif(
     not _RUN_FFMPEG,
     reason="set FVE_FFMPEG_TESTS=1 with ffmpeg on PATH to run the integration tier")
+
+
+# Emoji rasterisation needs a COLOUR-emoji font (Segoe UI Emoji on desktop
+# Windows). CI runners -- Linux and Windows Server alike -- ship none, so those
+# tests skip there while still running on the dev's real machine. Production
+# already degrades cleanly (emoji_png_path -> None -> overlay dropped).
+def _has_emoji_font() -> bool:
+    from vpipe.enrich import _emoji_font_path
+    return _emoji_font_path() is not None
+
+
+requires_emoji_font = pytest.mark.skipif(
+    not _has_emoji_font(),
+    reason="no colour-emoji font on this host (CI) — glyph rasterisation unavailable")
