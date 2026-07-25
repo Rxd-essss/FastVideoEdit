@@ -290,6 +290,56 @@ def test_run_vision_route_noop_when_disabled(monkeypatch):
     assert items[0].enabled is True                  # untouched
 
 
+def test_per_run_opt_enables_stage_when_config_off(monkeypatch):
+    """Тумблер вкладки «Монтаж» включает стадию даже при выключенном конфиге."""
+    serve, s = _mini_session(False, monkeypatch)          # config: OFF
+    monkeypatch.setattr(serve, "_wait_ollama_unloaded", lambda *a, **k: None)
+    fake = SimpleNamespace(available=lambda *a, **k: True,
+                           has_model=lambda *a, **k: False)   # дальше — скип
+    monkeypatch.setattr(serve, "get_client", lambda *a, **k: fake)
+    items = [_img_item([{"source": "schematic"}])]
+    called = {}
+    orig = serve.vision_route_mod.route
+    monkeypatch.setattr(serve.vision_route_mod, "route",
+                        lambda *a, **k: called.setdefault("hit", True))
+    # opts["vision"]=True -> дошли до построения клиента (has_model=False -> None)
+    assert serve._run_vision_route(s, items, {"vision": True},
+                                   log=lambda *_: None) is None
+    # без тумблера и с выключенным конфигом — выходим ДО клиента
+    assert serve._run_vision_route(s, items, {"vision": False},
+                                   log=lambda *_: None) is None
+    monkeypatch.setattr(serve.vision_route_mod, "route", orig)
+
+
+def test_per_run_opt_disables_stage_when_config_on(monkeypatch):
+    """И наоборот: снятый тумблер побеждает включённый конфиг."""
+    serve, s = _mini_session(True, monkeypatch)           # config: ON
+    boom = lambda *a, **k: pytest.fail("стадия не должна запускаться")  # noqa: E731
+    monkeypatch.setattr(serve, "get_client", boom)
+    monkeypatch.setattr(serve, "_wait_ollama_unloaded", boom)
+    items = [_img_item([{"source": "schematic"}])]
+    assert serve._run_vision_route(s, items, {"vision": False},
+                                   log=lambda *_: None) is None
+    assert items[0].enabled is True
+
+
+def test_enrich_opts_sanitize_vision_flag():
+    """vision — булев per-run опт: валидируется строго, мусор в strict -> 400."""
+    import serve
+    from fastapi import HTTPException
+    out = serve._sanitize_enrich_opts({"vision": True}, strict=True)
+    assert out["vision"] is True
+    assert serve._sanitize_enrich_opts({"vision": False},
+                                       strict=True)["vision"] is False
+    with pytest.raises(HTTPException):
+        serve._sanitize_enrich_opts({"vision": "да"}, strict=True)
+    # нестрогий режим (чтение enrich_ui.json) — мусор молча заменяется дефолтом
+    assert isinstance(serve._sanitize_enrich_opts({"vision": 1},
+                                                  strict=False)["vision"], bool)
+    # ключ всегда присутствует в каноническом виде (контракт фронта)
+    assert "vision" in serve._sanitize_enrich_opts({}, strict=True)
+
+
 def test_run_vision_route_skips_when_model_missing(monkeypatch):
     serve, s = _mini_session(True, monkeypatch)
     monkeypatch.setattr(serve, "_wait_ollama_unloaded", lambda *a, **k: None)

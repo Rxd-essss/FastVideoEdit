@@ -4066,6 +4066,9 @@ function seedEnrichModal() {
   $('#enSrcDiffusion').checked = srcs ? !!srcs.diffusion : (legacy === 'auto' || legacy === 'generate' || legacy == null)
   $('#enSrcStock').checked = srcs ? !!srcs.stock : (legacy === 'user_folder')
   $('#enUserFolder').value = o.user_folder || ''
+  // vision-роутер: дефолт приходит с бэкенда (там он берётся из config.yaml),
+  // пер-запусковый выбор юзера побеждает.
+  $('#enVision').checked = !!o.vision
   enrichToggleUserFolder()
   const off = !st.llmReady
   $('#enrichModalLlm').classList.toggle('hidden', !off)
@@ -4130,6 +4133,7 @@ async function runEnrichSuggest() {
     sources,
     image_source: enrichLegacyImageSource(sources),
     user_folder: $('#enUserFolder').value.trim(),
+    vision: $('#enVision').checked,
   }
   closeOverlay('#enrichModal')
   setActiveTab('enrich')

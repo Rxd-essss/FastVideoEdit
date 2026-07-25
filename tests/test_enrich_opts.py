@@ -53,7 +53,10 @@ def test_sanitize_empty_gives_defaults():
     assert o == {"types": {"image": True, "animation": True,
                            "list_card": True, "cta": True},
                  "density": "normal", "image_source": "auto",
-                 "user_folder": "", "stocks": {"enabled": False}}
+                 "user_folder": "", "stocks": {"enabled": False},
+                 # vision-роутер: пер-запусковый тумблер; дефолт — из config.yaml
+                 # (render.vision_route.enabled, по умолчанию выключен).
+                 "vision": False}
 
 
 def test_sanitize_passthrough_in_whitelist():

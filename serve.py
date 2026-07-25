@@ -773,9 +773,14 @@ def _enrich_opts_path() -> Path:
 
 
 def _default_enrich_opts() -> dict:
+    # ``vision`` — дефолт берём из конфига (render.vision_route.enabled), чтобы
+    # настройка в config.yaml не теряла смысл; пер-запусковое значение из UI
+    # всегда побеждает (юзер может включить/выключить прямо перед прогоном).
+    _vr = getattr(getattr(APP.get("cfg"), "render", None), "vision_route", None)
     return {"types": {k: True for k in _ENRICH_TYPE_KEYS},
             "density": "normal", "image_source": "auto",
-            "user_folder": "", "stocks": {"enabled": False}}
+            "user_folder": "", "stocks": {"enabled": False},
+            "vision": bool(getattr(_vr, "enabled", False))}
 
 
 def _sanitize_enrich_opts(raw, *, strict: bool = True) -> dict:
@@ -829,6 +834,13 @@ def _sanitize_enrich_opts(raw, *, strict: bool = True) -> dict:
             out["user_folder"] = uf.strip()
         elif strict:
             raise HTTPException(400, "user_folder: ожидается строка-путь")
+
+    vis = raw.get("vision")
+    if vis is not None:
+        if isinstance(vis, bool):
+            out["vision"] = vis
+        elif strict:
+            raise HTTPException(400, "vision: ожидается true/false")
 
     st = raw.get("stocks")
     if st is not None and not isinstance(st, dict) and strict:
@@ -3883,7 +3895,14 @@ def _run_vision_route(s: Session, items: list, params: dict, log) -> Optional[di
     стадия best-effort, монтаж никогда здесь не падает. Возврат — stats или None
     (стадия не запускалась)."""
     vr = getattr(s.cfg.render, "vision_route", None)
-    if vr is None or not getattr(vr, "enabled", False):
+    if vr is None:
+        return None
+    # Пер-запусковый тумблер вкладки «Монтаж» ПОБЕЖДАЕТ конфиг (его дефолт сам
+    # берётся из конфига — см. _default_enrich_opts), чтобы юзер мог включить/
+    # выключить стадию прямо перед прогоном, не правя config.yaml.
+    want = (params or {}).get("vision")
+    if not (bool(want) if isinstance(want, bool)
+            else bool(getattr(vr, "enabled", False))):
         return None
     targets = [it for it in items
                if getattr(it, "type", "") in vision_route_mod.VISUAL_TYPES
@@ -4171,7 +4190,9 @@ def enrich_suggest(body: dict = Body(default={})):
         # Vision-route (variant C, opt-in): VLM смотрит реальные кадры и ветит/
         # переназначает «слоп» ДО дорогой генерации ассетов. Своя VRAM-фаза
         # (выгрузит текстовую LLM, отсудит, выгрузит VLM). Выкл по умолчанию.
-        _run_vision_route(s, items, params, log=s.stage)
+        # Передаём ПОЛНЫЕ opts (а не whitelist-params плана): тумблер «vision» —
+        # настройка запуска, в params-блок плана §1.2 он не входит.
+        _run_vision_route(s, items, opts, log=s.stage)
         # Этап images (ТРЕК-2 §2): SD-генерация для точек asset_kind="generate".
         # ПОСЛЕ детекторов (VRAM-менеджер выгрузит Ollama), ДО мержа/планировщика:
         # генерим только свежие точки детектора, мерж затем хранит ревью юзера.
