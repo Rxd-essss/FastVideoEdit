@@ -88,6 +88,17 @@ _SCORE_INTRO_BONUS = 12        # наличие найденного intro
 _CTA_SCORE = {"subscribe": 60, "comment": 70}  # comment несёт уникальный вопрос
 _ILL_SCORE_BASE = 55
 _ILL_SCORE_QUERY = 15          # есть вменяемый английский image_query_en
+# Пере-оценка иллюстрации ПОСЛЕ стадии кандидатов (_rescore_point). На момент
+# детекции содержимое ещё неизвестно (fields собирает узкий экстрактор позже),
+# поэтому детектор ставит лишь базу, а реальный вес — здесь.
+# ЗАЧЕМ (измерено на 5 реальных планах юзера): раньше КАЖДАЯ картинка получала
+# ровно 55, из-за чего (а) автопак (порог AUTOPACK_ENRICH_MIN_SCORE=70) выкидывал
+# АБСОЛЮТНО ВСЕ картинки — в ролик не попадала ни одна схема; (б) engine-лимит
+# MAX_STILLS=6 при равных очках оставлял 6 САМЫХ РАННИХ, а не 6 лучших.
+_ILL_SCORE_RICH_W = 6          # очков за каждую валидную контент-строку карточки
+_ILL_SCORE_RICH_CAP = 5        # потолок учитываемых строк (5 -> +30)
+_ILL_SCORE_ICON = 5            # icon — декоративен: чуть выше базы, ниже порога
+_ILL_SCORE_NONE = 30           # материального кандидата нет — самый низкий приоритет
 
 # Прогресс задачи по детекторам (§3.4): lists 45 / cta 15 / illustrations 30 /
 # assets 10. Этап assets (подбор ассетов, §4 Tier 0/1) приходит в P5 — пока его
@@ -1253,6 +1264,50 @@ def _detect_illustrations(eff: _EffStream, transcript: Transcript, llm,
 # (быстро, CPU/LLM, без GPU): узкий экстрактор заполняет fields. diffusion-
 # кандидат — только для photo-моментов (реальная генерация — стадия images,
 # VRAM-менеджер). none — ВСЕГДА как вариант («лучше пусто, чем слоп»).
+def _schematic_richness(intent: str, fields: dict) -> int:
+    """Сколько ВАЛИДНЫХ контент-строк несёт карточка (то же число, что считает
+    ``_clean_extracted_fields``: строки, чей quote снапнулся к окну и чьи числа
+    реально звучат в речи). Одиночные интенты (callout/quote/code) — 1, если
+    есть непустое смысловое поле. Это единственный честный признак «наполненности»
+    предложения, доступный коду без ещё одного LLM-вызова."""
+    if not isinstance(fields, dict) or not fields:
+        return 0
+    list_field = _EXTRACT_LIST_FIELD.get(intent)
+    if list_field is None:                       # callout/quote/code
+        return 1 if any(v for v in fields.values()) else 0
+    rows = fields.get(list_field)
+    return len(rows) if isinstance(rows, list) else 0
+
+
+def _rescore_point(p: dict, chosen: dict, intent: str) -> None:
+    """Пере-оценить точку-иллюстрацию ПОСЛЕ того, как известен её материальный
+    кандидат (мутирует ``p['score']``, кламп 0..100).
+
+    Детектор ставит только базу — содержимого он ещё не видел. Здесь оно есть:
+      schematic → база + вес за каждую валидную строку (богатая карточка с 3+
+                  строками перешагивает порог автопака, тощая 1-2 остаётся ниже
+                  и не мусорит в ролике, но видна юзеру в UI);
+      diffusion → база + бонус за вменяемый query (как было);
+      icon      → база + маленький бонус (декор);
+      none      → низкий приоритет: визуала нет вовсе.
+    """
+    src = chosen.get("source", "none")
+    if src == "schematic":
+        rich = _schematic_richness(intent, chosen.get("fields") or {})
+        score = _ILL_SCORE_BASE + _ILL_SCORE_RICH_W * min(rich,
+                                                          _ILL_SCORE_RICH_CAP)
+    elif src == "diffusion":
+        score = _ILL_SCORE_BASE + (_ILL_SCORE_QUERY
+                                   if chosen.get("prompt") else 0)
+    elif src == "stock":
+        score = _ILL_SCORE_BASE + _ILL_SCORE_QUERY
+    elif src == "icon":
+        score = _ILL_SCORE_BASE + _ILL_SCORE_ICON
+    else:                                        # none — визуала нет
+        score = _ILL_SCORE_NONE
+    p["score"] = max(0, min(100, int(score)))
+
+
 def _build_candidates(points: list, eff: _EffStream, llm, log: LogFn,
                       *, default_style: str = SCHEMATIC_STYLE_DEF,
                       run_diffusion: bool = True) -> int:
@@ -1306,6 +1361,9 @@ def _build_candidates(points: list, eff: _EffStream, llm, log: LogFn,
         if clean[0]["source"] == "schematic":
             p["payload"]["intent"] = clean[0].get("intent", "")
             p["payload"]["schematic_style"] = clean[0].get("style", style)
+        # Реальный вес предложения — только теперь, когда известно содержимое
+        # выбранного кандидата (детектор ставил константу; см. _rescore_point).
+        _rescore_point(p, clean[0], clean[0].get("intent", intent))
         if clean[0]["source"] != "none":
             materialized += 1
         p.pop("_route", None)                      # служебное наружу не уходит

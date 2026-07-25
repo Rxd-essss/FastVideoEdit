@@ -939,6 +939,91 @@ def test_build_candidates_threads_default_style(monkeypatch):
     assert pt["payload"]["schematic_style"] == "neon"
 
 
+# --- score иллюстраций: реальный вес вместо константы 55 ------------------------
+def test_schematic_richness_counts_validated_rows():
+    # списочные интенты — длина списка (строки, прошедшие снап/анти-выдумку)
+    assert enrich_llm._schematic_richness("stat", {"stats": [1, 2, 3]}) == 3
+    assert enrich_llm._schematic_richness("compare", {"rows": []}) == 0
+    assert enrich_llm._schematic_richness("tree", {"nodes": [1]}) == 1
+    # одиночные интенты (callout/quote) — 1, если есть непустое поле
+    assert enrich_llm._schematic_richness("callout", {"text": "важно"}) == 1
+    assert enrich_llm._schematic_richness("callout", {"text": ""}) == 0
+    # мусор на входе не роняет
+    assert enrich_llm._schematic_richness("stat", {}) == 0
+    assert enrich_llm._schematic_richness("stat", None) == 0
+    assert enrich_llm._schematic_richness("stat", {"stats": "не список"}) == 0
+
+
+def test_rescore_gives_real_gradient_not_flat_55():
+    """Регресс #D5: раньше КАЖДАЯ картинка получала ровно 55 — из-за чего автопак
+    (порог 70) выкидывал их ВСЕ, а лимит движка (6 stills) оставлял самые ранние,
+    а не лучшие. Теперь богатая карточка перешагивает порог, тощая — нет."""
+    def sc(chosen, intent=""):
+        p = {"score": 55}
+        enrich_llm._rescore_point(p, chosen, intent)
+        return p["score"]
+
+    rich = sc({"source": "schematic", "fields": {"stats": [1, 2, 3, 4]}}, "stat")
+    thin = sc({"source": "schematic", "fields": {"stats": [1]}}, "stat")
+    empty = sc({"source": "none"})
+    assert rich >= 70 > thin            # порог автопака разделяет их
+    assert thin > empty                 # но тощая всё равно выше «визуала нет»
+    assert empty == enrich_llm._ILL_SCORE_NONE
+    # монотонность по наполненности + кламп потолком
+    seq = [sc({"source": "schematic", "fields": {"stats": [0] * n}}, "stat")
+           for n in range(0, 8)]
+    assert seq == sorted(seq)                       # не убывает
+    assert seq[-1] == seq[-2] == max(seq)           # выше cap не растёт
+    assert all(0 <= s <= 100 for s in seq)
+
+
+def test_rescore_other_sources():
+    def sc(chosen, intent=""):
+        p = {"score": 55}
+        enrich_llm._rescore_point(p, chosen, intent)
+        return p["score"]
+    # diffusion с промптом — прежний бонус за query; без промпта — только база
+    assert sc({"source": "diffusion", "prompt": "a cat"}) == \
+        enrich_llm._ILL_SCORE_BASE + enrich_llm._ILL_SCORE_QUERY
+    assert sc({"source": "diffusion", "prompt": ""}) == enrich_llm._ILL_SCORE_BASE
+    # icon — декор: выше базы, но НИЖЕ порога автопака (70)
+    assert enrich_llm._ILL_SCORE_BASE < sc({"source": "icon"}) < 70
+
+
+def test_build_candidates_rescores_point(monkeypatch):
+    """Стадия кандидатов пере-оценивает точку по РЕАЛЬНОМУ содержимому."""
+    tr = _build_tr(300)
+    eff = enrich_llm._build_eff(tr, _cl(tr))
+    monkeypatch.setattr(enrich_llm, "_extract_schematic",
+                        lambda *a, **k: {"title": "t",
+                                         "nodes": [{"label": f"n{i}"}
+                                                   for i in range(4)]})
+    pt = {"type": ENR_IMAGE, "word_start": 100, "word_end": 105, "score": 55,
+          "t_start": 50.0, "t_end": 53.0, "quote": "цитата", "reason": "r",
+          "payload": {"source": "schematic"},
+          "_route": {"source": "schematic", "intent": "tree",
+                     "lo": 100, "hi": 106}}
+    enrich_llm._build_candidates([pt], eff, None, _SILENT)
+    assert pt["score"] > 55                    # больше не константа
+    assert pt["score"] >= 70                   # 4 валидные строки -> в автопак
+
+
+def test_build_candidates_scores_none_point_low(monkeypatch):
+    """Точка, где ничего не материализовалось, получает низкий приоритет —
+    она не должна выигрывать трим у настоящих карточек."""
+    tr = _build_tr(300)
+    eff = enrich_llm._build_eff(tr, _cl(tr))
+    monkeypatch.setattr(enrich_llm, "_extract_schematic", lambda *a, **k: None)
+    pt = {"type": ENR_IMAGE, "word_start": 100, "word_end": 105, "score": 55,
+          "t_start": 50.0, "t_end": 53.0, "quote": "ц", "reason": "r",
+          "payload": {"source": "schematic"},
+          "_route": {"source": "schematic", "intent": "tree",
+                     "lo": 100, "hi": 106}}
+    enrich_llm._build_candidates([pt], eff, None, _SILENT)
+    assert pt["payload"]["candidates"][0]["source"] == "none"
+    assert pt["score"] == enrich_llm._ILL_SCORE_NONE
+
+
 def test_detect_all_forwards_codegfx_style(monkeypatch):
     """detect_all прокидывает codegfx_style в кандидатов (config → candidate)."""
     tr = _build_tr(300)
