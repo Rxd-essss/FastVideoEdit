@@ -4069,6 +4069,8 @@ function seedEnrichModal() {
   // vision-роутер: дефолт приходит с бэкенда (там он берётся из config.yaml),
   // пер-запусковый выбор юзера побеждает.
   $('#enVision').checked = !!o.vision
+  $('#enVisionStrict').value = (o.vision_strictness === 'soft') ? 'soft' : 'strict'
+  enrichToggleVision()
   enrichToggleUserFolder()
   const off = !st.llmReady
   $('#enrichModalLlm').classList.toggle('hidden', !off)
@@ -4084,6 +4086,12 @@ function enrichSourcesState() {
     diffusion: $('#enSrcDiffusion').checked,
     stock: $('#enSrcStock').checked,
   }
+}
+// Выбор строгости имеет смысл только при включённом vision-роутере.
+function enrichToggleVision() {
+  const on = $('#enVision') && $('#enVision').checked
+  const row = $('#enVisionStrictRow')
+  if (row) row.classList.toggle('hidden', !on)
 }
 function enrichToggleUserFolder() {
   const s = enrichSourcesState()
@@ -4134,6 +4142,7 @@ async function runEnrichSuggest() {
     image_source: enrichLegacyImageSource(sources),
     user_folder: $('#enUserFolder').value.trim(),
     vision: $('#enVision').checked,
+    vision_strictness: $('#enVisionStrict').value,
   }
   closeOverlay('#enrichModal')
   setActiveTab('enrich')
@@ -4375,6 +4384,7 @@ function bindUI() {
   for (const id of ['#enSrcAuto', '#enSrcSchematic', '#enSrcDiffusion', '#enSrcStock']) {
     const el = $(id); if (el) el.onchange = enrichToggleUserFolder
   }
+  { const el = $('#enVision'); if (el) el.onchange = enrichToggleVision }
   $('#btnEnPickFolder').onclick = () => {
     $('#enrichModal').classList.add('hidden')
     openFiles(true, (dir) => { if (dir) $('#enUserFolder').value = dir; openOverlay('#enrichModal') })
