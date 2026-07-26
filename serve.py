@@ -765,6 +765,9 @@ _ENRICH_DENSITIES = ("min", "normal", "aggressive")
 # "generate" = локальная SD-генерация (ТРЕК-2 §2); "auto" тоже умеет SD (папка →
 # SD → эмодзи → none). Должен совпадать с whitelist'ом sanitize_params (enrich.py).
 _ENRICH_IMAGE_SOURCES = ("auto", "emoji", "user_folder", "generate")
+# Строгость vision-роутера (см. VisionRouteCfg.strictness): порог — редакторский
+# выбор, замерено 75% вето у "strict" против 19% у "soft" на одних и тех же кадрах.
+_VISION_STRICTNESS = ("strict", "soft")
 
 
 def _enrich_opts_path() -> Path:
@@ -777,10 +780,13 @@ def _default_enrich_opts() -> dict:
     # настройка в config.yaml не теряла смысл; пер-запусковое значение из UI
     # всегда побеждает (юзер может включить/выключить прямо перед прогоном).
     _vr = getattr(getattr(APP.get("cfg"), "render", None), "vision_route", None)
+    _vs = str(getattr(_vr, "strictness", "strict") or "strict")
     return {"types": {k: True for k in _ENRICH_TYPE_KEYS},
             "density": "normal", "image_source": "auto",
             "user_folder": "", "stocks": {"enabled": False},
-            "vision": bool(getattr(_vr, "enabled", False))}
+            "vision": bool(getattr(_vr, "enabled", False)),
+            "vision_strictness": (_vs if _vs in _VISION_STRICTNESS
+                                  else "strict")}
 
 
 def _sanitize_enrich_opts(raw, *, strict: bool = True) -> dict:
@@ -841,6 +847,14 @@ def _sanitize_enrich_opts(raw, *, strict: bool = True) -> dict:
             out["vision"] = vis
         elif strict:
             raise HTTPException(400, "vision: ожидается true/false")
+
+    vs = raw.get("vision_strictness")
+    if vs is not None:
+        if vs in _VISION_STRICTNESS:
+            out["vision_strictness"] = vs
+        elif strict:
+            raise HTTPException(400, "vision_strictness: допустимы "
+                                     + ", ".join(_VISION_STRICTNESS))
 
     st = raw.get("stocks")
     if st is not None and not isinstance(st, dict) and strict:
@@ -3911,6 +3925,10 @@ def _run_vision_route(s: Session, items: list, params: dict, log) -> Optional[di
         return None
     # VRAM (§2): сначала освободить текстовую модель, затем занять слот VLM.
     _wait_ollama_unloaded(s, log)
+    # Строгость: пер-запусковый выбор из UI побеждает конфиг (как и сам тумблер).
+    want_s = (params or {}).get("vision_strictness")
+    if want_s in _VISION_STRICTNESS:
+        vr = vr.model_copy(update={"strictness": want_s})
     vcfg = s.cfg.llm.model_copy(update={
         "model": vr.model, "timeout": int(vr.timeout_s), "num_ctx": 8192,
         "think": False, "keep_alive": 0, "temperature": 0.0})

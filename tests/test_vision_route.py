@@ -340,6 +340,63 @@ def test_enrich_opts_sanitize_vision_flag():
     assert "vision" in serve._sanitize_enrich_opts({}, strict=True)
 
 
+# --- строгость роутера (редакторский выбор, не техническая истина) --------------
+def test_system_prompt_by_strictness():
+    assert vr.system_prompt("strict") is vr.SYSTEM
+    assert vr.system_prompt("soft") is vr.SYSTEM_SOFT
+    assert vr.system_prompt("SOFT") is vr.SYSTEM_SOFT          # регистр не важен
+    # незнакомое/пустое -> строгий (безопасный дефолт)
+    for bad in ("", None, "лютый", 42):
+        assert vr.system_prompt(bad) is vr.SYSTEM
+    # мягкий промпт действительно смещён в сторону «оставить»
+    assert "ДОВЕРЯЙ" in vr.SYSTEM_SOFT and "insert=true" in vr.SYSTEM_SOFT
+
+
+def test_route_uses_soft_prompt_when_configured():
+    it = _img_item([{"source": "schematic"}])
+    client = FakeVLM({"scene": "screen_share", "insert": True,
+                      "kind": "diagram", "reason": ""})
+    vr.route([it], "v.mp4", "ffmpeg", client, _cfg(strictness="soft"))
+    assert client.calls[0]["system"] is vr.SYSTEM_SOFT
+    # без указания строгости — строгий промпт
+    c2 = FakeVLM({"scene": "s", "insert": True, "kind": "diagram", "reason": ""})
+    vr.route([_img_item([{"source": "schematic"}])], "v.mp4", "ffmpeg", c2, _cfg())
+    assert c2.calls[0]["system"] is vr.SYSTEM
+
+
+def test_enrich_opts_sanitize_vision_strictness():
+    import serve
+    from fastapi import HTTPException
+    assert serve._sanitize_enrich_opts({"vision_strictness": "soft"},
+                                       strict=True)["vision_strictness"] == "soft"
+    with pytest.raises(HTTPException):
+        serve._sanitize_enrich_opts({"vision_strictness": "лютый"}, strict=True)
+    # дефолт всегда присутствует и валиден
+    d = serve._sanitize_enrich_opts({}, strict=True)
+    assert d["vision_strictness"] in ("strict", "soft")
+
+
+def test_per_run_strictness_beats_config(monkeypatch):
+    """Выбор из UI побеждает конфиг — как и сам тумблер."""
+    serve, s = _mini_session(True, monkeypatch)
+    s.cfg.render.vision_route.strictness = "strict"
+    monkeypatch.setattr(serve, "_wait_ollama_unloaded", lambda *a, **k: None)
+    seen = {}
+    fake = SimpleNamespace(available=lambda *a, **k: True,
+                           has_model=lambda *a, **k: True,
+                           unload=lambda *a, **k: True)
+    monkeypatch.setattr(serve, "get_client", lambda *a, **k: fake)
+    monkeypatch.setattr(serve.vision_route_mod, "route",
+                        lambda items, video, ff, cl, cfg, **k:
+                        seen.setdefault("strictness", cfg.strictness))
+    serve._run_vision_route(s, [_img_item([{"source": "schematic"}])],
+                            {"vision": True, "vision_strictness": "soft"},
+                            log=lambda *_: None)
+    assert seen["strictness"] == "soft"      # per-run победил конфиг
+    # и конфиг НЕ мутирован глобально
+    assert s.cfg.render.vision_route.strictness == "strict"
+
+
 def test_run_vision_route_skips_when_model_missing(monkeypatch):
     serve, s = _mini_session(True, monkeypatch)
     monkeypatch.setattr(serve, "_wait_ollama_unloaded", lambda *a, **k: None)

@@ -56,7 +56,10 @@ def test_sanitize_empty_gives_defaults():
                  "user_folder": "", "stocks": {"enabled": False},
                  # vision-роутер: пер-запусковый тумблер; дефолт — из config.yaml
                  # (render.vision_route.enabled, по умолчанию выключен).
-                 "vision": False}
+                 "vision": False,
+                 # строгость — редакторский выбор (замер: 75% вето у strict
+                 # против 19% у soft на одних кадрах); дефолт строгий.
+                 "vision_strictness": "strict"}
 
 
 def test_sanitize_passthrough_in_whitelist():
