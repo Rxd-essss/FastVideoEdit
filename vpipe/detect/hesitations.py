@@ -24,6 +24,7 @@ an empty list so the rest of detection is unaffected.
 from __future__ import annotations
 
 import wave
+from bisect import bisect_left
 from pathlib import Path
 
 from ..config import HesitationsCfg
@@ -137,7 +138,15 @@ def detect(audio_path: str | Path, duration: float, cfg: HesitationsCfg,
     except Exception:  # noqa: BLE001 — VAD/wav failure must not break detection
         return []
 
-    words = words or []
+    words = sorted(words or [], key=lambda w: w.start)  # Whisper already sorted; defensive
+    # Precompute once for the O(log n) word-safe clamp below (was two O(words)
+    # generator scans PER gap). w_starts is sorted; pmax_end[i] = max end over
+    # words[:i] (ends aren't monotonic if words overlap, so a prefix-max — not
+    # words[i-1].end — reproduces the old max(...) exactly).
+    w_starts = [w.start for w in words]
+    pmax_end: list = [None]
+    for w in words:
+        pmax_end.append(w.end if pmax_end[-1] is None else max(pmax_end[-1], w.end))
     out: list[CutSegment] = []
     for g_start, g_end in gaps:
         raw = g_end - g_start
@@ -152,8 +161,9 @@ def detect(audio_path: str | Path, duration: float, cfg: HesitationsCfg,
         # never bite into the surrounding words (the "огрызки слов" the user heard).
         if words:
             mid = 0.5 * (g_start + g_end)
-            prev_end = max((w.end for w in words if w.start < mid), default=None)
-            next_start = min((w.start for w in words if w.start >= mid), default=None)
+            idx = bisect_left(w_starts, mid)         # count of words with start < mid
+            prev_end = pmax_end[idx]                  # None when idx == 0
+            next_start = w_starts[idx] if idx < len(w_starts) else None
             if prev_end is not None:
                 a = max(a, prev_end)
             if next_start is not None:

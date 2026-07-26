@@ -10,8 +10,10 @@ Nothing leaves the machine.
 from __future__ import annotations
 
 import argparse
+import atexit
 import copy
 import json
+from contextlib import asynccontextmanager
 import logging
 import math
 import os
@@ -62,12 +64,17 @@ import anyio
 
 from vpipe import chapters as chapters_mod
 from vpipe import clips as clips_mod
+from vpipe import enrich as enrich_mod
+from vpipe import enrich_cards
+from vpipe import enrich_llm
+from vpipe import imagegen as imagegen_mod
 from vpipe import facecrop as facecrop_mod
 from vpipe import ffmpeg_utils
 from vpipe import metadata as metadata_mod
 from vpipe import netguard
 from vpipe import render as render_mod
 from vpipe import subtitles as subs_mod
+from vpipe import vision_route as vision_route_mod
 from vpipe.config import (Config, load_config, load_fillers, load_profanity)
 from vpipe.cutlist import resolve, save_txt
 from vpipe.export_nle import write_edl, write_fcpxml
@@ -95,10 +102,17 @@ MAX_UPLOAD_BYTES = 30 * 1024**3   # 30 GB upload cap
 # видео (из видеоконтейнера ffmpeg возьмёт звуковую дорожку).
 AUDIO_EXT = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".wma"}
 MUSIC_EXT = AUDIO_EXT | VIDEO_EXT
+# Авто-обогащение (§4 Tier 1 / «заменить ассет»): белый список картинок-ассетов
+# для /api/browse?kind=image — ровно те форматы, что индексирует match_user_assets.
+IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp"}
 # Extensions /api/output is allowed to serve — exactly the artifacts the pipeline
-# produces (rendered video, sidecar subs, chapters/metadata txt, NLE projects).
+# produces (rendered video, sidecar subs, chapters/metadata txt, NLE projects)
+# PLUS the V2 «Монтаж» enrich previews (code-graphic PNG from headless Chrome and
+# diffusion PNG from SD) — the UI shows the *real* rendered candidate, not a CSS
+# mock-up (MONTAGE_V2_PLAN §3), so the preview files must be servable by name.
 OUTPUT_EXT_ALLOWED = {".mp4", ".mov", ".mkv", ".webm", ".m4v",
-                      ".srt", ".vtt", ".ass", ".txt", ".edl", ".fcpxml", ".json"}
+                      ".srt", ".vtt", ".ass", ".txt", ".edl", ".fcpxml",
+                      ".json"} | IMAGE_EXT
 
 # P2-#5: allowed faster-whisper model names for the UI presets (quality↔speed
 # on an 8 GB card). A whitelist on the UI side — any other name -> 400. This is a
@@ -125,35 +139,49 @@ WHISPER_ALLOWED = {p["model"] for p in WHISPER_PRESETS}
 # Цвета — ASS &HAABBGGRR (AA=00 — непрозрачный); размеры/отступы — в пикселях
 # PlayRes (равен разрешению выхода). Подбор — под talking-head Shorts.
 CAPTION_PRESETS = [
+    {"key": "clean", "label": "Чистые",
+     "hint": "Ровный белый текст с чёткой обводкой. Без подсветки и анимаций — "
+             "самый нейтральный, «профессиональный» вид",
+     "style": {"font": "Arial", "size": 52,
+               "primary_color": "&H00FFFFFF", "outline_color": "&H00000000",
+               "karaoke_color": "&H00FFFFFF",   # highlight == text (нет цветного выделения)
+               "outline": 2.4, "shadow": 0.6,
+               "position": "bottom", "karaoke": False, "kinetic": False,
+               "margin_v": 60}},
     {"key": "classic", "label": "Классика",
-     "hint": "Белый текст, жёлтая подсветка слова, снизу",
+     "hint": "Белый текст, спокойная жёлтая подсветка активного слова (без прыжков)",
      "style": {"font": "Arial", "size": 52,
                "primary_color": "&H00FFFFFF", "outline_color": "&H00000000",
                "karaoke_color": "&H0000D4FF",   # #FFD400 — тёплый жёлтый
                "outline": 2.0, "shadow": 1.0,
-               "position": "bottom", "karaoke": True, "margin_v": 40}},
-    {"key": "neon", "label": "Неон",
-     "hint": "Крупнее, бирюзовая подсветка, приподнято над низом",
-     "style": {"font": "Verdana", "size": 62,
-               "primary_color": "&H00FFFFFF", "outline_color": "&H00000000",
-               "karaoke_color": "&H00FFE500",   # #00E5FF — бирюза
-               "outline": 3.0, "shadow": 0.0,
-               "position": "bottom", "karaoke": True, "margin_v": 160}},
+               "position": "bottom", "karaoke": True, "kinetic": False,
+               "margin_v": 40}},
     {"key": "minimal", "label": "Минимал",
-     "hint": "Мельче и спокойнее: мягкая полупрозрачная обводка-плашка",
+     "hint": "Мельче и спокойнее: мягкая полупрозрачная плашка-обводка, без анимаций",
      "style": {"font": "Tahoma", "size": 44,
                "primary_color": "&H00FFFFFF",
                "outline_color": "&H78000000",   # чёрный ≈53% непрозрачности
-               "karaoke_color": "&H006ED7F5",   # #F5D76E — приглушённое золото
+               "karaoke_color": "&H00FFFFFF",   # без цветного выделения
                "outline": 3.0, "shadow": 0.0,
-               "position": "bottom", "karaoke": True, "margin_v": 48}},
+               "position": "bottom", "karaoke": False, "kinetic": False,
+               "margin_v": 48}},
     {"key": "bold", "label": "Крупный",
-     "hint": "Для просмотра без звука — большой кегль по центру кадра",
+     "hint": "Для просмотра без звука — большой кегль по центру кадра, без прыжков",
      "style": {"font": "Impact", "size": 78,
                "primary_color": "&H00FFFFFF", "outline_color": "&H00000000",
                "karaoke_color": "&H0000D4FF",
                "outline": 3.0, "shadow": 2.0,
-               "position": "center", "karaoke": True, "margin_v": 40}},
+               "position": "center", "karaoke": True, "kinetic": False,
+               "margin_v": 40}},
+    {"key": "kinetic", "label": "Кинетик (TikTok)",
+     "hint": "Динамичный: слово-ключ вспухает и подсвечивается акцентом. "
+             "На любителя — включайте осознанно",
+     "style": {"font": "Verdana", "size": 62,
+               "primary_color": "&H00FFFFFF", "outline_color": "&H00000000",
+               "karaoke_color": "&H0000D4FF",
+               "outline": 3.0, "shadow": 0.0,
+               "position": "bottom", "karaoke": True, "kinetic": True,
+               "margin_v": 160}},
 ]
 
 # B5: the user-editable filler dictionary (repo root). The GET/PUT /api/fillers
@@ -189,6 +217,103 @@ QUEUE_LOCK = threading.Lock()        # guards QUEUE list mutations
 _queue_worker_thread: Optional[threading.Thread] = None
 _queue_running = False               # editor↔queue GPU mutual-exclusion flag (guarded by TASK_LOCK)
 _queue_cancel = threading.Event()    # set by /api/queue/stop to abort the run
+
+
+# --- #94 (UNVERIFIED, opt-in DEFAULT-OFF): debounced transcript flush ---------
+# Rapid single-word proofreading re-serializes the whole multi-MB transcript on
+# every edit. The debounce coalesces a burst into one write, but it is OFF by
+# default: env FVE_TRANSCRIPT_FLUSH_DEBOUNCE_SEC unset/0 -> inline flush on every
+# edit, byte-for-byte with the pre-change behavior. Set it >0 to opt in; the
+# task-start + shutdown/atexit force-flush hooks then bound the loss window.
+_TR_FLUSH_LOCK = threading.Lock()
+_tr_flush_timer: Optional[threading.Timer] = None
+_tr_flush_session = None    # сессия, захваченная взведённым таймером (W6 #10)
+
+
+def _tr_flush_debounce_sec() -> float:
+    """Debounce window in seconds. 0 (default) = disabled = inline flush."""
+    try:
+        return max(0.0, float(
+            os.environ.get("FVE_TRANSCRIPT_FLUSH_DEBOUNCE_SEC", "0") or 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _flush_transcript_now(s) -> None:
+    """Atomic tmp->os.replace of the transcript cache. uuid-unique tmp name so
+    two concurrent writers never collide (audit D-1). No-op without a session/
+    transcript. Never leaves a half-written file under the live name."""
+    if s is None or getattr(s, "transcript", None) is None:
+        return
+    cache_file = s.cache_dir / f"{s.audio_hash}.transcript.json"
+    tmp = cache_file.with_name(f"{cache_file.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        s.transcript.save(tmp)
+        os.replace(tmp, cache_file)
+    finally:
+        tmp.unlink(missing_ok=True)   # no-op после удачного replace
+
+
+def _schedule_transcript_flush(s, delay: float) -> None:
+    """Coalesce a burst of edits: (re)arm a single daemon timer that flushes the
+    captured session after ``delay`` idle seconds."""
+    global _tr_flush_timer, _tr_flush_session
+    with _TR_FLUSH_LOCK:
+        if _tr_flush_timer is not None:
+            _tr_flush_timer.cancel()
+        _tr_flush_session = s
+        _tr_flush_timer = threading.Timer(delay, _fire_transcript_flush, args=(s,))
+        _tr_flush_timer.daemon = True
+        _tr_flush_timer.start()
+
+
+def _fire_transcript_flush(s) -> None:
+    """Timer callback: СНАЧАЛА чистим pending-глобалы (иначе после первого
+    срабатывания каждый последующий force-flush заново сериализовал бы
+    мульти-МБ транскрипт — «No-op when no timer is pending» ломался), потом
+    флашим захваченную таймером сессию."""
+    global _tr_flush_timer, _tr_flush_session
+    with _TR_FLUSH_LOCK:
+        _tr_flush_timer = None
+        _tr_flush_session = None
+    _flush_transcript_now(s)
+
+
+def _force_flush_pending_transcript(s=None) -> None:
+    """Force a DEBOUNCED-but-unwritten transcript edit to disk NOW. No-op when no
+    timer is pending (i.e. debounce disabled) so default behavior is unchanged.
+    Called on task start and at shutdown/exit.
+
+    W6 #10: флашится сессия, ЗАХВАЧЕННАЯ взведённым таймером, и никогда другая:
+    смена клипа в окне дебаунса иначе отменяла таймер клипа А и флашила
+    нетронутый транскрипт клипа Б — правка А молча терялась. Если ``s`` — не
+    pending-сессия, таймер А оставляем взведённым (сам дофлашит A)."""
+    global _tr_flush_timer, _tr_flush_session
+    with _TR_FLUSH_LOCK:
+        pending = _tr_flush_timer is not None
+        target = _tr_flush_session
+        if (pending and s is not None and target is not None
+                and target is not s):
+            return          # чужая правка в очереди — её таймер не трогаем
+        if _tr_flush_timer is not None:
+            _tr_flush_timer.cancel()
+            _tr_flush_timer = None
+        _tr_flush_session = None
+    if pending:
+        _flush_transcript_now(target if target is not None
+                              else (s if s is not None else SESSION))
+
+
+def _quarantine_corrupt(path: Path) -> None:
+    """Rename a corrupt on-disk state file aside (never delete) so the ctor can
+    re-derive it instead of turning /api/open into a raw parser-error 400 (or a
+    startup exit-2 with --video). Best-effort — never raises."""
+    try:
+        bak = path.with_suffix(path.suffix + f".corrupt-{int(time.time())}")
+        os.replace(path, bak)
+        print(f"  повреждённый файл {path.name} отложен как {bak.name}; пересчитываю.")
+    except OSError:
+        pass
 
 
 class Session:
@@ -232,18 +357,47 @@ class Session:
         self.transcript: Optional[Transcript] = None
         self.cutlist: Optional[CutList] = None
         self.task = {"name": None, "running": False, "percent": 0.0,
-                     "stage": "", "error": None, "done": False, "results": None}
-        self._ctor_fresh_detect = False   # True if __init__ ran a fresh _detect()
+                     "stage": "", "error": None, "done": False, "results": None,
+                     "cancelled": False}
+        self._ctor_fresh_detect = False   # always False: the ctor never detects
+                                          # (kept: queue guard + tests read it)
 
-        # Load anything already on disk.
+        # Load anything already on disk. Detection is NO LONGER run here: it used
+        # to block /api/open for MINUTES on a synchronous LLM+VAD pass (no
+        # progress/cancel; a second /api/open raced two detections). A cached
+        # transcript with no VALID cutlist now leaves self.cutlist=None; the
+        # editor launches detection as a background task (open_session) and the
+        # batch queue detects explicitly. Corrupt files are quarantined, not fatal.
         cache_file = self.cache_dir / f"{self.audio_hash}.transcript.json"
         if cfg.transcribe.cache and cache_file.exists():
-            self.transcript = Transcript.load(cache_file)
+            try:
+                self.transcript = Transcript.load(cache_file)
+            except (ValueError, OSError):
+                _quarantine_corrupt(cache_file)          # corrupt cache -> re-transcribe
         if self.cutlist_path.exists():
-            self.cutlist = CutList.load_json(self.cutlist_path)
-        elif self.transcript is not None:
-            self.cutlist = self._detect()
-            self._ctor_fresh_detect = True
+            try:
+                loaded = CutList.load_json(self.cutlist_path)
+            except (ValueError, OSError):
+                _quarantine_corrupt(self.cutlist_path)   # corrupt -> re-detect later
+            else:
+                # The cutlist file is keyed by stem in a possibly SHARED out_dir;
+                # only trust it if it belongs to THIS video (cross-video / re-record).
+                # A foreign/stale list is dropped (self.cutlist stays None) so a
+                # later _detect() can't merge its stale manual cuts.
+                if self._cutlist_matches(loaded):
+                    self.cutlist = loaded
+                else:
+                    # W6 #1: отвергнутый файл вскоре ПЕРЕЗАПИШЕТ ленивый фоновый
+                    # _detect() (open_session/очередь). Это могут быть часы
+                    # ручной курации юзера — сначала best-effort копия в .bak,
+                    # чтобы разметка была восстановима.
+                    try:
+                        bak = self.cutlist_path.with_name(
+                            self.cutlist_path.name + ".bak")
+                        os.replace(self.cutlist_path, bak)
+                        print(f"  чужой/устаревший катлист отложен как {bak.name}")
+                    except OSError:
+                        pass
 
     # --- helpers -------------------------------------------------------------
     def _detect(self, cfg: Optional[Config] = None) -> CutList:
@@ -265,10 +419,31 @@ class Session:
         if self.cutlist is not None:
             cl.segments.extend(s for s in self.cutlist.segments if s.type == TYPE_MANUAL)
             cl.segments.sort(key=lambda s: s.start)
+        cl.audio_hash = self.audio_hash   # stamp so a reopen can validate ownership
         cl.save_json(self.cutlist_path)
         save_txt(cl, self.out_dir / f"{self.inp.stem}.cutlist.txt")
         self.cutlist = cl
         return cl
+
+    def _cutlist_matches(self, cl: CutList) -> bool:
+        """True if an on-disk cutlist belongs to THIS input. New cutlists carry
+        the source ``audio_hash``; legacy ones (no hash) fall back to an exact
+        source-path + duration match. Guards against a same-stem cutlist from a
+        different or re-recorded video sharing an out_dir."""
+        h = getattr(cl, "audio_hash", "")
+        if h:                                  # new cutlists carry the hash
+            # W6 #1: равенство хэша ДОСТАТОЧНО — хэш уже доказывает, что катлист
+            # от ЭТОГО видео; probe-клап (короткий стрим) легитимно сдвигает
+            # media.duration, и дрейф длительности тут не повод дропать.
+            return h == self.audio_hash
+        # legacy cutlist (no hash): source path (normcase — Windows, как в
+        # own_cutlist-проверке очереди) + duration. Толеранс 2.0 c: probe-клап
+        # ужимает duration до КОРОТЧАЙШЕГО стрима, так что легаси-катлист этого
+        # же файла может отличаться на v/a-перекос (0.5–2 c у OBS/телефона).
+        src_ok = (not cl.source) or (os.path.normcase(cl.source)
+                                     == os.path.normcase(str(self.inp)))
+        dur_ok = (not cl.duration) or abs(cl.duration - self.media.duration) <= 2.0
+        return src_ok and dur_ok
 
     def set_progress(self, frac: float) -> None:
         self.task["percent"] = round(min(1.0, max(0.0, frac)) * 100, 1)
@@ -277,6 +452,10 @@ class Session:
         self.task["stage"] = msg
 
     def start_task(self, name: str, fn) -> None:
+        # #94: any DEBOUNCED transcript edit must land on disk before a long
+        # task (transcribe/detect/render) starts. No-op when debounce is off
+        # (no pending timer) — default byte-for-byte.
+        _force_flush_pending_transcript(self)
         # The batch queue (F3) and the editor must never load models on the 8 GB
         # GPU at once. Check BOTH the queue flag and our own running flag
         # atomically under TASK_LOCK (which also guards _queue_running), then set
@@ -309,7 +488,34 @@ class Session:
 
 
 SESSION: Optional[Session] = None
-app = FastAPI(title="FastVideoEdit")
+
+
+@asynccontextmanager
+async def _lifespan(_app: "FastAPI"):
+    """ASGI lifespan: nothing to set up before serving (main() does that), but on
+    graceful shutdown (Ctrl+C / SIGTERM) run the ffmpeg-cancel + flush teardown.
+    Replaces the deprecated @app.on_event("shutdown") hook."""
+    yield
+    _cancel_ffmpeg_on_shutdown()
+
+
+app = FastAPI(title="FastVideoEdit", lifespan=_lifespan)
+
+
+def _cancel_ffmpeg_on_shutdown() -> None:
+    """uvicorn graceful shutdown (Ctrl+C / SIGTERM) -> terminate any tracked
+    ffmpeg so a daemon render thread can't keep an orphan encoding after the
+    server has quit (holding the GPU + locking the .part file). Idempotent;
+    safe when nothing is running. Invoked from the ASGI lifespan handler."""
+    try:
+        ffmpeg_utils.cancel_all()
+    except Exception:  # noqa: BLE001 — best-effort teardown, never raise on exit
+        pass
+    # #94: persist any debounced transcript edit on graceful ASGI shutdown.
+    try:
+        _force_flush_pending_transcript()
+    except Exception:  # noqa: BLE001 — best-effort teardown, never raise on exit
+        pass
 
 
 @app.middleware("http")
@@ -375,6 +581,17 @@ async def _csrf_guard(request: Request, call_next):
 def open_session(path: str) -> Session:
     global SESSION
     SESSION = Session(path, APP["cfg"], APP["out_dir"], APP["use_llm"])
+    s = SESSION
+    # The ctor no longer detects synchronously (that froze /api/open for minutes
+    # on an LLM+VAD pass). If we have a transcript but no valid cutlist, launch
+    # detection as a background TASK so the request returns immediately and the
+    # UI gets progress + cancel. A busy queue -> start_task raises 409; swallow
+    # it (the user can detect once the queue frees up).
+    if s.cutlist is None and s.transcript is not None:
+        try:
+            s.start_task("detect", lambda: s._detect())
+        except HTTPException:
+            pass
     return SESSION
 
 
@@ -533,6 +750,121 @@ def _write_detect_opts(opts: dict) -> None:
     effective options in memory; persistence is a bonus, never a 500.
     """
     p = _detect_opts_path()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(opts, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, p)
+    except OSError:
+        pass
+
+
+# --- авто-обогащение: настройки запуска (ENRICH_PLAN §5, cache/enrich_ui.json) --
+_ENRICH_TYPE_KEYS = ("image", "animation", "list_card", "cta")
+_ENRICH_DENSITIES = ("min", "normal", "aggressive")
+# "generate" = локальная SD-генерация (ТРЕК-2 §2); "auto" тоже умеет SD (папка →
+# SD → эмодзи → none). Должен совпадать с whitelist'ом sanitize_params (enrich.py).
+_ENRICH_IMAGE_SOURCES = ("auto", "emoji", "user_folder", "generate")
+
+
+def _enrich_opts_path() -> Path:
+    """``cache_dir/enrich_ui.json`` — персист настроек «Предложить монтаж»."""
+    return Path(APP["cfg"].paths.cache_dir) / "enrich_ui.json"
+
+
+def _default_enrich_opts() -> dict:
+    # ``vision`` — дефолт берём из конфига (render.vision_route.enabled), чтобы
+    # настройка в config.yaml не теряла смысл; пер-запусковое значение из UI
+    # всегда побеждает (юзер может включить/выключить прямо перед прогоном).
+    _vr = getattr(getattr(APP.get("cfg"), "render", None), "vision_route", None)
+    return {"types": {k: True for k in _ENRICH_TYPE_KEYS},
+            "density": "normal", "image_source": "auto",
+            "user_folder": "", "stocks": {"enabled": False},
+            "vision": bool(getattr(_vr, "enabled", False))}
+
+
+def _sanitize_enrich_opts(raw, *, strict: bool = True) -> dict:
+    """Whitelist-sanitize настроек обогащения в канонический вид (паттерн B5
+    _sanitize_detect_opts): ``strict=True`` (тело POST /api/enrich/suggest) —
+    неверный ТИП/значение вне белого списка → 400; ``strict=False`` (чтение
+    enrich_ui.json) — мусор молча заменяется дефолтом (битый файл не должен
+    ронять /api/state). Неизвестные ключи игнорируются в обоих режимах.
+
+    ``stocks.enabled`` принудительно False: стоки — Tier 2 (v1.1, строго
+    opt-in OFF); до их появления персист не имеет права хранить заранее
+    взведённый облачный тумблер (§4/§9 — приватность)."""
+    out = _default_enrich_opts()
+    if not isinstance(raw, dict):
+        if strict:
+            raise HTTPException(400, "Настройки обогащения: ожидается объект")
+        return out
+
+    t = raw.get("types")
+    if t is not None:
+        if not isinstance(t, dict):
+            if strict:
+                raise HTTPException(
+                    400, "types: ожидается объект {тип: true/false}")
+        else:
+            for k in _ENRICH_TYPE_KEYS:
+                if k not in t:
+                    continue
+                v = t[k]
+                if not isinstance(v, bool):
+                    if strict:
+                        raise HTTPException(400, f"types.{k}: ожидается "
+                                                 "true/false")
+                    continue
+                out["types"][k] = v
+
+    for key, allowed in (("density", _ENRICH_DENSITIES),
+                         ("image_source", _ENRICH_IMAGE_SOURCES)):
+        v = raw.get(key)
+        if v is None:
+            continue
+        if v in allowed:
+            out[key] = v
+        elif strict:
+            raise HTTPException(400, f"{key}: допустимы "
+                                     + ", ".join(allowed))
+
+    uf = raw.get("user_folder")
+    if uf is not None:
+        if isinstance(uf, str):
+            out["user_folder"] = uf.strip()
+        elif strict:
+            raise HTTPException(400, "user_folder: ожидается строка-путь")
+
+    vis = raw.get("vision")
+    if vis is not None:
+        if isinstance(vis, bool):
+            out["vision"] = vis
+        elif strict:
+            raise HTTPException(400, "vision: ожидается true/false")
+
+    st = raw.get("stocks")
+    if st is not None and not isinstance(st, dict) and strict:
+        raise HTTPException(400, "stocks: ожидается объект {enabled: false}")
+    # v1: стоков нет — что бы ни прислали/ни лежало в файле, enabled=False.
+    return out
+
+
+def _read_enrich_opts() -> Optional[dict]:
+    """Сохранённые настройки обогащения. ``None`` — не настраивали / битый файл
+    (= дефолты, паттерн detect_opts)."""
+    try:
+        data = json.loads(_enrich_opts_path().read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 — missing / unreadable / bad JSON
+        return None
+    if not isinstance(data, dict):
+        return None
+    return _sanitize_enrich_opts(data, strict=False)
+
+
+def _write_enrich_opts(opts: dict) -> None:
+    """Персист настроек атомарно (.tmp -> os.replace). Best-effort как
+    detect_ui.json: настройки уже применены к задаче, неудача записи — не 500."""
+    p = _enrich_opts_path()
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         tmp = p.with_suffix(".json.tmp")
@@ -773,6 +1105,24 @@ def _network_summary(offline: bool, st: dict) -> str:
 
 
 # --- shared render helpers (reused by /api/render AND the F3 queue worker) ----
+def _clean_stem(raw, fallback: str) -> str:
+    """Output stem from a UI/queue filename OR the input stem. BOTH are already
+    extension-less, so a blind ``Path(...).stem`` truncates a DOTTED name at its
+    last dot (``лекция.часть1`` -> ``лекция``), collapsing every ``stem_clipNN``
+    clip onto one file. Strip a trailing suffix ONLY when it is a known media
+    extension (so a stray ``.mp4`` a user typed is still cleaned)."""
+    raw = (str(raw) if raw is not None else "").strip() or fallback
+    p = Path(raw)
+    return (p.stem if p.suffix.lower() in VIDEO_EXT else p.name) or fallback
+
+
+def _with_ext(base: Path, ext: str) -> Path:
+    """Append ``ext`` WITHOUT ``Path.with_suffix`` (which truncates a dotted stem
+    at its last dot). Identical to ``with_suffix`` for the common non-dotted
+    stem, so existing single-format outputs are byte-for-byte unchanged."""
+    return base.parent / (base.name + ext)
+
+
 def _resolve_render_opts(s: Session, opts: dict):
     """Translate UI/queue render-opts into (cfg, scale_h, fps, out_dir, base).
 
@@ -783,13 +1133,16 @@ def _resolve_render_opts(s: Session, opts: dict):
     if opts.get("encoder") in ("nvenc", "x264"):
         cfg.render.encoder = opts["encoder"]
     q = opts.get("quality")
-    if isinstance(q, (int, float)):
+    if isinstance(q, (int, float)) and not isinstance(q, bool):
         q = max(0, min(51, int(q)))   # H.264/HEVC QP/CRF range
         cfg.render.nvenc.qp = q
         cfg.render.nvenc.cq = q
         cfg.render.x264.crf = q
     if opts.get("audio_bitrate"):
-        cfg.render.audio_bitrate = str(opts["audio_bitrate"])
+        ab = str(opts["audio_bitrate"]).strip()
+        if not re.fullmatch(r"\d{2,4}k", ab):    # whitelist «128k»…«320k»
+            raise HTTPException(400, "audio_bitrate: ожидается вид «128k»…«320k»")
+        cfg.render.audio_bitrate = ab
     if opts.get("censor_method") in ("partial", "pitch", "lowpass", "reverse"):
         cfg.censor.method = opts["censor_method"]
     if "subtitles" in opts:
@@ -822,7 +1175,10 @@ def _resolve_render_opts(s: Session, opts: dict):
             b.outline_color = str(bs["outline_color"])
         if bs.get("position") in ("bottom", "top", "center"):
             b.position = bs["position"]
-        b.karaoke = bool(bs.get("karaoke", True))
+        if "karaoke" in bs:                      # absent -> keep config.yaml value
+            b.karaoke = bool(bs["karaoke"])
+        if "kinetic" in bs:                      # keyword "pop" (default off)
+            b.kinetic = bool(bs["kinetic"])
         # C1 (пресеты стилей): числовые поля, которых нет среди «сырых» полей
         # UI — приходят только целым пресетом. Клампы — здравые пределы ASS;
         # мусор молча игнорируется (значение из config.yaml остаётся).
@@ -942,6 +1298,24 @@ def _resolve_render_opts(s: Session, opts: dict):
     else:
         cfg.render.music.enabled = False
 
+    # --- авто-обогащение (ENRICH_PLAN §5) ------------------------------------
+    # Контракт как у music: без явного opts.enrich = {enabled:true} обогащение
+    # ВЫКЛЮЧЕНО — даже если config.yaml включил его в сессии. Любой мусор
+    # вместо объекта (строка/число/null) тоже честно выключает. min_score —
+    # служебная ручка Авто-пака (score>=70 поверх enabled, без ревью); мусор
+    # в ней игнорируется, значение клампится в 0..100.
+    en = opts.get("enrich")
+    if isinstance(en, dict) and en.get("enabled"):
+        cfg.render.enrich.enabled = True
+        ms = en.get("min_score")
+        if ms is not None and not isinstance(ms, bool):
+            try:                       # NaN → ValueError, ±inf → OverflowError
+                cfg.render.enrich.min_score = max(0, min(100, int(ms)))
+            except (TypeError, ValueError, OverflowError):
+                pass
+    else:
+        cfg.render.enrich.enabled = False
+
     # --- scale_h: None (source) or an int in [144, 4320] ---------------------
     # When vertical is on, the exact target scale is baked into the crop filter,
     # so the generic height resize is ignored (forced to None) to avoid a double
@@ -956,11 +1330,15 @@ def _resolve_render_opts(s: Session, opts: dict):
             raise HTTPException(400, "scale_h must be an integer (144–4320)")
         if not (144 <= scale_h <= 4320):
             raise HTTPException(400, "scale_h must be between 144 and 4320")
+        if scale_h % 2:                          # yuv420p требует чётную высоту
+            scale_h -= 1
         if scale_h == s.media.height:            # identity -> let copy fast-path win
             scale_h = None
 
     # --- fps: None (source) or 0 < fps <= 120 --------------------------------
     fps = opts.get("fps") or None                # None = source fps
+    if isinstance(fps, bool):                    # JSON true/false — не fps
+        raise HTTPException(400, "fps must be a number (0 < fps <= 120)")
     if fps is not None:
         try:
             fps = float(fps)
@@ -973,16 +1351,33 @@ def _resolve_render_opts(s: Session, opts: dict):
 
     out_dir = Path(opts.get("out_dir") or s.out_dir).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
-    stem = Path((opts.get("filename") or s.inp.stem).strip() or s.inp.stem).stem
+    stem = _clean_stem(opts.get("filename") or s.inp.stem, s.inp.stem)
     base = out_dir / stem
     return cfg, scale_h, fps, out_dir, base
+
+
+def _final_render_dims(s: Session, scale_h,
+                       vert_dims: Optional[tuple[int, int]]) -> tuple[int, int]:
+    """(W, H) финального кадра — для PlayRes ASS-файлов и планировщика enrich.
+
+    Ровно та логика, что исторически жила в ass-блоке _run_render_pipeline:
+    vertical → точная цель кропа; иначе высота = scale_h (или исходная),
+    ширина — пропорциональна источнику."""
+    if vert_dims is not None:
+        return vert_dims
+    out_h = int(scale_h) if scale_h else (s.media.height or 1080)
+    src_w = s.media.width or 1920
+    src_h = s.media.height or 1080
+    out_w = int(round(src_w * out_h / src_h)) if src_h else 1920
+    return out_w, out_h
 
 
 def _run_render_pipeline(s: Session, cfg, scale_h, fps, out_dir: Path,
                          base: Path, on_progress, on_stage,
                          cutlist_override: Optional[CutList] = None,
                          edge_fade: float = 0.0,
-                         sidecar_base: Optional[Path] = None) -> dict:
+                         sidecar_base: Optional[Path] = None,
+                         should_cancel=None) -> dict:
     """Render mp4 + (optional) subtitles + chapters, returning the results dict.
 
     ``on_progress(frac)`` / ``on_stage(msg)`` are callbacks so the same body
@@ -1009,7 +1404,13 @@ def _run_render_pipeline(s: Session, cfg, scale_h, fps, out_dir: Path,
     legacy behavior: sidecars share ``base`` with the mp4."""
     cl = cutlist_override or s.cutlist
     tr = s.transcript
-    removed, _ = resolve(cl)
+    removed, _ = resolve(cl)                     # raw — facecrop outer span only
+    # R1: the SAME sliver-filtered removed set render() actually encodes. Every
+    # burned/sidecar subtitle, chapter, metadata and enrich Timeline below is
+    # built from removed_eff so its timestamps match the rendered video — a
+    # dropped sub-min_segment sliver otherwise desyncs every following cue and
+    # the error accumulates over the length of the video.
+    _, removed_eff = render_mod.effective_cut(cl, s.media, cfg)
 
     # C: vertical 9:16 Shorts crop. Detect the face X-center (center='auto') once
     # here — render() stays pure and just receives the finished crop,scale filter.
@@ -1056,20 +1457,14 @@ def _run_render_pipeline(s: Session, cfg, scale_h, fps, out_dir: Path,
     if cfg.subtitles.burn.enabled and tr is not None:
         try:
             on_stage("Подготовка вшитых субтитров…")
-            tl_ass = Timeline(removed, s.media.duration)
+            tl_ass = Timeline(removed_eff, s.media.duration)
             words_final = remap_words(tr.all_words(), tl_ass)
             cues_ass = subs_mod.build_cues(
                 words_final, s.matcher, cfg.subtitles, cfg.masking,
                 tl_ass.new_duration())
-            if vert_dims is not None:
-                # Vertical: PlayRes must match the cropped+scaled output so style
-                # sizes/margins are pixel-accurate against the 9:16 frame.
-                out_w, out_h = vert_dims
-            else:
-                out_h = int(scale_h) if scale_h else (s.media.height or 1080)
-                src_w = s.media.width or 1920
-                src_h = s.media.height or 1080
-                out_w = int(round(src_w * out_h / src_h)) if src_h else 1920
+            # Vertical: PlayRes must match the cropped+scaled output so style
+            # sizes/margins are pixel-accurate against the 9:16 frame.
+            out_w, out_h = _final_render_dims(s, scale_h, vert_dims)
             # Clip Maker (план §2.3.4): per-clip имя ASS, чтобы клипы цикла не
             # перетирали один burn.ass; обычный рендер — прежнее имя бит-в-бит.
             ass_name = ("burn.ass" if cutlist_override is None
@@ -1085,36 +1480,133 @@ def _run_render_pipeline(s: Session, cfg, scale_h, fps, out_dir: Path,
             on_stage(f"Вшитые субтитры: не удалось подготовить ({e}); рендер без них.")
             ass_path = None
 
+    # ENRICH (ENRICH_PLAN §5): оверлеи авто-обогащения — ТОЛЬКО основной рендер.
+    # Клипы Clip Maker и автопак-клипы идут по cutlist_override-пути и
+    # обогащение не получают (анти-скоуп §9). mp4 свят (паттерн burn-блока):
+    # нет плана / несвежий hash / любой сбой подготовки → лог-warning через
+    # on_stage и рендер БЕЗ обогащения, задача не падает.
+    render_enrich = None
+    if cfg.render.enrich.enabled and cutlist_override is None:
+        try:
+            plan = enrich_mod.load_enrich(_enrich_json_path(s))
+            if plan is None:
+                on_stage("Обогащение: план не найден (enrich.json) — "
+                         "рендер без обогащения.")
+            elif plan.hash != s.audio_hash:
+                on_stage("Обогащение: план от другого видео (hash не совпал) — "
+                         "рендер без обогащения.")
+            else:
+                ms = int(cfg.render.enrich.min_score or 0)
+                if ms > 0:           # автопак: score>=70 ПОВЕРХ enabled (§5)
+                    plan.items = [it for it in plan.items if it.score >= ms]
+                tl_enr = Timeline(removed_eff, s.media.duration)
+                out_w, out_h = _final_render_dims(s, scale_h, vert_dims)
+                re_plan = enrich_mod.plan_render(
+                    plan, tl_enr, tr.all_words() if tr is not None else None,
+                    cfg, out_w, out_h,
+                    log=lambda m="": on_stage(str(m).strip() or "Обогащение…"))
+                if re_plan.cards or re_plan.cta_texts:
+                    # Карточки/вопрос CTA — отдельный ASS (идёт ПЕРВЫМ
+                    # subtitles-фильтром, burn.ass остаётся последним, §2.2).
+                    enr_ass = Path(s.work_dir) / f"enrich_{base.name}.ass"
+                    enrich_cards.write_enrich_ass(
+                        re_plan.cards, re_plan.cta_texts, out_w, out_h,
+                        enr_ass,
+                        subs_top_1080=(enrich_cards.subs_zone_top_1080(
+                            cfg.subtitles.burn, cfg.subtitles.max_lines)
+                            if cfg.subtitles.burn.enabled else None))
+                    re_plan.cards_ass = str(enr_ass)
+                if re_plan.stills or re_plan.anims or re_plan.cards_ass:
+                    render_enrich = re_plan
+                else:
+                    on_stage("Обогащение: в плане нет применимых предложений — "
+                             "рендер без оверлеев.")
+        except Exception as e:  # noqa: BLE001 — enrichment is best-effort
+            on_stage(f"Обогащение: не удалось подготовить ({e}); рендер без него.")
+            render_enrich = None
+
     on_stage("Рендер видео…")
+    # enrich передаётся kwarg-ом только когда он есть: пустой/выключенный план
+    # оставляет вызов render() бит-в-бит прежним (легаси-контракт).
+    enrich_kw = {"enrich": render_enrich} if render_enrich is not None else {}
     rr = render_mod.render(
-        s.ff, s.media, cl, cfg, base.with_suffix(".mp4"), s.work_dir,
+        s.ff, s.media, cl, cfg, _with_ext(base, ".mp4"), s.work_dir,
         on_progress=on_progress,
         log=lambda m="": on_stage(str(m).strip() or "Рендер видео…"),
         scale_h=scale_h, fps=fps, ass_path=ass_path, crop_filter=crop_filter,
-        edge_fade=edge_fade)
+        edge_fade=edge_fade,
+        # W6 #8: очередь передаёт свой стоп-сигнал (у её throwaway-Session флаг
+        # task['cancelled'] никто не ставит); редактор — прежний дефолт.
+        should_cancel=(should_cancel
+                       or (lambda: bool(s.task.get("cancelled")))), **enrich_kw)
+
+    # R1 render-output-validate: the mp4 is the irreplaceable artifact, but
+    # ffmpeg can exit 0 and still write a SHORT file (crash-interrupted source,
+    # VFR metadata overstating the decodable stream). Report a MEASURED duration
+    # and fail loudly on a gross shortfall instead of toasting a truncated render
+    # as done. A probe failure must NOT lose the mp4 (best-effort — mirrors the
+    # burn/enrich try). ``expected`` is render()'s EFFECTIVE (post-sliver) value,
+    # so with R1 the comparison is exact and the tolerance only covers muxer
+    # rounding. One-sided (fails only when SHORTER) so container padding never
+    # false-alarms.
+    expected = float(rr.get("new_duration") or 0.0)
+    probed = None
+    out_mp4 = rr.get("out")
+    if s.ff is not None and out_mp4 and expected > 0:
+        try:
+            fmt = s.ff.probe(out_mp4).get("format", {})
+            probed = float(fmt.get("duration", 0.0) or 0.0)
+        except Exception:  # noqa: BLE001 — probe is best-effort, never lose the mp4
+            probed = None
+    if probed is not None:
+        frame = (1.0 / s.media.fps) if s.media.fps else 0.04
+        if probed + 0.5 + frame < expected:
+            raise RuntimeError(
+                f"Рендер оборвался: выходной файл {probed:.1f} с короче "
+                f"ожидаемых {expected:.1f} с (ffmpeg завершился с кодом 0, но "
+                f"записал меньше). Файл оставлен для проверки: {out_mp4}. / "
+                f"Render truncated: output {probed:.1f}s vs expected "
+                f"{expected:.1f}s.")
 
     sr: dict = {}
     subtitles_ok = not cfg.subtitles.enabled
     if cfg.subtitles.enabled:
         try:
             on_stage("Субтитры…")
-            sr = subs_mod.generate(tr, removed, cfg.subtitles, cfg.masking,
+            sr = subs_mod.generate(tr, removed_eff, cfg.subtitles, cfg.masking,
                                    s.matcher, sidecar_base or base,
                                    log=lambda *_: None)
             subtitles_ok = True
         except Exception as e:  # noqa: BLE001 — keep the rendered mp4
             sr = {"error": str(e)}
 
+    # #62: stem-key the txt sidecars so two videos rendered into the same
+    # out_dir can't overwrite each other's chapters/metadata. Regular render:
+    # sidecar_base is None -> sc == base (out_dir/<stem>), so the file is
+    # out_dir/<stem>.chapters.txt. The results dict still returns the real path
+    # (cr.get('path')/meta_path.resolve()); the UI links it with a static label.
+    sc = sidecar_base or base
+    chapters_out = _with_ext(sc, ".chapters.txt")
     cr: dict = {}
     chapters_ok = not cfg.chapters.enabled
     if cfg.chapters.enabled:
         try:
             on_stage("Главы…")
-            cr = chapters_mod.generate(tr, removed, cfg.chapters,
-                                       out_dir / "chapters.txt", llm=s.llm,
+            cr = chapters_mod.generate(tr, removed_eff, cfg.chapters,
+                                       chapters_out, llm=s.llm,
                                        matcher=s.matcher, mask=cfg.masking,
                                        log=lambda *_: None, on_stage=on_stage)
             chapters_ok = True
+            # #36-restore: mirror into the preview cache — GET /api/chapters (the
+            # single reload-restore source) reads work_dir/preview_chapters.txt,
+            # while the render sidecar lives at out/<stem>.chapters.txt (#62).
+            # Best-effort: a cache write failure must not harm the render.
+            try:
+                if chapters_out.exists():
+                    (s.work_dir / "preview_chapters.txt").write_text(
+                        chapters_out.read_text(encoding="utf-8"), encoding="utf-8")
+            except OSError:
+                pass
         except Exception as e:  # noqa: BLE001 — keep the rendered mp4
             cr = {"error": str(e)}
 
@@ -1128,27 +1620,36 @@ def _run_render_pipeline(s: Session, cfg, scale_h, fps, out_dir: Path,
     if cfg.metadata.enabled and s.llm is not None:
         try:
             on_stage("Метаданные…")
-            chapters_txt = out_dir / "chapters.txt"
+            chapters_txt = chapters_out
             mr = metadata_mod.generate(
-                tr, removed, cfg.metadata, s.llm,
+                tr, removed_eff, cfg.metadata, s.llm,
                 chapters_path=chapters_txt if chapters_txt.exists() else None,
                 matcher=s.matcher, mask=cfg.masking, log=lambda *_: None)
             if mr.get("title") or mr.get("description"):
-                meta_path = out_dir / "metadata.txt"
+                meta_path = _with_ext(sc, ".metadata.txt")
                 meta_path.write_text(
                     "TITLE:\n" + mr.get("title", "") +
                     "\n\nHOOK:\n" + mr.get("hook", "") +
                     "\n\nDESCRIPTION:\n" + mr.get("description", "") +
                     "\n\nTAGS:\n" + ", ".join(mr.get("tags", [])) + "\n",
                     encoding="utf-8")
+                # #36-restore: mirror into the preview cache (same JSON shape the
+                # preview_metadata task writes) so GET /api/metadata restores the
+                # Мета tab after a render + reload. Best-effort.
+                try:
+                    (s.work_dir / "preview_metadata.json").write_text(
+                        json.dumps(mr, ensure_ascii=False), encoding="utf-8")
+                except OSError:
+                    pass
             metadata_ok = True
         except Exception as e:  # noqa: BLE001 — keep the rendered mp4
             mr = {"error": str(e)}
 
-    tl = Timeline(removed, s.media.duration)
+    tl = Timeline(removed_eff, s.media.duration)
     return {
         "mp4": rr.get("out"), "encoder": rr.get("encoder"),
         "new_duration": round(tl.new_duration(), 1),
+        "new_duration_probed": round(probed, 1) if probed is not None else None,
         "old_duration": round(s.media.duration, 1),
         "out_dir": str(out_dir.resolve()),
         "srt": sr.get("srt"), "vtt": sr.get("vtt"),
@@ -1236,13 +1737,32 @@ def _render_formats(s: Session, opts: dict, formats: list[str],
     если не удался НИ ОДИН (а попытки были) — задача падает, как раньше.
     """
     n = len(formats)
-    stem = Path((opts.get("filename") or s.inp.stem).strip() or s.inp.stem).stem
+    stem = _clean_stem(opts.get("filename") or s.inp.stem, s.inp.stem)
     src_w = s.media.width or 0
     src_h = s.media.height or 0
     entries: list[dict] = []
     merged: Optional[dict] = None
     errors: list[str] = []
     sidecars_done = False
+    # Perf (#85): the AUTO face-center depends only on (source, whole-file
+    # range) — cutlist_override is None in the formats path, so detect_center
+    # scans the SAME span for every cropped format and returns the SAME cx.
+    # Detect it ONCE here and feed it back explicitly per format so
+    # _run_render_pipeline takes the explicit-float branch instead of re-
+    # scanning per format (removes N-1 face-detection passes). Only when the
+    # client left the center on 'auto' — an explicit user center is respected
+    # untouched. detect_center never raises (0.5 fallback); the guard is belt-
+    # and-suspenders.
+    fixed_center: Optional[str] = None
+    wants_crop = any(f != "source" for f in formats)
+    if wants_crop and str(opts.get("vertical_center", "auto") or "auto") == "auto":
+        try:
+            cx = facecrop_mod.detect_center(
+                s.media.path, s.ff, s.media.duration,
+                samples=s.cfg.render.vertical.samples, start=0.0, end=None)
+            fixed_center = f"{min(1.0, max(0.0, float(cx))):.4f}"
+        except Exception:  # noqa: BLE001 — detection is best-effort (0.5 fallback)
+            fixed_center = None
     for i, f in enumerate(formats):
         if is_cancelled():
             break                                  # cancel между форматами
@@ -1270,6 +1790,10 @@ def _render_formats(s: Session, opts: dict, formats: list[str],
                 "note": "совпадает с исходным форматом — пропущено "
                         "(дубль не рендерим)"})
             continue
+        # Perf (#85): feed the once-detected center so this cropped format
+        # skips its own face-detection pass (same crop, N-1 fewer scans).
+        if fixed_center is not None and f != "source":
+            opts_i["vertical_center"] = fixed_center
         if sidecars_done:
             opts_i.update(subtitles=False, chapters=False, metadata=False)
         if n > 1:
@@ -1342,8 +1866,9 @@ def _queue_process_one(job: QueueJob) -> None:
             raise RuntimeError("Очередь остановлена")
 
     _chk()
-    # Build a throwaway Session for this clip. The constructor probes media,
-    # loads any cached transcript, and (if a transcript exists) auto-detects.
+    # Build a throwaway Session for this clip. The constructor probes media and
+    # loads any cached transcript/cutlist; it NEVER auto-detects (deferred-
+    # detect refactor) — step (2) below runs detection explicitly when needed.
     ls = Session(job.path, APP["cfg"], job.out_dir, APP["use_llm"])
 
     def prog(frac: float) -> None:
@@ -1368,12 +1893,27 @@ def _queue_process_one(job: QueueJob) -> None:
             log=lambda m="": stage(str(m).strip() or job.stage),
             on_progress=lambda f: prog(0.05 + f * 0.35))
 
-    # (2) detection. If the ctor LOADED an on-disk cutlist (prior editor
-    #     session), re-detect so stale edits can't leak in. If the ctor just
-    #     generated a FRESH cutlist from a cached transcript, skip the
-    #     redundant (LLM-heavy) second pass.
+    # (2) detection. The ctor NEVER detects now (deferred-detect refactor:
+    #     _ctor_fresh_detect stays False on a real Session — the flag/guard are
+    #     kept for the queue-worker test fakes). Skip detection (and do
+    #     NOT overwrite the file) when the ctor loaded an on-disk cutlist that
+    #     BELONGS to this exact input (its `source` == this file): that is the
+    #     user's curated cutlist, and _detect() would save over it, reverting
+    #     every enable/disable toggle (only TYPE_MANUAL cuts survive its merge).
+    #     Re-detect only for a genuinely foreign/stale cutlist (missing or
+    #     mismatched `source`).
     _chk()
-    if not getattr(ls, "_ctor_fresh_detect", False):
+    # Free any opt-in cached Whisper model BEFORE the LLM detect / SD / render
+    # stages so a resident large-v3 never collides with qwen3 on the 8 GB card.
+    # No-op unless transcribe.cache_model was enabled (the cache stays empty).
+    transcribe_mod.release_whisper_cache()
+    _loaded_cl = getattr(ls, "cutlist", None)
+    own_cutlist = (
+        _loaded_cl is not None
+        and os.path.normcase(str(getattr(_loaded_cl, "source", "") or ""))
+            == os.path.normcase(str(getattr(ls, "inp", "")))
+    )
+    if not getattr(ls, "_ctor_fresh_detect", False) and not own_cutlist:
         stage("Детекция вырезов…")
         ls._detect()
     prog(0.45)
@@ -1381,11 +1921,42 @@ def _queue_process_one(job: QueueJob) -> None:
     # (3) render (+ optional subtitles/chapters), reusing the editor path.
     _chk()
     cfg, scale_h, fps, out_dir, base = _resolve_render_opts(ls, job.render_opts)
+    # Collision guard (#62): the batch queue defaults every job to the shared
+    # out_dir and derives the mp4 base purely from the stem, so a SECOND video
+    # sharing a stem would silently overwrite the first (both then report the
+    # same 'done' path). A per-output '.source' marker records which audio_hash
+    # owns <base>.mp4; when a DIFFERENT video owns it, uniquify with a hash
+    # suffix instead of clobbering. The interactive editor never runs this path,
+    # so its overwrite-on-re-render semantics are untouched.
+    _renamed = False
+    if base is not None:
+        mp4 = _with_ext(base, ".mp4")
+        marker = _with_ext(base, ".source")
+        prior = marker.read_text(encoding="utf-8").strip() if marker.exists() else ""
+        if mp4.exists() and prior and prior != str(ls.audio_hash):
+            base = base.parent / f"{base.name}-{str(ls.audio_hash)[:6]}"
+            job.stage = f"Имя занято другим видео — сохраняю как {base.name}.mp4"
+            _renamed = True
     # Map the render's 0..1 onto the remaining 0.45..1.0 of the job bar.
+    # W6 #8: пробрасываем стоп очереди в render() — иначе Stop во время 2-pass
+    # loudnorm-замера / DFN-экстракта глотался как graceful degradation и ПОСЛЕ
+    # остановки стартовал полный многочасовой энкод (задача завершалась 'done').
     job.result = _run_render_pipeline(
         ls, cfg, scale_h, fps, out_dir, base,
         on_progress=lambda f: prog(0.45 + f * 0.55),
-        on_stage=stage)
+        on_stage=stage,
+        should_cancel=lambda: (_queue_cancel.is_set()
+                               or bool(getattr(ls, "task", {}).get("cancelled"))))
+    # W6 #14 (#62): маркер владения пишем ПОСЛЕ удачного рендера — упавший
+    # рендер иначе оставлял маркер без mp4 (ложное владение именем).
+    if base is not None:
+        try:
+            _with_ext(base, ".source").write_text(str(ls.audio_hash),
+                                                  encoding="utf-8")
+        except OSError:
+            pass
+    if _renamed and isinstance(job.result, dict):
+        job.result["renamed"] = base.name
     prog(1.0)
     job.status = "done"
 
@@ -1399,7 +1970,19 @@ def _queue_worker() -> None:
             if job is not None:
                 job.status = "running"
         if job is None:
-            break
+            # Drain: no pending job. Clear _queue_running atomically with a
+            # final pending re-check under TASK_LOCK — the SAME lock
+            # _start_queue_worker checks the flag under. Without this, a
+            # queue/add + queue/start landing between 'saw no pending' and
+            # 'cleared the flag' is a lost wakeup. Lock order TASK_LOCK->
+            # QUEUE_LOCK matches every other nesting (nothing takes QUEUE_LOCK
+            # then TASK_LOCK).
+            with TASK_LOCK:
+                with QUEUE_LOCK:
+                    if any(j.status == "pending" for j in QUEUE):
+                        continue
+                _queue_running = False
+            return
         # Persist the pending->running transition (outside QUEUE_LOCK, which
         # _save_queue re-acquires for its snapshot — calling it under the lock
         # would deadlock). A crash now leaves status='running' on disk, which
@@ -1460,6 +2043,7 @@ WATCH_LOCK = threading.Lock()        # guards WATCH / WATCH_PROCESSED / WATCH_ST
 WATCH: dict = {"enabled": False, "folder": None, "render_opts_preset": "current"}
 WATCH_PROCESSED: dict[str, dict] = {}   # normcase(path) -> {"size": int, "mtime": float}
 WATCH_STATUS: dict = {"error": None, "last_scan": None}
+WATCH_GEN = 0                        # bumped under WATCH_LOCK on every watch_set
 _watch_thread: Optional[threading.Thread] = None
 _watch_stop = threading.Event()      # личный Event ТЕКУЩЕГО потока (см. _watch_apply)
 
@@ -1574,7 +2158,19 @@ def scan_once(folder: Path, registry: dict[str, dict],
             pending.pop(key, None)
             continue                        # уже обработан и не менялся
         if pending.get(key) == (size, mtime):
-            # Двухфазная стабильность: размер/время не менялись целый скан.
+            # Двухфазная стабильность пройдена. Но «размер стабилен» ≠ «файл
+            # разлочен»: некоторые рекордеры/копиры держат ЭКСКЛЮЗИВНЫЙ лок уже
+            # после того, как файл перестал расти (мультиплексор финализирует
+            # длинный ролик). Промоутить сейчас — первый же job упадёт на
+            # probe/hash, уедет в error, а файл уже в registry и НИКОГДА не
+            # переедет снова. Пробуем открыть на shared-read: залочен —
+            # оставляем в pending, ждём следующего скана (ключ не трогаем,
+            # ретрай бесплатный).
+            try:
+                with open(path, "rb"):
+                    pass
+            except OSError:
+                continue
             pending.pop(key, None)
             registry[key] = {"size": size, "mtime": mtime}
             new_files.append(path)
@@ -1608,6 +2204,7 @@ def _watch_tick(folder_str: str, pending: dict[str, tuple[int, float]]) -> int:
     """
     log = logging.getLogger("fastvideoedit.watch")
     with WATCH_LOCK:
+        gen = WATCH_GEN
         before = {k: dict(v) for k, v in WATCH_PROCESSED.items()}
     registry = {k: dict(v) for k, v in before.items()}
 
@@ -1636,6 +2233,14 @@ def _watch_tick(folder_str: str, pending: dict[str, tuple[int, float]]) -> int:
         _save_queue()
 
     with WATCH_LOCK:
+        if gen != WATCH_GEN:
+            # watch_set пере-сидировал реестр (смена папки), пока шёл наш
+            # lock-free скан. `registry` построен из ДО-seed копии; запись
+            # затёрла бы seed, и новый наблюдатель загнал бы в очередь весь
+            # старый архив. Бросаем свой write-back — реестром владеет новое
+            # поколение.
+            WATCH_STATUS["last_scan"] = time.time()
+            return enqueued
         WATCH_PROCESSED.clear()
         WATCH_PROCESSED.update(registry)
         WATCH_STATUS["error"] = None
@@ -1714,10 +2319,17 @@ def S() -> Session:
 
 
 def _guard_no_task() -> None:
-    """409 if a background task is in flight (mutating endpoints use this)."""
-    if SESSION is not None and SESSION.task["running"]:
+    """409 if a background task is in flight (mutating endpoints use this).
+
+    Read the running flags under TASK_LOCK (the same lock start_task /
+    _start_queue_worker set them under) so a mutating endpoint can't observe a
+    half-committed start."""
+    with TASK_LOCK:
+        task_running = SESSION is not None and SESSION.task["running"]
+        queue_running = _queue_running
+    if task_running:
         raise HTTPException(409, "Идёт фоновая задача — дождитесь её завершения")
-    if _queue_running:
+    if queue_running:
         raise HTTPException(409, "Очередь обрабатывает ролики — дождитесь её "
                                  "завершения или остановите очередь")
 
@@ -1737,7 +2349,9 @@ def state():
                 "queue_running": _queue_running,
                 "queue_pending": _queue_pending_count(),
                 # B5: saved detection options (null = never configured).
-                "detect_opts": _read_detect_opts()}
+                "detect_opts": _read_detect_opts(),
+                # ENRICH §5: настройки «Предложить монтаж» (null = дефолты).
+                "enrich_opts": _read_enrich_opts()}
     s = S()
     m = s.media
     return {
@@ -1764,6 +2378,14 @@ def state():
         "defaults": {
             "encoder": s.cfg.render.encoder,
             "quality": s.cfg.render.nvenc.qp if s.cfg.render.encoder == "nvenc" else s.cfg.render.x264.crf,
+            # Per-encoder quality so the modal seeds the right value when the user
+            # switches encoder (#46) instead of a hardcoded 19/17.
+            "quality_nvenc": s.cfg.render.nvenc.qp,
+            "quality_x264": s.cfg.render.x264.crf,
+            # Seed the burn-subtitles / chapters checkboxes from config.yaml so a
+            # config `enabled: false` is honoured instead of hardcoding true (#38).
+            "subtitles": s.cfg.subtitles.enabled,
+            "chapters": s.cfg.chapters.enabled,
             "audio_bitrate": s.cfg.render.audio_bitrate,
             "censor_method": s.cfg.censor.method,
             "denoise": s.cfg.render.denoise.enabled,
@@ -1792,6 +2414,13 @@ def state():
         # B5: saved detection options from cache/detect_ui.json (null = never
         # configured -> /api/detect runs with the untouched session cfg).
         "detect_opts": _read_detect_opts(),
+        # ENRICH §5: настройки «Предложить монтаж» (null = дефолты) + компактная
+        # сводка плана для бутстрапа 5-й вкладки (count/stale, как clips).
+        "enrich_opts": _read_enrich_opts(),
+        "enrich": _enrich_state(s),
+        # ТРЕК-2 §2: SD-генерация настроена? (тумблер+бинарь+модель) — UI красит
+        # warning-баннер «SD не настроен — эмодзи-фолбэк» под источником картинок.
+        "imagegen_ready": _sd_configured(s.cfg),
         "queue_running": _queue_running,   # F3: editor can flag a busy queue
         # P2-#6: pending count (incl. a queue restored from queue.json with the
         # worker stopped) so the «📋 Очередь» badge lights up on first load.
@@ -1816,9 +2445,10 @@ def browse(dir: Optional[str] = None, kind: Optional[str] = None):
     base = base.resolve()
     if not base.exists() or not base.is_dir():
         raise HTTPException(404, "Folder not found")
-    # kind="music": файл-пикер фоновой музыки (C3) — показываем аудио и видео
-    # из MUSIC_EXT; любой другой kind — прежний список видеофайлов.
-    exts = MUSIC_EXT if kind == "music" else VIDEO_EXT
+    # kind="music": файл-пикер фоновой музыки (C3) — аудио+видео из MUSIC_EXT;
+    # kind="image": пикер «заменить ассет» обогащения (§4) — картинки IMAGE_EXT;
+    # любой другой kind (в т.ч. "folder"/"video"/None) — прежний список видео.
+    exts = {"music": MUSIC_EXT, "image": IMAGE_EXT}.get(kind, VIDEO_EXT)
     folders, files = [], []
     try:
         for e in sorted(base.iterdir(), key=lambda p: p.name.lower()):
@@ -1878,12 +2508,24 @@ async def upload(request: Request, name: str = "video.mp4"):
     total = 0
     try:
         with open(tmp, "wb") as f:
+            # #93: f.write is a blocking syscall; on a single-loop uvicorn a
+            # multi-GB upload would otherwise stall every other in-flight
+            # response in bursts (loopback receive outruns disk write). Offload
+            # writes so the event loop stays responsive — но W6 #15: сетевые
+            # ~64КБ-чанки копим в ~1МБ буфер: один thread-hop на чанк стоил
+            # ~0.1–0.3 мс диспетчеризации (порядка минуты на 30 ГБ).
+            buf = bytearray()
             async for chunk in request.stream():
                 total += len(chunk)
                 if total > MAX_UPLOAD_BYTES:
                     raise HTTPException(413, "Файл слишком большой (>30 ГБ). "
                                              "/ File too large (>30 GB).")
-                f.write(chunk)
+                buf += chunk
+                if len(buf) >= (1 << 20):
+                    await anyio.to_thread.run_sync(f.write, bytes(buf))
+                    buf.clear()
+            if buf:
+                await anyio.to_thread.run_sync(f.write, bytes(buf))
         os.replace(tmp, dest)
     except BaseException:
         try:
@@ -2001,19 +2643,17 @@ def put_transcript_word(payload: dict = Body(...)):
     prefix = old[: len(old) - len(old.lstrip())]
     w.word = prefix + new
     segs[si].text = _join_words(words)
-    # Атомарная запись кэша: пишем .tmp и подменяем os.replace — обрыв/краш
-    # посреди записи никогда не оставляет полу-файл под живым именем.
-    # Имя tmp УНИКАЛЬНО на вызов (audit D-1): два параллельных PUT (быстрые
-    # правки соседних слов) с общим .tmp на Windows ловили PermissionError на
-    # os.replace → ложный 500 при уже применённой в памяти правке. С uuid каждый
-    # пишет свой файл, последний replace побеждает с полным состоянием памяти.
-    cache_file = s.cache_dir / f"{s.audio_hash}.transcript.json"
-    tmp = cache_file.with_name(f"{cache_file.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        s.transcript.save(tmp)
-        os.replace(tmp, cache_file)
-    finally:
-        tmp.unlink(missing_ok=True)   # no-op после удачного replace
+    # #94: the in-memory edit above is already applied (GET reads memory). By
+    # default (env FVE_TRANSCRIPT_FLUSH_DEBOUNCE_SEC unset/0) flush the atomic
+    # tmp->os.replace INLINE on every edit — byte-for-byte with the prior
+    # behavior. Opt-in debounce (>0) coalesces a burst of edits into one write;
+    # the task-start + shutdown/atexit force-flush hooks guarantee no edit is
+    # lost. The uuid-unique tmp name (audit D-1) is preserved in both paths.
+    debounce = _tr_flush_debounce_sec()
+    if debounce > 0:
+        _schedule_transcript_flush(s, debounce)
+    else:
+        _flush_transcript_now(s)
     return {"ok": True, "text": w.word, "segment_text": segs[si].text}
 
 
@@ -2029,9 +2669,47 @@ def get_cutlist():
 def put_cutlist(payload: dict = Body(...)):
     s = S()
     _guard_no_task()
+    # Validate every segment BEFORE from_dict (#61), which does d["id"] /
+    # float(d[...]) with no checks (KeyError-500 on a missing key) and silently
+    # accepts the NaN/±Infinity literals json.loads permits. An unguarded NaN is
+    # written into cutlist.json by save_json (allow_nan default True) and then
+    # bricks every later GET /api/cutlist (JSONResponse uses allow_nan=False ->
+    # 500), a 500 that survives restart. Mirror the /api/clips/render guard.
+    raw_segs = payload.get("segments", [])
+    if not isinstance(raw_segs, list):
+        raise HTTPException(400, "segments должен быть списком")
+    duration = float(s.media.duration)
+    for i, d in enumerate(raw_segs):
+        if not isinstance(d, dict):
+            raise HTTPException(400, f"Сегмент №{i + 1}: ожидается объект")
+        for k in ("id", "type", "action"):
+            if not isinstance(d.get(k), str) or not d.get(k):
+                raise HTTPException(
+                    400, f"Сегмент №{i + 1}: поле «{k}» должно быть непустой строкой")
+        try:
+            start, end = float(d.get("start")), float(d.get("end"))
+        except (TypeError, ValueError):
+            raise HTTPException(
+                400, f"Сегмент №{i + 1}: start/end должны быть числами (секунды)")
+        if not (math.isfinite(start) and math.isfinite(end)):
+            raise HTTPException(
+                400, f"Сегмент №{i + 1}: start/end должны быть конечными числами")
+        if end <= start:
+            raise HTTPException(400, f"Сегмент №{i + 1}: пустой/обратный диапазон")
+        if start < -0.001 or start >= duration + 0.001:
+            raise HTTPException(400, f"Сегмент №{i + 1}: границы вне ролика")
+        # W6 #2: end > duration НЕ отвергаем — это легитимный детекторный хвост
+        # (Whisper таймкодит ПОЛНОЕ аудио, probe-клап мог укоротить duration;
+        # сервер сам отдаёт такие сегменты в GET). 400 здесь ломал автосейв
+        # НАВСЕГДА: UI шлёт ВСЕ сегменты, один хвост = каждый PUT падает.
+        # Clamp to [0, duration] so a past-EOF trim can't reach ffmpeg; from_dict
+        # re-reads these mutated values below.
+        d["start"] = max(0.0, min(duration, start))
+        d["end"] = min(duration, end)
     cl = CutList.from_dict(payload)
     cl.duration = s.media.duration
     cl.source = str(s.inp)
+    cl.audio_hash = s.audio_hash   # stamp so a user-edited cutlist validates on reopen
     s.cutlist = cl
     cl.save_json(s.cutlist_path)
     save_txt(cl, s.out_dir / f"{s.inp.stem}.cutlist.txt")
@@ -2316,6 +2994,30 @@ def export_nle(body: dict = Body(default={})):
             "format": fmt, "segments": len(kept)}
 
 
+def _enrich_preview_roots() -> set[Path]:
+    """V2 «Монтаж» preview roots for /api/output: the code-graphic cache
+    (``cache/codegfx``, written by ``_run_schematic_candidates`` /
+    ``codegfx.render``) and the diffusion cache (``cache/enrich_img``, written by
+    ``imagegen.generate_*``). Both writers root at ``Path("cache")`` (cwd) and the
+    configured ``cfg.paths.cache_dir`` is the same folder — we include both forms
+    so previews resolve regardless of how the server was launched. The
+    relative-path guard in ``output()`` still confines reads to these subdirs."""
+    bases: set[Path] = set()
+    try:
+        bases.add(Path(APP["cfg"].paths.cache_dir))
+    except Exception:  # noqa: BLE001 — no cfg yet -> fall back to cwd cache
+        pass
+    bases.add(Path("cache"))
+    roots: set[Path] = set()
+    for b in bases:
+        for sub in ("codegfx", "enrich_img"):
+            try:
+                roots.add((b / sub).resolve())
+            except Exception:  # noqa: BLE001
+                continue
+    return roots
+
+
 @app.get("/api/output/{name}")
 def output(name: str):
     # Serve from the editor's out dirs AND every queue job's out dir, so result
@@ -2335,6 +3037,10 @@ def output(name: str):
                 roots.add(Path(j.out_dir).resolve())
             except Exception:  # noqa: BLE001
                 continue
+    # V2 «Монтаж» honest previews live in the cache, not out_dir — add their
+    # roots so the candidate <img src=/api/output/<basename>> resolves to the
+    # real rendered PNG instead of a 404 (MONTAGE_V2_PLAN §3 «конец лажи»).
+    roots |= _enrich_preview_roots()
     # Only ever hand back files we actually produce. Without this an out_dir
     # pointed at a populated folder would let /api/output read ANY file there by
     # name (matters most if the server is bound to a non-loopback host).
@@ -2619,7 +3325,17 @@ def queue_stop():
     """Abort the running queue: flag it and kill any in-flight ffmpeg. The
     current job ends in 'error: Очередь остановлена'; pending jobs stay pending."""
     _queue_cancel.set()
-    ffmpeg_utils.cancel_all()
+    # cancel_all() is PROCESS-WIDE (kills every registered ffmpeg). Only fire it
+    # when the queue is really running — otherwise a stale Stop button (queue
+    # finished, editor render started) or an out-of-band call would terminate the
+    # editor's ffmpeg with a raw exit-1 dump instead of a clean cancel. Same
+    # editor<->queue exclusion invariant /api/cancel relies on. Read the flag
+    # under TASK_LOCK (which guards _queue_running); no QUEUE_LOCK is taken, so
+    # the TASK_LOCK-before-QUEUE_LOCK order invariant is untouched.
+    with TASK_LOCK:
+        running = _queue_running
+    if running:
+        ffmpeg_utils.cancel_all()
     return {"ok": True}
 
 
@@ -2635,11 +3351,24 @@ def queue_remove(body: dict = Body(...)):
 
 
 @app.post("/api/queue/clear")
-def queue_clear():
-    """Drop every job that isn't currently running (pending/done/error)."""
+def queue_clear(body: Optional[dict] = Body(default=None)):
+    """Drop finished/queued jobs.
+
+    Back-compat: with no body, clears every non-running job (pending/done/error).
+    Pass {"statuses": ["done", "error"]} to clear ONLY those statuses, so pending
+    batch jobs the user queued survive — this is what the «Очистить завершённые»
+    button sends. Running jobs are never removed.
+    """
+    statuses = None
+    if isinstance(body, dict) and isinstance(body.get("statuses"), list):
+        statuses = {str(s) for s in body["statuses"]}
     with QUEUE_LOCK:
         before = len(QUEUE)
-        QUEUE[:] = [j for j in QUEUE if j.status == "running"]
+        if statuses is None:
+            QUEUE[:] = [j for j in QUEUE if j.status == "running"]
+        else:
+            QUEUE[:] = [j for j in QUEUE
+                        if j.status == "running" or j.status not in statuses]
         removed = before - len(QUEUE)
     _save_queue()
     return {"ok": True, "removed": removed}
@@ -2660,6 +3389,7 @@ def watch_set(body: dict = Body(...)):
     Включение (или смена папки) СИДИРУЕТ реестр текущим содержимым папки:
     обрабатываются только файлы, появившиеся ПОСЛЕ включения, — как и обещает
     UI. В ответе ``seeded`` — сколько уже лежавших видео помечено «не трогать»."""
+    global WATCH_GEN
     enabled = bool(body.get("enabled", False))
     folder_raw = str(body.get("folder") or "").strip()
     folder: Optional[str] = folder_raw or None
@@ -2710,6 +3440,7 @@ def watch_set(body: dict = Body(...)):
     with WATCH_LOCK:
         WATCH["enabled"] = enabled
         WATCH["folder"] = folder
+        WATCH_GEN += 1                       # смена папки/seed — новое поколение
         WATCH_PROCESSED.update(seed)
         if not enabled:
             WATCH_STATUS["error"] = None
@@ -2880,14 +3611,16 @@ def _save_clips_json(s: Session, cands: list) -> None:
         "clips": [asdict(c) for c in cands],
     }
     p = _clips_json_path(s)
+    tmp = p.with_name(f"{p.name}.{uuid.uuid4().hex}.tmp")   # audit D-1: уникальный tmp
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
                        encoding="utf-8")
         os.replace(tmp, p)
     except OSError:
         pass  # non-fatal: candidates are already in task['results']
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _load_clips_json(s: Session) -> Optional[dict]:
@@ -2952,6 +3685,36 @@ def get_clips():
             # файлы до F6 писались без rank_source — тогда порядок и был
             # round-robin (MVP-сортировка)
             "rank_source": data.get("rank_source", "round_robin")}
+
+
+@app.get("/api/chapters")
+def get_chapters():
+    """Уже сгенерированные главы (work_dir/preview_chapters.txt) — для
+    восстановления вкладки «Главы» при перезагрузке, как GET /api/clips. Файла
+    нет -> пустой список (200, не 404). Read-only, без _guard_no_task."""
+    s = S()
+    p = s.work_dir / "preview_chapters.txt"
+    if not p.exists():
+        return {"chapters": []}
+    try:
+        return {"chapters": _parse_chapters_txt(str(p))}
+    except Exception:  # noqa: BLE001 — битый файл: пустая вкладка лучше 500
+        return {"chapters": []}
+
+
+@app.get("/api/metadata")
+def get_metadata():
+    """Уже сгенерированные метаданные (work_dir/preview_metadata.json) — для
+    восстановления вкладки «Мета». Файла нет -> ``metadata: null`` (200).
+    Read-only, без _guard_no_task."""
+    s = S()
+    p = s.work_dir / "preview_metadata.json"
+    if not p.exists():
+        return {"metadata": None}
+    try:
+        return {"metadata": json.loads(p.read_text(encoding="utf-8"))}
+    except Exception:  # noqa: BLE001 — битый файл: пустая вкладка лучше 500
+        return {"metadata": None}
 
 
 # F7: жёсткие пределы длительности клипа при правке границ из UI (сек).
@@ -3031,14 +3794,623 @@ def clips_save(body: dict = Body(default={})):
     clip["dur_eff"] = round(max(0.0, dur_raw - tl.removed_overlap(start, end)), 3)
 
     p = _clips_json_path(s)
+    # audit D-1: уникальное имя tmp на вызов — параллельные save с общим .tmp на
+    # Windows ловили PermissionError на os.replace → ложный 500. Последний
+    # replace побеждает; tmp чистится в finally.
+    tmp = p.with_name(f"{p.name}.{uuid.uuid4().hex}.tmp")
     try:
-        tmp = p.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2),
                        encoding="utf-8")
         os.replace(tmp, p)
     except OSError as e:
         raise HTTPException(500, f"Не удалось сохранить clips.json: {e}")
+    finally:
+        tmp.unlink(missing_ok=True)
     return {"ok": True, "clip": clip}
+
+
+# --- ENRICH_PLAN §5: авто-обогащение — план, suggest, save ----------------------
+def _enrich_json_path(s: Session) -> Path:
+    """``out/<stem>.enrich.json`` — где живёт план обогащения (§1.2)."""
+    return s.out_dir / f"{s.inp.stem}.enrich.json"
+
+
+def _save_enrich_json(s: Session, plan: "enrich_mod.EnrichPlan") -> None:
+    """Persist плана из задачи suggest — best-effort (зеркало _save_clips_json):
+    результат задачи уже в ``task['results']``, файл лишь кормит GET /api/enrich
+    при повторном открытии; неудача записи не должна валить LLM-пасс. Строгая
+    запись (500 юзеру) — только в /api/enrich/save, где юзер ждёт подтверждение."""
+    try:
+        enrich_mod.save_enrich(plan, _enrich_json_path(s))
+    except OSError:
+        pass  # non-fatal: план уже в task['results']
+
+
+def _enrich_state(s: Session) -> dict:
+    """Компактная сводка для GET /api/state: {count, stale} (полные items —
+    GET /api/enrich). ``count`` — все предложения плана (счётчик вкладки),
+    ``stale`` — план от другого аудио (hash-инвалидация, как clips)."""
+    plan = enrich_mod.load_enrich(_enrich_json_path(s))
+    if plan is None:
+        return {"count": 0, "stale": False}
+    if plan.hash != s.audio_hash:
+        return {"count": 0, "stale": True}
+    return {"count": len(plan.items), "stale": False}
+
+
+def _run_enrich_detectors(s: Session, params: dict, log) -> list:
+    """P3 (ENRICH_PLAN §7-P3): три LLM-детектора §3.1–3.3 (списки / CTA /
+    иллюстрации, vpipe/enrich_llm.py) + этап ассетов §4 (P5). ``s.llm`` уже
+    есть (llm_off отсечён в эндпоинте); ``params`` — полные настройки запуска,
+    детекторам уходит их whitelist-подмножество (sanitize_params), а
+    ``user_folder`` (Tier 1, §4) — отдельным kwarg (в params-блок плана §1.2 он
+    не входит). Прогресс задачи — по детекторам (lists 45 / cta 15 /
+    illustrations 30 / assets 10); сбойное окно/детектор/этап не валит задачу
+    (warnings уходят в log)."""
+    _cg = getattr(s.cfg.render, "codegfx", None)
+    _cg_style = getattr(_cg, "codegfx_style", enrich_mod.SCHEMATIC_STYLE_DEF)
+    return enrich_llm.detect_all(
+        s.transcript, s.cutlist, enrich_mod.sanitize_params(params), s.llm,
+        log=log, on_progress=s.set_progress,
+        user_folder=(params or {}).get("user_folder", ""),
+        codegfx_style=_cg_style)
+
+
+def _sd_configured(cfg: Config) -> bool:
+    """SD-генерация реально доступна: тумблер включён И бинарь sd-cli И модель
+    .gguf резолвятся (паттерн opt-in DeepFilterNet). Решает, запускать ли этап
+    images и показывать ли warning-баннер «SD не настроен» (ТРЕК-2 §2)."""
+    ig = cfg.render.imagegen
+    if not ig.imagegen_enabled:
+        return False
+    return bool(imagegen_mod._resolve_sd_bin(ig.imagegen_bin)
+                and imagegen_mod._resolve_model(ig.imagegen_model))
+
+
+def _wait_ollama_unloaded(s: Session, log, *, tries: int = 20,
+                          delay: float = 0.5) -> None:
+    """VRAM-менеджер (§2): выгрузить qwen3 и дождаться пустого GET /api/ps перед
+    SD-этапом (8 ГБ карта не вместит LLM+SDXL). best-effort: нет Ollama / не
+    выгрузилась за tries опросов — всё равно идём дальше (--max-vram подстрахует),
+    задачу не валим."""
+    if s.llm is None:
+        return
+    s.llm.unload()
+    for _ in range(max(1, tries)):
+        if not s.llm.loaded_models():
+            return
+        time.sleep(delay)
+    log("  SD: Ollama не выгрузилась за отведённое время — "
+        "продолжаю (sd-cli с --max-vram).")
+
+
+def _run_vision_route(s: Session, items: list, params: dict, log) -> Optional[dict]:
+    """Vision-route (МОНТАЖ variant C, opt-in): показать VLM реальные кадры
+    каждого визуального кандидата и заветить/переназначить «слоп» (схема поверх
+    лица ИЛИ поверх уже-визуального экрана). Своя VRAM-фаза: выгружаем текстовую
+    LLM → занимаем слот vision-моделью → судим → выгружаем VLM (перед SD-этапом).
+
+    Выключено по умолчанию (render.vision_route.enabled=false — не меняем монтаж
+    без спроса). Недоступная Ollama / нескачанная модель / сбой → тихий пропуск:
+    стадия best-effort, монтаж никогда здесь не падает. Возврат — stats или None
+    (стадия не запускалась)."""
+    vr = getattr(s.cfg.render, "vision_route", None)
+    if vr is None:
+        return None
+    # Пер-запусковый тумблер вкладки «Монтаж» ПОБЕЖДАЕТ конфиг (его дефолт сам
+    # берётся из конфига — см. _default_enrich_opts), чтобы юзер мог включить/
+    # выключить стадию прямо перед прогоном, не правя config.yaml.
+    want = (params or {}).get("vision")
+    if not (bool(want) if isinstance(want, bool)
+            else bool(getattr(vr, "enabled", False))):
+        return None
+    targets = [it for it in items
+               if getattr(it, "type", "") in vision_route_mod.VISUAL_TYPES
+               and getattr(it, "enabled", True)]
+    if not targets:
+        return None
+    # VRAM (§2): сначала освободить текстовую модель, затем занять слот VLM.
+    _wait_ollama_unloaded(s, log)
+    vcfg = s.cfg.llm.model_copy(update={
+        "model": vr.model, "timeout": int(vr.timeout_s), "num_ctx": 8192,
+        "think": False, "keep_alive": 0, "temperature": 0.0})
+    vclient = get_client(vcfg)
+    if vclient is None or not vclient.available():
+        log("  vision-route: Ollama недоступна — стадия пропущена")
+        return None
+    if not vclient.has_model(vr.model):
+        log(f"  vision-route: модель {vr.model} не установлена — стадия "
+            f"пропущена (ollama pull {vr.model})")
+        return None
+    def _card_factory(it, title: str, bullets: list) -> bool:
+        """Кросс-тип image→list_card: заменяем payload картинки на карточку-список
+        из title+bullets, что VLM собрал по кадру. t_word пунктов размазан по
+        [t_start,t_end] — пункты проявляются последовательно, как у обычных
+        list_card. Меняем и type айтема; остальной пайплайн рисует его нативно."""
+        t0 = float(getattr(it, "t_start", 0.0) or 0.0)
+        t1 = float(getattr(it, "t_end", t0) or t0)
+        span = max(0.0, t1 - t0)
+        n = max(1, len(bullets))
+        cards = [enrich_mod.CardItem(
+            text=str(b).strip()[:enrich_mod.CARD_ITEM_TEXT_MAX],
+            word_idx=int(getattr(it, "word_start", -1) or -1),
+            t_word=max(0.0, t0 + (span * i / n if n > 1 else 0.0)))
+            for i, b in enumerate(bullets)]
+        it.payload = enrich_mod.ListCardPayload(
+            title=str(title).strip()[:80], items=cards)
+        it.type = enrich_mod.ENR_LIST_CARD
+        return True
+
+    s.stage(f"Монтаж: vision-роутер ({len(targets)} кандидатов)…")
+    stats = None
+    try:
+        stats = vision_route_mod.route(
+            items, s.inp, s.ff.ffmpeg, vclient, vr, log=log,
+            on_progress=s.set_progress, card_factory=_card_factory)
+    except Exception as e:  # noqa: BLE001 — best-effort: не валим монтаж
+        log(f"  vision-route: стадия упала ({e}) — продолжаю без неё")
+    finally:
+        try:
+            vclient.unload(vr.model)          # освободить VRAM перед SD-этапом
+        except Exception:  # noqa: BLE001
+            pass
+    return stats
+
+
+def _codegfx_cache_path(cache_root: Path, intent: str, style: str,
+                        fields: dict) -> Path:
+    """Детерминированный путь PNG код-схемы: cache/codegfx/<sha1>.png (intent+
+    style+fields). Один и тот же кандидат между прогонами/перерендерами =
+    мгновенно (как кэш SD)."""
+    blob = json.dumps({"i": intent, "s": style, "f": fields},
+                      sort_keys=True, ensure_ascii=False)
+    key = hashlib.sha1(blob.encode("utf-8")).hexdigest()
+    return (cache_root / "codegfx" / f"{key}.png").resolve()
+
+
+def _run_schematic_candidates(s: Session, items: list, log) -> int:
+    """Стадия images (часть 1, §2/§4): отрендерить ВСЕ schematic-кандидаты через
+    код-графику (codegfx.render.render_schematic, CPU/headless-Chrome, 0 VRAM —
+    можно ДО unload Ollama). Пишет ``asset_path``/``preview`` в кандидат (рендер
+    ролика берёт его через ImagePayload.resolved_asset()). codegfx-модуль —
+    домен другого агента; импорт ЗАЩИЩЁН (нет модуля/Chrome → кандидат остаётся
+    без PNG, UI покажет none/диффузию; задача НЕ падает). Возврат — число
+    отрендеренных schematic-кандидатов."""
+    cfg_cg = getattr(s.cfg.render, "codegfx", None)
+    if cfg_cg is not None and not getattr(cfg_cg, "codegfx_enabled", True):
+        return 0
+    # точки с хотя бы одним schematic-кандидатом
+    targets: list[tuple] = []          # (candidate dict, payload)
+    for it in items:
+        pl = getattr(it, "payload", None)
+        cands = getattr(pl, "candidates", None) if pl is not None else None
+        for c in (cands or []):
+            if isinstance(c, dict) and c.get("source") == "schematic" \
+                    and c.get("fields"):
+                targets.append((c, pl))
+    if not targets:
+        return 0
+    try:
+        from vpipe.codegfx.render import render_schematic_cached
+    except Exception as e:  # noqa: BLE001 — codegfx ещё не готов / нет Chrome
+        log(f"  Код-схема: движок недоступен ({e}) — schematic-кандидаты без "
+            "превью (UI покажет none/диффузию).")
+        return 0
+    # Perf (#95): route through the idempotent, WxH-aware cache wrapper — it
+    # computes cache/codegfx/<sha1>.png itself and returns the ready PNG WITHOUT
+    # relaunching headless Chrome when a valid one already exists.
+    s.stage(f"Монтаж: код-схемы ({len(targets)})…")
+    made = 0
+    for c, _pl in targets:
+        intent = c.get("intent", "")
+        style = c.get("style", "minimal")
+        fields = c.get("fields") or {}
+        try:
+            path = render_schematic_cached(intent, fields, style, cfg=cfg_cg,
+                                           log=log)
+        except Exception as e:  # noqa: BLE001 — одна схема не валит остальные
+            log(f"  Код-схема «{intent}» упала ({e}).")
+            path = None
+        if path:
+            c["asset_path"] = str(path)
+            c["preview"] = str(path)
+            made += 1
+    return made
+
+
+def _run_enrich_images(s: Session, items: list, params: dict, log) -> int:
+    """Стадия images (MONTAGE_V2 §2/§4): сначала код-схемы (CPU, до unload),
+    потом диффузия фото-кандидатов (после unload Ollama, VRAM-менеджер §5).
+
+    Зовётся ПОСЛЕ детекторов/стадии кандидатов и ПЕРЕД планировщиком. Порядок:
+      1. ``_run_schematic_candidates`` — рендер schematic-кандидатов код-графикой
+         (0 VRAM, безопасно до выгрузки Ollama);
+      2. диффузия: для каждой photo-точки (выбранный diffusion-кандидат) гоним
+         N сидов (``generate_candidates``) → превью в кандидаты, выбранному —
+         asset_path. Только при image_source ∈ {generate, auto} И настроенном SD.
+    Сбой любой части не валит задачу. Возврат — число материализованных
+    (schematic + diffusion) ассетов."""
+    made = 0
+    try:
+        made += _run_schematic_candidates(s, items, log)
+    except Exception as e:  # noqa: BLE001 — код-схемы не валят задачу
+        log(f"enrich: стадия код-схем упала ({e}) — пропускаю")
+
+    src = (params or {}).get("image_source", "auto")
+    # diffusion-точки = выбранный кандидат source==diffusion (синхронизирован в
+    # плоский asset_kind="generate" этапом ассетов — но источник правды кандидат).
+    diff_pts = [it for it in items
+                if _has_diffusion_candidate(getattr(it, "payload", None))]
+    if src not in ("generate", "auto") or not diff_pts:
+        return made
+    if not _sd_configured(s.cfg):
+        log("  SD не настроен (бинарь/модель) — фото-кандидаты без генерации "
+            f"({len(diff_pts)} шт., останутся none/эмодзи).")
+        return made
+    s.stage(f"Монтаж: генерация фото ({len(diff_pts)})…")
+    _wait_ollama_unloaded(s, log)
+    base = 1.0 - enrich_llm.PROGRESS_WEIGHTS["assets"]
+    n = len(diff_pts)
+    try:
+        for i, it in enumerate(diff_pts):
+            s.set_progress(base + enrich_llm.PROGRESS_WEIGHTS["assets"] * i / n)
+            made += _generate_point_candidates(it.payload, s.cfg.render.imagegen,
+                                               log)
+        s.set_progress(1.0 - enrich_llm.PROGRESS_WEIGHTS["assets"]
+                       + enrich_llm.PROGRESS_WEIGHTS["assets"])
+    except Exception as e:  # noqa: BLE001 — сбойный SD-этап не валит задачу
+        log(f"enrich: этап генерации фото упал ({e})")
+    return made
+
+
+def _has_diffusion_candidate(pl) -> bool:
+    """payload несёт хотя бы один diffusion-кандидат (V2) ИЛИ старый плоский
+    asset_kind=="generate" (обратная совместимость)."""
+    if pl is None:
+        return False
+    cands = getattr(pl, "candidates", None) or []
+    if any(isinstance(c, dict) and c.get("source") == "diffusion"
+           for c in cands):
+        return True
+    return getattr(pl, "asset_kind", None) == "generate"
+
+
+def _generate_point_candidates(pl, ig_cfg, log) -> int:
+    """Сгенерировать N=4 SD-кандидата всем diffusion-кандидатам одной точки и
+    записать превью в кандидаты; выбранному diffusion-кандидату — asset_path.
+    Старый плоский план (без candidates) — откат на enrich_image_batch ([pl]).
+    Возврат — 1 если выбранный visual материализовался, иначе 0."""
+    cands = getattr(pl, "candidates", None) or []
+    diff_idx = [i for i, c in enumerate(cands)
+                if isinstance(c, dict) and c.get("source") == "diffusion"]
+    if not diff_idx:                              # старый плоский путь
+        return imagegen_mod.enrich_image_batch([type("P", (), {"payload": pl})()],
+                                               ig_cfg, log)
+    sel = getattr(pl, "selected", 0)
+    materialized = 0
+    for i in diff_idx:
+        c = cands[i]
+        prompt = c.get("prompt") or ""
+        try:
+            paths = imagegen_mod.generate_candidates(prompt, ig_cfg, log=log)
+        except Exception as e:  # noqa: BLE001 — одна точка не валит остальные
+            log(f"  SD: фото-кандидат упал ({e}).")
+            paths = []
+        if paths:
+            c["asset_path"] = paths[0]
+            c["preview"] = paths[0]
+            # доп. сиды как отдельные diffusion-кандидаты (листание §3): добираем
+            # до потолка CANDIDATES_MAX, не дублируя.
+            for extra in paths[1:]:
+                if len(cands) >= enrich_mod.CANDIDATES_MAX:
+                    break
+                cands.append({"source": "diffusion", "prompt": prompt,
+                              "seed": -1, "asset_path": extra,
+                              "preview": extra})
+            if i == sel:
+                pl.asset_kind = "user"
+                pl.asset_path = paths[0]
+                materialized = 1
+    return materialized
+
+
+def _merge_enrich_user_state(s: Session, items: list) -> list:
+    """Повторный suggest НЕ уничтожает работу юзера (§1: «ИИ предлагает —
+    юзер решает»; CRITICAL код-ревью P2). Протокол мержа со старым планом:
+
+    - совпавший id → переносим ``enabled``-решение юзера, а при ``edited`` —
+      и правки целиком (payload + тайминги); свежие поля детектора
+      (score/quote/reason) остаются новыми;
+    - ручные предложения (``source:"user"``) переезжают в новый план целиком —
+      детекторы их не переоткроют;
+    - исчезнувшие LLM-предложения честно уходят (новый анализ);
+    - план от ДРУГОГО аудио не мержится — полная hash-инвалидация,
+      как в GET /api/enrich и save."""
+    old = enrich_mod.load_enrich(_enrich_json_path(s))
+    if old is None or old.hash != s.audio_hash:
+        return items
+    prev_by_id = {it.id: it for it in old.items}
+    # Детекторы дают КАЖДОМУ предложению свежий random id (item_from_dict ->
+    # new_item_id) на каждом прогоне, поэтому матч ТОЛЬКО по id НИКОГДА не
+    # переносит ревью LLM-предложений между запусками. Стабильный ключ — по
+    # ОРИГИНАЛЬНЫМ word-индексам (они не смещаются при смене катлиста — ровно
+    # тогда юзер и перезапускает анализ): (type, word_start, word_end). Ручные
+    # (source:"user") в ключ НЕ кладём — они переезжают явным extend ниже.
+    prev_by_key: dict[tuple, object] = {}
+    for it in old.items:
+        if it.source == "user":
+            continue
+        prev_by_key.setdefault((it.type, it.word_start, it.word_end), it)
+    carried_ids: set[str] = set()            # id СТАРЫХ items, уже перенесённых
+    for it in items:
+        prev = prev_by_id.get(it.id) or \
+            prev_by_key.get((it.type, it.word_start, it.word_end))
+        if prev is None:
+            continue
+        carried_ids.add(prev.id)
+        it.enabled = prev.enabled            # решение юзера — закон
+        if prev.edited:                      # правки текста/таймингов — тоже
+            it.payload = prev.payload
+            it.t_start = prev.t_start
+            it.t_end = prev.t_end
+            it.edited = True
+    items.extend(p for p in old.items
+                 if p.source == "user" and p.id not in carried_ids)
+    return items
+
+
+@app.post("/api/enrich/suggest")
+def enrich_suggest(body: dict = Body(default={})):
+    """Предложения авто-обогащения (§5) — фоновая задача ``enrich``.
+
+    Паттерн /api/clips/suggest: 409 без транскрипта/катлиста; без LLM —
+    мгновенный 200 ``{ok:false, reason:'llm_off'}`` БЕЗ задачи (и без персиста
+    настроек — нечего применять); занятая задача/очередь → 409. Тело — настройки
+    запуска (types/density/image_source/user_folder): strict-sanitize (B5),
+    персист в cache/enrich_ui.json, затем фоновая задача: детекторы (P3-хук) →
+    мерж с прошлым планом (_merge_enrich_user_state: повторный запуск не
+    теряет enabled/edited и ручные предложения юзера) → планировщик статусов →
+    out/<stem>.enrich.json (hash + cutlist_rev)."""
+    s = S()
+    if s.transcript is None or s.cutlist is None:
+        raise HTTPException(409, "Transcribe and detect first")
+    if s.llm is None:
+        return {"ok": False, "reason": "llm_off"}
+    _guard_no_task()
+
+    opts = _sanitize_enrich_opts(body if isinstance(body, dict) else {},
+                                 strict=True)
+    _write_enrich_opts(opts)
+    # Блок params плана (§1.2) — подмножество настроек (whitelist в enrich.py).
+    params = enrich_mod.sanitize_params(opts)
+
+    def run():
+        s.stage("Монтаж: анализ…")
+        items = _run_enrich_detectors(s, opts, log=s.stage)
+        # Vision-route (variant C, opt-in): VLM смотрит реальные кадры и ветит/
+        # переназначает «слоп» ДО дорогой генерации ассетов. Своя VRAM-фаза
+        # (выгрузит текстовую LLM, отсудит, выгрузит VLM). Выкл по умолчанию.
+        # Передаём ПОЛНЫЕ opts (а не whitelist-params плана): тумблер «vision» —
+        # настройка запуска, в params-блок плана §1.2 он не входит.
+        _run_vision_route(s, items, opts, log=s.stage)
+        # Этап images (ТРЕК-2 §2): SD-генерация для точек asset_kind="generate".
+        # ПОСЛЕ детекторов (VRAM-менеджер выгрузит Ollama), ДО мержа/планировщика:
+        # генерим только свежие точки детектора, мерж затем хранит ревью юзера.
+        _run_enrich_images(s, items, params, log=s.stage)
+        # Повторный анализ не теряет ревью юзера: enabled/edited и ручные
+        # предложения переезжают из старого плана (CRITICAL код-ревью P2).
+        items = _merge_enrich_user_state(s, items)
+        plan = enrich_mod.EnrichPlan(
+            hash=s.audio_hash,
+            # cutlist_rev — снимок enabled-вырезов НА МОМЕНТ анализа (§1.2);
+            # катлист не сменится под задачей (PUT /api/cutlist держит
+            # _guard_no_task), но честнее снять его внутри задачи.
+            cutlist_rev=enrich_mod.compute_cutlist_rev(s.cutlist),
+            model=s.cfg.llm.model, params=params, items=items)
+        # Планировщик — для статусов/auto-disable, которые увидит UI (§5):
+        # координаты исходника (рендер пересчитает под свой выход).
+        s.stage("Монтаж: планировщик…")
+        removed_now, _ = resolve(s.cutlist)
+        enrich_mod.plan_render(
+            plan, Timeline(removed_now, s.media.duration),
+            s.transcript.all_words(), s.cfg,
+            s.media.width or 1920, s.media.height or 1080,
+            log=lambda *_: None)
+        _save_enrich_json(s, plan)
+        s.task["results"] = {"enrich": {
+            "items": [it.to_dict() for it in plan.items],
+            "params": params}}
+
+    s.start_task("enrich", run)
+    return {"ok": True}
+
+
+@app.get("/api/enrich")
+def get_enrich():
+    """Сохранённый план (§5): ``{items, params, stale, cutlist_changed}``.
+
+    Hash-валидация как у клипов: план от другого аудио → ``stale:true`` и
+    пустые items (полная инвалидация). Несовпавший cutlist_rev — лишь мягкий
+    баннер ``cutlist_changed:true`` (рендер всё равно корректен: ремап + дроп,
+    §1.3); items при этом отдаются."""
+    s = S()
+    plan = enrich_mod.load_enrich(_enrich_json_path(s))
+    if plan is None:
+        return {"items": [], "params": None, "stale": False,
+                "cutlist_changed": False}
+    if plan.hash != s.audio_hash:
+        return {"items": [], "params": None, "stale": True,
+                "cutlist_changed": False}
+    cur_rev = enrich_mod.compute_cutlist_rev(
+        s.cutlist if s.cutlist is not None else [])
+    return {"items": [it.to_dict() for it in plan.items],
+            # load_enrich уже прогнал params через whitelist sanitize_params —
+            # наружу всегда канонический вид, даже если файл правили руками.
+            "params": plan.params,
+            "stale": False,
+            "cutlist_changed": cur_rev != plan.cutlist_rev,
+            "generated_at": plan.generated_at,
+            "model": plan.model}
+
+
+@app.post("/api/enrich/save")
+def enrich_save(body: dict = Body(default={})):
+    """Мерж правок UI в план (§5): ``{items:[{id, enabled?, payload?,
+    t_start?, t_end?}]}``.
+
+    Существующий id — точечная правка: тоггл ``enabled`` (edited НЕ трогает),
+    правки payload/таймингов (NaN/Infinity → 400, клампы к ролику, лимиты
+    текстов §1.2 через санитайзеры enrich.py) ставят ``edited:true``. Новый id
+    с валидным ``type`` — ручное предложение, ``source:"user"`` (§5); новый id
+    БЕЗ type — честный 404 (опечатка, а не добавление). Нет плана → 409; план
+    от другого видео → 409. Запись атомарная (.tmp -> os.replace) со СТРОГИМ
+    500 — оригинальный файл при сбое остаётся целым."""
+    s = S()
+    _guard_no_task()
+    raw_items = body.get("items")
+    if not isinstance(raw_items, list) or not raw_items:
+        raise HTTPException(400, "items: ожидается непустой список правок")
+
+    plan = enrich_mod.load_enrich(_enrich_json_path(s))
+    if plan is None:
+        raise HTTPException(409, "План обогащения не найден — сначала "
+                                 "«Предложить монтаж»")
+    if plan.hash != s.audio_hash:
+        raise HTTPException(409, "enrich.json от другого видео — правка "
+                                 "отклонена")
+
+    duration = float(s.media.duration)
+    index_of = {it.id: i for i, it in enumerate(plan.items)}
+    updated: list[dict] = []
+    for k, e in enumerate(raw_items):
+        if not isinstance(e, dict):
+            raise HTTPException(400, f"items[{k}]: ожидается объект")
+        eid = e.get("id")
+        if not isinstance(eid, str) or not eid:
+            raise HTTPException(400, f"items[{k}]: id обязателен (строка)")
+        # NaN/±Infinity валидны для json.loads и пролезают сквозь клампы
+        # (паттерн /api/clips/save) — отсекаем ДО любых сравнений.
+        for key in ("t_start", "t_end"):
+            v = e.get(key)
+            if v is None:
+                continue
+            if (isinstance(v, bool) or not isinstance(v, (int, float))
+                    or not math.isfinite(float(v))):
+                raise HTTPException(400, f"items[{k}].{key}: ожидается "
+                                         "конечное число (секунды)")
+        if "enabled" in e and not isinstance(e["enabled"], bool):
+            raise HTTPException(400, f"items[{k}].enabled: ожидается "
+                                     "true/false")
+        if "payload" in e and e["payload"] is not None \
+                and not isinstance(e["payload"], dict):
+            raise HTTPException(400, f"items[{k}].payload: ожидается объект")
+
+        if eid in index_of:
+            idx = index_of[eid]
+            d = plan.items[idx].to_dict()
+            touched = False                  # правка payload/таймингов → edited
+            if isinstance(e.get("payload"), dict) and e["payload"]:
+                d["payload"] = {**d["payload"], **e["payload"]}
+                touched = True
+            for key in ("t_start", "t_end"):
+                if e.get(key) is not None:
+                    d[key] = min(duration, max(0.0, float(e[key])))
+                    touched = True
+            if "enabled" in e:
+                d["enabled"] = e["enabled"]   # тоггл — НЕ правка (edited не трогаем)
+            if touched:
+                d["edited"] = True
+            # item_from_dict — единый санитайзер: клампы длительностей по типу,
+            # лимиты текстов §1.2, NaN-гарды внутри payload. id/type из d —
+            # неизменны. Тип валиден (взят из существующего item) → не None.
+            it = enrich_mod.item_from_dict(d)
+            plan.items[idx] = it
+        else:
+            t = e.get("type")
+            if t not in enrich_mod.ENR_TYPES:
+                raise HTTPException(404, f"Предложение {eid} не найдено")
+            d = dict(e)
+            d["source"] = "user"             # ручное предложение (§5)
+            for key in ("t_start", "t_end"):
+                if e.get(key) is not None:
+                    d[key] = min(duration, max(0.0, float(e[key])))
+            it = enrich_mod.item_from_dict(d)
+            plan.items.append(it)
+            index_of[it.id] = len(plan.items) - 1
+        updated.append(it.to_dict())
+
+    try:
+        enrich_mod.save_enrich(plan, _enrich_json_path(s))
+    except OSError as e:
+        raise HTTPException(500, f"Не удалось сохранить enrich.json: {e}")
+    return {"ok": True, "items": updated}
+
+
+@app.post("/api/enrich/select")
+def enrich_select(body: dict = Body(default={})):
+    """Выбор кандидата визуала (MONTAGE_V2 §3): ``{id, idx}`` — поставить
+    ``payload.selected=idx`` точке-иллюстрации ``id`` (юзер листает кандидаты в
+    «Монтаже» и фиксирует лучший). Лёгкий целевой эндпоинт (НЕ ставит
+    ``edited=true`` — выбор кандидата это не правка содержимого, а назначение
+    одного из УЖЕ предложенных вариантов).
+
+    ``idx`` клампится в [0, len(candidates)-1] санитайзером ImagePayload. После
+    выбора плоские поля payload (asset_kind/asset_path/source) пересинхронизируем
+    под новый выбранный кандидат — рендер берёт ассет через resolved_asset().
+    Контракт для UI-агента. Нет плана / другой видео → 409; неизвестный id или
+    не-иллюстрация → 404; невалидный idx → 400."""
+    s = S()
+    _guard_no_task()
+    eid = body.get("id")
+    idx = body.get("idx")
+    if not isinstance(eid, str) or not eid:
+        raise HTTPException(400, "id обязателен (строка)")
+    if isinstance(idx, bool) or not isinstance(idx, int) or idx < 0:
+        raise HTTPException(400, "idx: ожидается неотрицательное целое")
+
+    plan = enrich_mod.load_enrich(_enrich_json_path(s))
+    if plan is None:
+        raise HTTPException(409, "План обогащения не найден")
+    if plan.hash != s.audio_hash:
+        raise HTTPException(409, "enrich.json от другого видео")
+
+    target = next((it for it in plan.items if it.id == eid), None)
+    if target is None or target.type != enrich_mod.ENR_IMAGE:
+        raise HTTPException(404, f"Точка-иллюстрация {eid} не найдена")
+    cands = getattr(target.payload, "candidates", None) or []
+    if not cands:
+        raise HTTPException(400, "У точки нет кандидатов для выбора")
+    if idx >= len(cands):
+        raise HTTPException(400, f"idx {idx} вне диапазона (кандидатов "
+                                 f"{len(cands)})")
+    # Меняем selected И пересинхронизируем ПЛОСКИЕ поля (asset_kind/asset_path/
+    # gen_prompt_en/gen_seed) под выбранный кандидат — иначе рендер/стадия images
+    # продолжат смотреть на ПРЕДЫДУЩИЙ материализованный ассет (docstring обещает
+    # ровно этот синк). _legacy_sync_from_candidate — тот же синк, что делает
+    # анализ; читает d["selected"]/d["candidates"], поэтому зовём ПОСЛЕ set idx.
+    d = target.payload.to_dict()
+    d["selected"] = idx
+    enrich_llm._legacy_sync_from_candidate(d)
+    # W6 #12: _attach_emoji в анализе покрывает ТОЛЬКО кандидата, выбранного на
+    # его проходе. icon-кандидат, выбранный ЗДЕСЬ позже, оставался с пустым
+    # emoji — рендер гарантированно дропал оверлей (emoji_png_path('') -> None).
+    # Подбираем эмодзи тем же хелпером; best-effort — сбой не валит выбор.
+    _cands = d.get("candidates") or []
+    if (idx < len(_cands) and isinstance(_cands[idx], dict)
+            and _cands[idx].get("source") == "icon"
+            and not _cands[idx].get("emoji")):
+        try:
+            enrich_llm._attach_emoji(d, enrich_llm._load_emoji_map())
+        except Exception:  # noqa: BLE001 — подбор эмодзи best-effort
+            pass
+    new_pl = enrich_mod.ImagePayload.sanitize(d)
+    target.payload = new_pl
+    try:
+        enrich_mod.save_enrich(plan, _enrich_json_path(s))
+    except OSError as e:
+        raise HTTPException(500, f"Не удалось сохранить enrich.json: {e}")
+    return {"ok": True, "id": eid, "selected": new_pl.selected,
+            "source": new_pl.source}
 
 
 def _render_clip_job(s: Session, *, start: float, end: float, idx: int,
@@ -3124,9 +4496,11 @@ def clips_render(body: dict = Body(default={})):
     # Сервер принудительно глушит главы/метаданные для клипов (план §2.4) —
     # независимо от того, что прислал клиент. music=None — клипы Shorts НИКОГДА
     # не получают фоновую подложку (C3): _resolve_render_opts при не-dict
-    # music принудительно выключает cfg.render.music.
+    # music принудительно выключает cfg.render.music. enrich=None — обогащение
+    # Shorts-клипов вне скоупа v1 (ENRICH_PLAN §9); cutlist_override-путь его
+    # и так не применяет, это второй (явный) предохранитель.
     render_opts = {**render_opts, "chapters": False, "metadata": False,
-                   "music": None}
+                   "music": None, "enrich": None}
 
     duration = float(s.media.duration)
     clips_in: list[dict] = []
@@ -3191,8 +4565,11 @@ def clips_render(body: dict = Body(default={})):
 # (/api/clips/render). Против 4 ручных облачных шагов CapCut — локально и
 # бесплатно. Веса стадий для общего percent (нормируются по активным стадиям,
 # чтобы пропущенная транскрипция не оставляла «дыру» в прогрессе):
-_AUTOPACK_WEIGHTS = {"transcribe": 0.35, "detect": 0.10, "main": 0.25,
-                     "suggest": 0.10, "clips": 0.20}
+_AUTOPACK_WEIGHTS = {"transcribe": 0.35, "detect": 0.10, "enrich": 0.12,
+                     "main": 0.25, "suggest": 0.10, "clips": 0.20}
+# ENRICH §5: в автопаке применяются ТОЛЬКО предложения со score >= 70 поверх
+# enabled — консервативный порог, автопак идёт без ревью-вкладки.
+AUTOPACK_ENRICH_MIN_SCORE = 70
 
 
 def _autopack_top_clips(cands: list, duration: float, top_k: int) -> list[dict]:
@@ -3231,12 +4608,17 @@ def autopack(body: dict = Body(default={})):
 
     Тело: ``{top_k: 1–10 (клампится, дефолт 3), formats: [...] для ОСНОВНОГО
     ролика (как у /api/render, дефолт ["source"]), clips: bool (дефолт true),
-    render_opts: {...} (как у /api/render)}``.
+    enrich: bool (дефолт false — ENRICH §5: применить СВЕЖИЙ план обогащения
+    к основному ролику со score >= 70 поверх enabled; плана нет/несвежий →
+    warning, детекторы автопак не зовёт), render_opts: {...} (как у
+    /api/render)}``.
 
     Стадии (каждая видна в SSE stage, percent — по весам _AUTOPACK_WEIGHTS):
       а) транскрипция, если её нет (кэш → стадия пропускается);
       б) детекция, если катлист ПУСТ — существующий НЕ передетекчивается
          (юзер мог править вырезы руками);
+      б2) enrich=true и свежий план: пометка «применяю план (score>=70)» —
+         сам план применит рендер основного ролика (opts.enrich);
       в) рендер основного ролика через _render_formats (C2, мультиформат);
       г) clips=true: suggest — но свежий clips.json (hash совпал)
          переиспользуется без LLM; LLM выключен → warning, основной остаётся;
@@ -3286,8 +4668,18 @@ def autopack(body: dict = Body(default={})):
     will_suggest = do_clips and not cached_fresh and s.llm is not None
     will_render_clips = do_clips and (cached_fresh or s.llm is not None)
 
+    # ENRICH §5: стадия выполняется ТОЛЬКО при body.enrich=true И существующем
+    # СВЕЖЕМ плане (hash совпал). Детекторы автопак НЕ зовёт — нет плана →
+    # warning и пропуск (запуск анализа из автопака решит P3).
+    do_enrich = bool(body.get("enrich", False))
+    enrich_plan = enrich_mod.load_enrich(_enrich_json_path(s)) \
+        if do_enrich else None
+    will_enrich = bool(enrich_plan is not None
+                       and enrich_plan.hash == s.audio_hash)
+
     plan = [k for k, on in (("transcribe", need_transcribe),
                             ("detect", need_detect),
+                            ("enrich", will_enrich),
                             ("main", True),
                             ("suggest", will_suggest),
                             ("clips", will_render_clips)) if on]
@@ -3306,17 +4698,46 @@ def autopack(body: dict = Body(default={})):
 
     # Сервер принудительно глушит главы/метаданные для клипов (паттерн
     # /api/clips/render) — иначе каждый клип гонял бы LLM и тёр metadata.txt.
-    # music=None — подложка (C3) только в ОСНОВНОМ ролике, клипы без музыки.
+    # music=None — подложка (C3) только в ОСНОВНОМ ролике, клипы без музыки;
+    # enrich=None — обогащение Shorts-клипов вне скоупа v1 (ENRICH_PLAN §9).
+    # Shorts-клипы ВСЕГДА вертикальные 9:16 — YouTube опознаёт Shorts только по
+    # вертикали; горизонтальный клип он считает обычным видео. Форсируем crop
+    # НЕЗАВИСИМО от render_opts (они настраивают ГОРИЗОНТАЛЬНЫЙ основной ролик),
+    # иначе клипы наследуют 16:9 источника (баг: «шортсы 16:9»). Центр кадра —
+    # авто-детект лица, если пользователь не задал вручную.
     clip_opts = {**render_opts, "chapters": False, "metadata": False,
-                 "music": None}
+                 "music": None, "enrich": None,
+                 "vertical": True, "vertical_target": "1080x1920",
+                 "vertical_center": render_opts.get("vertical_center", "auto")}
+    # Основной ролик: обогащение управляется автопаком, а не сырыми
+    # render_opts клиента — явный ключ в обе стороны (вкл со score-порогом /
+    # выкл, если стадия не запланирована).
+    main_opts = {**render_opts,
+                 "enrich": ({"enabled": True,
+                             "min_score": AUTOPACK_ENRICH_MIN_SCORE}
+                            if will_enrich else {"enabled": False})}
     cl_duration = float(s.media.duration)
 
     def run():
         warnings: list[str] = []
         skipped: list[str] = []
         results: dict = {"warnings": warnings, "skipped": skipped}
+
+        def _publish() -> None:
+            # /api/state serializes s.task["results"] by LIVE reference on the
+            # event loop while this worker inserts keys; a size-changing insert
+            # during jsonable_encoder's dict iteration raises RuntimeError -> 500.
+            # Publish dict(results) (frozen key set) so readers only ever iterate
+            # a dict we won't mutate. Nested lists (warnings/clip_results) are
+            # append-only and nested dict (totals) is key-overwrite -> safe.
+            s.task["results"] = dict(results)
+
+        def _set_result(key: str, value) -> None:
+            results[key] = value
+            _publish()
+
         # Сразу в task: отмена/падение на любой стадии сохраняет уже сделанное.
-        s.task["results"] = results
+        _publish()
 
         def _chk() -> None:
             if s.task.get("cancelled"):
@@ -3350,20 +4771,46 @@ def autopack(body: dict = Body(default={})):
         else:
             skipped.append("Детекция: катлист уже есть — не передетекчиваем")
 
+        # --- (б2) обогащение основного ролика (ENRICH §5) ----------------------
+        # Стадия лишь фиксирует решение и счётчик: сам план применит
+        # _run_render_pipeline стадии «main» (opts.enrich в main_opts).
+        if do_enrich:
+            if will_enrich:
+                _chk()
+                n_apply = sum(
+                    1 for it in enrich_plan.items
+                    if it.enabled and it.score >= AUTOPACK_ENRICH_MIN_SCORE)
+                s.stage(f"Обогащение: применяю план "
+                        f"(score ≥ {AUTOPACK_ENRICH_MIN_SCORE}, "
+                        f"предложений: {n_apply})…")
+                _set_result("enrich", {"applied": True,
+                                       "min_score": AUTOPACK_ENRICH_MIN_SCORE,
+                                       "count": n_apply})
+                sub("enrich")(1.0)
+            elif enrich_plan is not None:
+                warnings.append("Обогащение пропущено: план от другого видео "
+                                "(несвежий hash) — запустите «Предложить "
+                                "монтаж» заново")
+                _set_result("enrich", {"applied": False})
+            else:
+                warnings.append("Обогащение пропущено: нет плана — сначала "
+                                "«Предложить монтаж»")
+                _set_result("enrich", {"applied": False})
+
         # --- (в) основной ролик (мультиформат C2) ------------------------------
         _chk()
         res_main = _render_formats(
-            s, dict(render_opts), formats,
+            s, dict(main_opts), formats,
             on_progress=sub("main"),
             on_stage=lambda m: s.stage(f"Основной ролик: {m}"),
             is_cancelled=lambda: bool(s.task.get("cancelled")))
-        results["main"] = res_main
+        _set_result("main", res_main)
         removed_now, _ = resolve(s.cutlist)
         totals = {"duration_before": round(float(s.media.duration), 1),
                   "duration_after": res_main.get("new_duration"),
                   "cuts": len(removed_now),
                   "clips_rendered": 0}
-        results["totals"] = totals
+        _set_result("totals", totals)
         _chk()
 
         # --- (г) подбор клипов --------------------------------------------------
@@ -3376,7 +4823,7 @@ def autopack(body: dict = Body(default={})):
         elif s.llm is None:
             # Зафиксированное решение (план §2.4): фолбэк-нарезки без LLM нет.
             warnings.append("ИИ выключен — клипы не предложены")
-            results["clips"] = []
+            _set_result("clips", [])
         else:
             _chk()
             s.stage("Клипы: подбор…")
@@ -3388,14 +4835,14 @@ def autopack(body: dict = Body(default={})):
             except Exception as e:  # noqa: BLE001 — Ollama умерла: частичный успех
                 _chk()              # отмена «через» suggest — честный cancelled
                 warnings.append(f"Подбор клипов не удался: {e}")
-                results["clips"] = {"error": str(e)}
+                _set_result("clips", {"error": str(e)})
             else:
                 sub("suggest")(1.0)
                 _save_clips_json(s, fresh)   # панель клипов оживёт без LLM
                 cands = [asdict(c) for c in fresh]
                 if not cands:
                     warnings.append("ИИ не нашёл подходящих клипов")
-                    results["clips"] = []
+                    _set_result("clips", [])
                     cands = None
 
         # --- (д) рендер топ-K клипов — общий цикл с /api/clips/render ----------
@@ -3403,7 +4850,7 @@ def autopack(body: dict = Body(default={})):
             top = _autopack_top_clips(cands, cl_duration, top_k)
             n = len(top)
             clip_results: list[dict] = []
-            results["clips"] = clip_results
+            _set_result("clips", clip_results)
             p = sub("clips")
             for i, c in enumerate(top):
                 if s.task.get("cancelled"):
@@ -3422,7 +4869,7 @@ def autopack(body: dict = Body(default={})):
             totals["clips_rendered"] = sum(1 for x in clip_results if x.get("ok"))
 
         _chk()
-        results["ok"] = True   # частичный успех (warnings) — тоже успех
+        _set_result("ok", True)   # частичный успех (warnings) — тоже успех
 
     s.start_task("autopack", run)
     return {"ok": True, "top_k": top_k, "formats": formats, "clips": do_clips}
@@ -3434,7 +4881,7 @@ async def events(request: Request):
 
     def _payload() -> str:
         t = s.task
-        return json.dumps({k: t[k] for k in
+        return json.dumps({k: t.get(k) for k in
                            ("name", "running", "percent", "stage",
                             "error", "done", "results", "cancelled")})
 
@@ -3503,6 +4950,93 @@ def _install_connection_reset_filter() -> None:
     flt = _ConnectionResetFilter()
     for name in ("uvicorn.error", "asyncio"):
         logging.getLogger(name).addFilter(flt)
+
+
+def _sweep_uploads(cfg, keep_days: float = 7.0) -> None:
+    """Best-effort GC for work/_uploads (#92): delete files older than
+    ``keep_days`` that are NOT open in the editor and NOT referenced by any
+    queue job. Never raises — a cleanup failure must not block startup."""
+    try:
+        updir = Path(cfg.paths.work_dir) / "_uploads"
+        if not updir.exists():
+            return
+        keep: set[str] = set()
+        s = SESSION
+        if s is not None:
+            try:
+                keep.add(os.path.normcase(str(s.inp.resolve())))
+            except OSError:
+                pass
+        with QUEUE_LOCK:
+            for j in QUEUE:
+                try:
+                    keep.add(os.path.normcase(str(Path(j.path).resolve())))
+                except OSError:
+                    continue
+        cutoff = time.time() - keep_days * 86400.0
+        for p in updir.iterdir():
+            try:
+                if not p.is_file() or p.suffix.lower() == ".part":
+                    continue
+                if os.path.normcase(str(p.resolve())) in keep:
+                    continue
+                if p.stat().st_mtime < cutoff:
+                    p.unlink()
+            except OSError:
+                pass
+    except Exception:  # noqa: BLE001 — never block startup
+        pass
+
+
+def _img_cache_roots(cfg) -> set:
+    """W6 #11 (#96): каталоги, куда РЕАЛЬНО пишут генераторы картинок. Ни один
+    из писателей не читает cfg.paths.cache_dir (serve не передаёт cache_dir):
+    codegfx якорит свой CACHE_DIR на repo-root, imagegen резолвит свой от CWD
+    (см. _enrich_preview_roots — превью уже вынуждено перечислять оба корня).
+    Свип метёт именно их; cfg-путь оставлен для дефолт-раскладки (всё совпадает)
+    и на будущее cache_dir-aware поколение писателей."""
+    roots: set = set()
+    for sub in ("enrich_img", "codegfx"):
+        try:
+            roots.add((Path(cfg.paths.cache_dir) / sub).resolve())
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        roots.add(Path(imagegen_mod.CACHE_DIR).resolve())     # CWD-relative writer
+    except Exception:  # noqa: BLE001 — движок опционален
+        pass
+    try:
+        from vpipe.codegfx import render as _cg
+        base = Path(_cg.CACHE_DIR)
+        if not base.is_absolute():
+            base = Path(_cg._REPO_ROOT) / base                # repo-root writer
+        roots.add(base.resolve())
+    except Exception:  # noqa: BLE001 — движок опционален
+        pass
+    return roots
+
+
+def _sweep_img_cache(cfg) -> None:
+    """Opt-in, default-OFF age sweep of the IMAGE caches only (enrich_img /
+    codegfx) (#96). ``cache_img_max_age_days == 0`` (default) => never evict —
+    exact current behavior. Never touches transcript/peaks (correctness caches)
+    or work/ dirs. Best-effort; a cleanup failure must not block startup."""
+    try:
+        max_age = int(getattr(cfg.paths, "cache_img_max_age_days", 0) or 0)
+        if max_age <= 0:
+            return
+        cutoff = time.time() - max_age * 86400
+        for d in _img_cache_roots(cfg):
+            if not d.exists():
+                continue
+            for p in d.rglob("*.png"):
+                try:
+                    if p.stat().st_mtime < cutoff:
+                        p.unlink()
+                except OSError:
+                    pass
+    except Exception:  # noqa: BLE001 — best-effort, never block startup
+        pass
 
 
 def main() -> int:
@@ -3574,6 +5108,13 @@ def main() -> int:
     except Exception:  # noqa: BLE001 — best-effort cleanup, never block startup
         pass
 
+    # GC the multi-GB work/_uploads leak (#92) and run the opt-in image-cache
+    # LRU sweep (#96, default-off). Placed AFTER _load_queue()/open_session so
+    # the keep-set (open session + every queued job) is complete; both are
+    # best-effort and never block startup.
+    _sweep_uploads(cfg)
+    _sweep_img_cache(cfg)
+
     # Pin the Host header (DNS-rebinding defence). Added here, not at module
     # scope, so the TestClient (Host: testserver) isn't rejected by the suite.
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=_allowed_hosts(args.host))
@@ -3603,6 +5144,13 @@ def main() -> int:
     # A7: mute the «ConnectionResetError [WinError 10054]» tracebacks the
     # proactor loop prints whenever the browser drops a video stream mid-read.
     _install_connection_reset_filter()
+    # Parent interpreter exit (normal return / SystemExit that skips the ASGI
+    # shutdown) must also kill any tracked ffmpeg so it can't orphan and keep the
+    # GPU + a .part lock. Registered HERE (not at import) so import-only test
+    # processes don't add a global hook.
+    atexit.register(ffmpeg_utils.cancel_all)
+    # #94: also persist any debounced-but-unwritten transcript edit on exit.
+    atexit.register(_force_flush_pending_transcript)
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
     return 0
 

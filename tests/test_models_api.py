@@ -124,7 +124,7 @@ def test_apply_saved_models_missing_file_keeps_defaults(client, cfg):
 
 
 # --- GET /api/models ---------------------------------------------------------
-def test_get_models_shape_ollama_off(client):
+def test_get_models_shape_ollama_off(client, cfg):
     r = client.get("/api/models")
     assert r.status_code == 200
     j = r.json()
@@ -137,8 +137,9 @@ def test_get_models_shape_ollama_off(client):
     for p in j["whisper"]["presets"]:
         assert {"key", "label", "model", "hint"} <= set(p)
     assert j["whisper"]["transcript"] is None   # no session
-    # llm block — graceful when Ollama off
-    assert j["llm"]["current"] == "qwen3:8b"
+    # llm block — graceful when Ollama off. Compare against the loaded config
+    # (not a hard-coded name) so a model swap in config.yaml can't stale this.
+    assert j["llm"]["current"] == cfg.llm.model
     assert j["llm"]["available"] is False
     assert j["llm"]["installed"] == []
     assert j["llm"]["ready"] is False

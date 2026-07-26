@@ -628,6 +628,124 @@ def test_autopack_csrf_guarded(client, monkeypatch, tmp_path):
     assert sess.task["name"] is None
 
 
+# === P2: стадия enrich (ENRICH_PLAN §5) ============================================
+from vpipe import enrich as enrich_mod  # noqa: E402
+
+
+def _enr_item(iid, score, enabled=True):
+    return enrich_mod.EnrichItem(
+        id=iid, type=enrich_mod.ENR_IMAGE, score=score, enabled=enabled,
+        t_start=35.0, t_end=38.0, payload=enrich_mod.ImagePayload())
+
+
+def _write_enrich_plan(sess, items, *, hash=HASH):
+    plan = enrich_mod.EnrichPlan(hash=hash, cutlist_rev="rev", model="m",
+                                 items=list(items))
+    enrich_mod.save_enrich(plan, serve._enrich_json_path(sess))
+
+
+def test_autopack_weights_include_enrich():
+    # вес 0.12; нормировка по активным стадиям уже есть (total_w в autopack)
+    assert serve._AUTOPACK_WEIGHTS["enrich"] == pytest.approx(0.12)
+    assert serve.AUTOPACK_ENRICH_MIN_SCORE == 70
+
+
+def test_enrich_with_fresh_plan_applies_score_70(client, monkeypatch,
+                                                 tmp_path):
+    events: list = []
+    sess = FakeSession(tmp_path, llm=None, cuts=(_cut(),), events=events)
+    _install(monkeypatch, sess)
+    # 3 предложения: enabled 80 (идёт), enabled 50 (ниже порога),
+    # disabled 90 (юзер выключил — score не спасает)
+    _write_enrich_plan(sess, [_enr_item("e1", 80),
+                              _enr_item("e2", 50),
+                              _enr_item("e3", 90, enabled=False)])
+    calls = _patch_pipeline(monkeypatch, events)
+
+    r = client.post("/api/autopack", json={"enrich": True, "clips": False})
+    assert r.status_code == 200
+    _wait_done(sess)
+    assert sess.task["error"] is None and sess.task["done"] is True
+    assert sess.task["percent"] == 100.0         # веса нормируются без дыр
+
+    res = sess.task["results"]
+    assert res["ok"] is True and res["warnings"] == []
+    # консервативный фильтр: score>=70 ПОВЕРХ enabled → ровно 1 предложение
+    assert res["enrich"] == {"applied": True, "min_score": 70, "count": 1}
+    # основной рендер получил включённый enrich с порогом 70
+    cfg_main = calls[0]["cfg"]
+    assert cfg_main.render.enrich.enabled is True
+    assert cfg_main.render.enrich.min_score == 70
+
+
+def test_enrich_no_plan_warns_and_skips(client, monkeypatch, tmp_path):
+    events: list = []
+    sess = FakeSession(tmp_path, llm=None, cuts=(_cut(),), events=events)
+    _install(monkeypatch, sess)
+    calls = _patch_pipeline(monkeypatch, events)
+
+    client.post("/api/autopack", json={"enrich": True, "clips": False})
+    _wait_done(sess)
+    assert sess.task["error"] is None and sess.task["done"] is True
+    assert sess.task["percent"] == 100.0
+    res = sess.task["results"]
+    assert res["ok"] is True                     # частичный успех — тоже успех
+    assert any(w.startswith("Обогащение пропущено: нет плана")
+               for w in res["warnings"])
+    assert res["enrich"] == {"applied": False}
+    # детекторы НЕ зовутся (P3 решит), основной рендер идёт БЕЗ обогащения
+    assert calls[0]["cfg"].render.enrich.enabled is False
+
+
+def test_enrich_stale_plan_warns_and_skips(client, monkeypatch, tmp_path):
+    events: list = []
+    sess = FakeSession(tmp_path, llm=None, cuts=(_cut(),), events=events)
+    _install(monkeypatch, sess)
+    _write_enrich_plan(sess, [_enr_item("e1", 95)], hash="ff" * 20)
+    calls = _patch_pipeline(monkeypatch, events)
+
+    client.post("/api/autopack", json={"enrich": True, "clips": False})
+    _wait_done(sess)
+    res = sess.task["results"]
+    assert res["enrich"] == {"applied": False}
+    assert any("несвежий" in w for w in res["warnings"])
+    assert calls[0]["cfg"].render.enrich.enabled is False
+
+
+def test_enrich_default_off(client, monkeypatch, tmp_path):
+    # без body.enrich стадии нет вовсе — даже при свежем плане на диске
+    events: list = []
+    sess = FakeSession(tmp_path, llm=None, cuts=(_cut(),), events=events)
+    _install(monkeypatch, sess)
+    _write_enrich_plan(sess, [_enr_item("e1", 95)])
+    calls = _patch_pipeline(monkeypatch, events)
+
+    client.post("/api/autopack", json={"clips": False})
+    _wait_done(sess)
+    res = sess.task["results"]
+    assert "enrich" not in res
+    assert res["warnings"] == []
+    assert calls[0]["cfg"].render.enrich.enabled is False
+
+
+def test_enrich_clips_never_enriched(client, monkeypatch, tmp_path):
+    # клипы автопака идут с enrich=None (анти-скоуп §9) — даже при body.enrich
+    events: list = []
+    sess = FakeSession(tmp_path, llm=None, cuts=(_cut(),), events=events)
+    _install(monkeypatch, sess)
+    _write_enrich_plan(sess, [_enr_item("e1", 95)])
+    serve._save_clips_json(sess, [_cand("c01")])     # свежий кэш — без LLM
+    calls = _patch_pipeline(monkeypatch, events)
+
+    client.post("/api/autopack", json={"enrich": True, "top_k": 1})
+    _wait_done(sess)
+    assert sess.task["error"] is None
+    assert events == ["main", "clip"]
+    assert calls[0]["cfg"].render.enrich.enabled is True    # основной — да
+    assert calls[1]["cfg"].render.enrich.enabled is False   # клип — никогда
+    assert calls[1]["override"] is not None
+
+
 # --- мусорные записи в кэше клипов молча пропускаются ------------------------------
 def test_autopack_top_clips_filters_garbage():
     cands = [
@@ -643,3 +761,34 @@ def test_autopack_top_clips_filters_garbage():
     assert [c["id"] for c in top] == ["ok1", "ok2"]
     assert top[0]["hook"] == "Хук"
     assert top[1] == {"id": "ok2", "start": 0.0, "end": 40.0, "hook": ""}
+
+
+# --- Shorts clips must ALWAYS be vertical 9:16 (bug: clips came out 16:9) ------
+def test_autopack_clips_forced_vertical_main_stays_horizontal(client, monkeypatch,
+                                                              tmp_path):
+    """Багрепорт: «шортсы автопака получаются 16:9 и опознаются YouTube как
+    видео». Клипы обязаны быть вертикальными 9:16 НЕЗАВИСИМО от горизонтальных
+    render_opts основного ролика; сам основной ролик вертикаль НЕ получает."""
+    events: list = []
+    sess = FakeSession(tmp_path, llm=object(), transcript=True, cutlist=True,
+                       events=events)
+    _install(monkeypatch, sess)
+    _patch_suggest(monkeypatch, events, result=[_cand("c01", 5.0, 35.0)])
+    calls = _patch_pipeline(monkeypatch, events)
+
+    # render_opts ГОРИЗОНТАЛЬНЫЕ — vertical не задан
+    r = client.post("/api/autopack",
+                    json={"top_k": 1, "render_opts": {"subtitles": False}})
+    assert r.status_code == 200
+    _wait_done(sess)
+    assert sess.task["error"] is None
+
+    clip_calls = [c for c in calls if c["override"] is not None]
+    main_calls = [c for c in calls if c["override"] is None]
+    assert clip_calls, "клипы не рендерились"
+    for c in clip_calls:                       # каждый Shorts — вертикальный
+        assert c["cfg"].render.vertical.enabled is True
+        assert c["cfg"].render.vertical.target == "1080x1920"
+    # основной ролик остаётся горизонтальным (vertical НЕ форсится на мастер)
+    assert main_calls and all(not c["cfg"].render.vertical.enabled
+                              for c in main_calls)

@@ -33,12 +33,23 @@ STYLE_FIELDS = set(AssStyleCfg.model_fields) - {"enabled"}
 
 
 # --- форма списка -------------------------------------------------------------
-def test_four_presets_unique_keys_and_labels():
-    assert len(serve.CAPTION_PRESETS) == 4
+def test_presets_unique_keys_and_labels():
+    # 5 пресетов: clean/classic/minimal/bold/kinetic (kinetic-поп только в
+    # последнем — «прыжки» больше не форсятся везде).
+    assert len(serve.CAPTION_PRESETS) == 5
     keys = [p["key"] for p in serve.CAPTION_PRESETS]
-    assert len(set(keys)) == 4
+    assert len(set(keys)) == 5
     for p in serve.CAPTION_PRESETS:
         assert p["label"].strip() and p["hint"].strip()
+
+
+def test_only_kinetic_preset_enables_pop_clean_has_no_highlight():
+    by = {p["key"]: p["style"] for p in serve.CAPTION_PRESETS}
+    # kinetic-поп включён РОВНО в одном пресете
+    assert [k for k, s in by.items() if s.get("kinetic")] == ["kinetic"]
+    # «Чистые» — без цветного выделения (karaoke off, highlight == текст)
+    assert by["clean"]["karaoke"] is False
+    assert by["clean"]["karaoke_color"] == by["clean"]["primary_color"]
 
 
 def test_preset_styles_are_complete_assstylecfg_sets():
@@ -62,14 +73,16 @@ def _style_line(txt: str) -> list[str]:
 
 
 @pytest.mark.parametrize("key,expect", [
+    # чистые: без караоке -> Primary = обычный белый текст, снизу
+    ("clean",   {"align": "2", "primary": "&H00FFFFFF"}),
     # классика: снизу, «спетое» слово жёлтым (Primary = karaoke_color)
     ("classic", {"align": "2", "primary": "&H0000D4FF"}),
-    # неон: бирюзовая подсветка, приподнят над низом (MarginV из пресета)
-    ("neon",    {"align": "2", "primary": "&H00FFE500", "margin_v": "160"}),
-    # минимал: полупрозрачная обводка-плашка
+    # минимал: полупрозрачная обводка-плашка, без караоке
     ("minimal", {"align": "2", "outline_c": "&H78000000"}),
     # крупный: по центру кадра, Impact
     ("bold",    {"align": "5", "font": "Impact", "size": "78"}),
+    # кинетик: приподнят над низом (MarginV из пресета)
+    ("kinetic", {"align": "2", "primary": "&H0000D4FF", "margin_v": "160"}),
 ])
 def test_write_ass_per_preset(tmp_path, key, expect):
     p = next(x for x in serve.CAPTION_PRESETS if x["key"] == key)
@@ -94,8 +107,11 @@ def test_write_ass_per_preset(tmp_path, key, expect):
         assert f[2] == expect["size"]
     if "margin_v" in expect:
         assert f[-2] == expect["margin_v"]
-    # караоке-пресеты реально производят \k-строки (а не голый текст)
-    assert "Dialogue:" in txt and "\\k" in txt
+    # караоке-пресеты производят \k-строки; статичные («Чистые»/«Минимал») —
+    # ровный текст без \k. kinetic-поп (\t-вспухание) — ТОЛЬКО в пресете kinetic.
+    assert "Dialogue:" in txt
+    assert ("\\k" in txt) == bool(p["style"].get("karaoke"))
+    assert ("\\fscx" in txt) == bool(p["style"].get("kinetic"))
 
 
 # --- _resolve_render_opts: пресет применяется целиком ---------------------------

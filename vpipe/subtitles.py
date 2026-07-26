@@ -163,12 +163,21 @@ def build_cues(words: list[Word], matcher: ProfanityMatcher,
             required = chars / max_cps
             if (c.end - c.start) < required:
                 limit = cue_next_start[i] - subs.min_gap
-                c.end = min(max(c.end, c.start + required), max(c.start, limit), total)
+                # Extend-only: never pull the end BELOW the original (that would
+                # drop the cue's own last word). The outer max(c.end, ...) makes
+                # `limit` cap the EXTENSION only, never shrink the cue.
+                c.end = max(c.end, min(c.start + required, max(c.end, limit), total))
 
-    # Enforce no overlap (keep order, leave a small gap).
+    # Enforce no overlap. For CONTINUOUS speech (next cue begins within ~0.15s)
+    # chain end-to-start so the subtitle area doesn't blink off/on at the
+    # boundary; a real pause keeps the min_gap.
     for i in range(len(cues) - 1):
-        if cues[i].end > cues[i + 1].start - subs.min_gap:
-            cues[i].end = max(cues[i].start + 0.2, cues[i + 1].start - subs.min_gap)
+        nxt = cues[i + 1].start
+        if cues[i].end > nxt - subs.min_gap:
+            if nxt - cues[i].end < 0.15 and nxt > cues[i].start + 0.2:
+                cues[i].end = nxt
+            else:
+                cues[i].end = max(cues[i].start + 0.2, nxt - subs.min_gap)
     return cues
 
 
@@ -225,11 +234,13 @@ def generate(transcript: Transcript, removed: list[tuple[float, float]],
     cues = build_cues(words, matcher, subs, mask, tl.new_duration())
 
     base = Path(out_base)
-    srt = str(base.with_suffix(".srt"))
+    # String-append, not Path.with_suffix: a dotted sidecar base (лекция.часть1)
+    # would otherwise be re-truncated at its last dot to лекция.srt.
+    srt = str(Path(str(base) + ".srt"))
     write_srt(cues, srt)
     result = {"cues": len(cues), "srt": srt}
     if subs.write_vtt:
-        vtt = str(base.with_suffix(".vtt"))
+        vtt = str(Path(str(base) + ".vtt"))
         write_vtt(cues, vtt)
         result["vtt"] = vtt
     if subs.write_transcript:
@@ -253,15 +264,95 @@ def _ass_text_escape(text: str) -> str:
     hard break ``\N``. We do NOT touch ``}`` (harmless without an opening brace)
     beyond the brace escape above.
     """
-    text = text.replace("\\", "\\\\")        # backslash first
-    text = text.replace("{", "\\{").replace("}", "\\}")
+    # ASS has no general '\' escape and '\{' is libass-only. Neutralise the
+    # ambiguous backslash and use fullwidth brace/solidus lookalikes so the text
+    # is safe in BOTH libass and VSFilter. Do the literal substitutions BEFORE
+    # inserting our own \N for real newlines (which needs a genuine backslash).
+    text = text.replace("\\", "⧵")       # reverse-solidus glyph
+    text = text.replace("{", "｛").replace("}", "｝")  # fullwidth braces
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = text.replace("\n", "\\N")
     return text
 
 
+# --- Feature B (V11 §4b): kinetic keyword pop inside karaoke -------------------
+# Stop-list of NON-content words that must never "pop": the line-tail function
+# words (prepositions/conjunctions/particles — exactly the §4b «не-ключевые»
+# set) plus a few common pronouns/forms that carry no emphasis. Anything NOT in
+# here AND long enough is a content-word candidate (noun/verb «носитель смысла»).
+_KINETIC_STOP = _BAD_LINE_TAIL | {
+    "это", "этот", "эта", "эти", "вот", "так", "там", "тут", "уже", "ещё",
+    "его", "её", "их", "мы", "вы", "он", "она", "они", "я", "ты", "оно",
+    "был", "была", "было", "были", "есть", "над", "без", "про", "там",
+    "тоже", "только", "очень", "когда", "если", "чтобы", "потому",
+}
+KINETIC_MIN_LEN = 4           # слово короче 4 букв не «носитель смысла» -> не поп
+KINETIC_MAX_PER_CUE = 2       # 1–2 слова на реплику (§4b), НЕ каждую реплику
+KINETIC_SCALE = 120           # вспухание до 120% (≤1.2×, §4b анти-кринж)
+KINETIC_POP_IN_MS = 120       # рост за 120 мс (R3)
+KINETIC_POP_HOLD_MS = 260     # держит 260 мс
+KINETIC_POP_OUT_MS = 160      # возврат за 160 мс
+_KINETIC_DEFAULT_ACCENT = "&H000B9EF5"   # #f59e0b BGR — акцент проекта (не кислота)
+
+
+def _is_content_word(disp: str) -> bool:
+    r"""Слово — «носитель смысла» (кандидат на кинетический поп, §4b)?
+
+    Чистим пунктуацию/кавычки, нижний регистр; отсекаем стоп-лист (предлоги/
+    союзы/частицы/местоимения) и короткие слова. Длинное содержательное слово
+    (существительное/глагол), число с цифрами — годится.
+    """
+    core = disp.strip(".,!?…:;\"'»«()-—").lower()
+    if not core:
+        return False
+    if any(ch.isdigit() for ch in core):     # числа/названия — всегда содержательны
+        return True
+    return len(core) >= KINETIC_MIN_LEN and core not in _KINETIC_STOP
+
+
+def _kinetic_keywords(disp_words: list[str], *,
+                      max_n: int = KINETIC_MAX_PER_CUE) -> set[int]:
+    r"""Индексы 1–2 ключевых слов реплики для кинетического попа (§4b).
+
+    Эвристика «носитель смысла, не стоп-лист»: из content-слов берём самые
+    длинные (длина ≈ значимость), не больше ``max_n``. НЕ каждую реплику — если
+    content-слов нет, set пуст (поп не ставится). Стабильно: при равной длине
+    выигрывает более ранний индекс."""
+    cands = [(len(disp_words[i]), -i, i)
+             for i in range(len(disp_words))
+             if _is_content_word(disp_words[i])]
+    if not cands:
+        return set()
+    cands.sort(reverse=True)
+    return {i for _l, _ni, i in cands[:max(0, max_n)]}
+
+
+def _kinetic_pop_tag(start_ms: int, accent: str,
+                     restore_fill: str = "&H0000FFFF",
+                     restore_outline: str = "&H00000000") -> str:
+    r"""``\t``-поп ключевого слова: вспухание ``KINETIC_SCALE``% + акцент за
+    ``POP_IN``, держит ``POP_HOLD``, возврат к 100% за ``POP_OUT`` (§4b, R3).
+
+    Времена line-relative (libass ``\t`` от начала события): ``start_ms`` =
+    смещение до произнесения слова (=Σ предыдущих ``\k`` ×10). Караоке-``\k``
+    остального текста не трогаем — поп лишь добавляет ``\t`` в тот же блок.
+    """
+    t0 = max(0, int(start_ms))
+    t1 = t0 + KINETIC_POP_IN_MS
+    t2 = t1 + KINETIC_POP_HOLD_MS
+    t3 = t2 + KINETIC_POP_OUT_MS
+    return (f"\\t({t0},{t1},\\fscx{KINETIC_SCALE}\\fscy{KINETIC_SCALE}"
+            f"\\1c{accent}\\3c{accent})"
+            f"\\t({t2},{t3},\\fscx100\\fscy100"
+            f"\\1c{restore_fill}\\3c{restore_outline})")
+
+
 def _karaoke_text(cue: Cue, words: list[Word], matcher: ProfanityMatcher,
-                  mask: MaskingCfg, eps: float = 0.02) -> str:
+                  mask: MaskingCfg, eps: float = 0.02, *,
+                  kinetic: bool = True,
+                  accent: str = _KINETIC_DEFAULT_ACCENT,
+                  karaoke_color: str = "&H0000FFFF",
+                  outline_color: str = "&H00000000") -> str:
     r"""Render one cue's text as a karaoke line: ``{\kNN}word`` per word.
 
     ``NN`` is the word's duration in centiseconds (ASS ``\k`` unit). Words are
@@ -273,9 +364,23 @@ def _karaoke_text(cue: Cue, words: list[Word], matcher: ProfanityMatcher,
     Line breaks in ``cue.text`` are preserved: we keep the wrapped plain text as
     the layout reference and only attach ``\k`` tags to whitespace-separated
     tokens, mapping them positionally onto the in-cue words.
+
+    V11 §4b — kinetic keyword pop: when ``kinetic`` is on, 1–2 content words of
+    the cue additionally get a ``\t`` transform that swells them to
+    ``KINETIC_SCALE``% + accent colour exactly when spoken, then returns to
+    100%. The pop only ADDS a ``\t`` inside the word's own ``{...}`` block — the
+    per-word ``\kNN`` karaoke fill (count and centisecond sum) is untouched
+    (proven byte-compatible with the existing karaoke contract). Profane
+    (masked) words never pop (no extra attention on a bleeped word).
     """
+    # Overlap (not full-containment) selection: build_cues trims cue ends below
+    # the last word's end for back-to-back speech (max_cps/overlap passes), so
+    # containment silently dropped the tail word. A word belongs to the cue iff
+    # its span OVERLAPS the cue window. The eps keeps the previous cue's last
+    # word (ends at cue.start) and the next cue's first word (starts at cue.end)
+    # out.
     in_cue = [w for w in words
-              if w.start >= cue.start - eps and w.end <= cue.end + eps]
+              if w.start < cue.end - eps and w.end > cue.start + eps]
     in_cue.sort(key=lambda w: w.start)
 
     # If we somehow can't line words up with the cue, fall back to plain text.
@@ -300,10 +405,47 @@ def _karaoke_text(cue: Cue, words: list[Word], matcher: ProfanityMatcher,
     drift = total_cs - sum(spans)
     spans[-1] = max(1, spans[-1] + drift)
 
+    disps = [_display(w, matcher, mask) for w in in_cue]
+    # Kinetic keywords: only NON-profane content words are eligible to pop.
+    key_idx: set[int] = set()
+    if kinetic:
+        eligible = [d if not matcher.is_profane(w.word.strip()) else ""
+                    for w, d in zip(in_cue, disps)]
+        key_idx = _kinetic_keywords(eligible)
+
     out_parts: list[str] = []
-    for w, cs in zip(in_cue, spans):
-        disp = _ass_text_escape(_display(w, matcher, mask))
-        out_parts.append(f"{{\\k{cs}}}{disp}")
+    elapsed_cs = 0                          # Σ предыдущих \k -> офсет слова в мс
+    for i, (disp, cs) in enumerate(zip(disps, spans)):
+        esc = _ass_text_escape(disp)
+        if i in key_idx:
+            pop = _kinetic_pop_tag(elapsed_cs * 10, accent,
+                                   karaoke_color, outline_color)
+            # W6 #3: ASS-теги (включая \t) действуют от точки вставки до КОНЦА
+            # строки события — без явного сброса поп вспухал/перекрашивал ВСЕ
+            # следующие слова на время окна анимации. Статический restore-блок
+            # сразу после ключевого слова скоупит поп: поздний статический тег
+            # переопределяет анимируемое значение для последующего текста, а
+            # \t-пара продолжает анимировать само слово. \1c = PrimaryColour
+            # стиля (karaoke_color), так что караоке-заливка не меняется.
+            reset = (f"{{\\fscx100\\fscy100"
+                     f"\\1c{karaoke_color}\\3c{outline_color}}}")
+            out_parts.append(f"{{\\k{cs}{pop}}}{esc}{reset}")
+        else:
+            out_parts.append(f"{{\\k{cs}}}{esc}")
+        elapsed_cs += cs
+    # Reapply cue.text's balanced multi-line layout to the \k tokens: split the
+    # tokens positionally into the same per-line word counts _wrap chose and join
+    # the line groups with the ASS hard break \N so libass stops pixel-re-wrapping
+    # (max_lines / Russian break rules survive in the burn). Fall back to a flat
+    # line when the token count doesn't match cue.text (e.g. the overlap eps
+    # dropped a word) so we never shift words across lines.
+    line_counts = [len(ln.split(" ")) for ln in cue.text.split("\n")]
+    if len(line_counts) > 1 and sum(line_counts) == len(out_parts):
+        chunks, idx = [], 0
+        for n in line_counts:
+            chunks.append(" ".join(out_parts[idx:idx + n]))
+            idx += n
+        return "\\N".join(chunks)
     return " ".join(out_parts)
 
 
@@ -323,6 +465,13 @@ def write_ass(cues: list[Cue], path: str | Path, style: "AssStyleCfg", *,
     Cyrillic most reliably.
     """
     pr_x, pr_y = int(play_res[0] or 1920), int(play_res[1] or 1080)
+    # Presets are defined @1080 (serve.CAPTION_PRESETS) and hand-tuned for BOTH
+    # 1920x1080 and the 1080x1920 Shorts frame. Scale by the SHORT side / 1080:
+    # landscape k = pr_y/1080 (4K -> 2.0), portrait 9:16 k = 1080/1080 = 1.0 —
+    # a pr_y/1080 scale blew vertical fonts up 1.78x past the UNSCALED
+    # max_line_chars wrap budget and overflowed the 1080-px frame width (W6 #4).
+    # k==1.0 at 1080p/vertical -> those renders stay byte-identical.
+    k = min(pr_x, pr_y) / 1080.0
     align = _ASS_ALIGN.get(style.position, 2)
 
     header = [
@@ -344,13 +493,14 @@ def write_ass(cues: list[Cue], path: str | Path, style: "AssStyleCfg", *,
         # Secondary = base text colour, Primary = karaoke highlight colour.
         ("Style: Default,{font},{size},{primary},{secondary},{outline_c},"
          "&H64000000,0,0,0,0,100,100,0,0,1,{outline},{shadow},{align},"
-         "40,40,{margin_v},1").format(
-            font=style.font, size=int(style.size),
+         "{mlr},{mlr},{margin_v},1").format(
+            font=style.font, size=max(1, int(round(style.size * k))),
             primary=(style.karaoke_color if karaoke else style.primary_color),
             secondary=style.primary_color,
             outline_c=style.outline_color,
-            outline=_num(style.outline), shadow=_num(style.shadow),
-            align=align, margin_v=int(style.margin_v)),
+            outline=_num(style.outline * k), shadow=_num(style.shadow * k),
+            align=align, mlr=int(round(40 * k)),
+            margin_v=int(round(style.margin_v * k))),
         "",
         "[Events]",
         ("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, "
@@ -366,7 +516,14 @@ def write_ass(cues: list[Cue], path: str | Path, style: "AssStyleCfg", *,
     lines = list(header)
     for c in cues:
         if use_kara:
-            text = _karaoke_text(c, words or [], kmatcher, kmask)
+            # V11 §4b: kinetic keyword pop uses the project accent (distinct from
+            # the karaoke fill so the swelling word reads as an emphasis, not
+            # just the sung colour). Karaoke \k fill stays untouched.
+            text = _karaoke_text(c, words or [], kmatcher, kmask,
+                                 kinetic=bool(getattr(style, "kinetic", False)),
+                                 accent=_KINETIC_DEFAULT_ACCENT,
+                                 karaoke_color=style.karaoke_color,
+                                 outline_color=style.outline_color)
         else:
             text = _ass_text_escape(c.text)
         lines.append(

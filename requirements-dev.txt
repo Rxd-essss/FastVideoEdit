@@ -1,0 +1,9 @@
+# Dev-only test dependencies. NOT installed on CI: .github/workflows/ci.yml
+# installs requirements.txt + pytest + httpx only, on purpose (the suite must
+# stay hermetic). Any test needing these degrades gracefully -- see
+# tests/test_timeline_property.py, guarded by pytest.importorskip('hypothesis'),
+# which skips the whole module when hypothesis is absent.
+#
+#   pip install -r requirements-dev.txt
+
+hypothesis>=6,<7   # property/fuzz tests for the interval math (audit #86)

@@ -255,7 +255,7 @@ def _patch_render(monkeypatch):
 
     def fake_render(ff, media, cl, cfg, out, work_dir, *, on_progress=None,
                     log=None, scale_h=None, fps=None, ass_path=None,
-                    crop_filter=None, edge_fade=0.0):
+                    crop_filter=None, edge_fade=0.0, **kw):
         calls.append({"cl": cl, "ass_path": ass_path, "edge_fade": edge_fade})
         return {"out": str(out), "encoder": "fake"}
 

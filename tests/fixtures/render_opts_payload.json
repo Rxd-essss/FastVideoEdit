@@ -1,0 +1,44 @@
+{
+  "_note": "Recorded output of web/app.js collectRenderOpts() (app.js:2786-2831) with EVERY top-level key the function can emit: the base object, the conditional enrich block, the conditional denoise_strength/denoise_normalize/denoise_engine (emitted only when denoise is on), and the burn_subtitles/burn_style pair from burnOptsFromUI(). Regenerate this file whenever collectRenderOpts legitimately gains/renames a field (console.log(JSON.stringify(collectRenderOpts())) in the render modal) — that regeneration is the review signal for a UI<->server contract change. Keys here are the contract; values are representative. See tests/test_render_opts_contract.py.",
+  "encoder": "x264",
+  "quality": 20,
+  "scale_h": 1080,
+  "fps": 30,
+  "audio_bitrate": "256k",
+  "censor_method": "pitch",
+  "subtitles": true,
+  "chapters": true,
+  "formats": ["source"],
+  "denoise": true,
+  "denoise_deess": true,
+  "denoise_loudnorm": true,
+  "loudnorm_mode": "2pass",
+  "cut_fade": 0.02,
+  "music": {
+    "enabled": false,
+    "path": "",
+    "gain_db": -18,
+    "duck_db": -12
+  },
+  "out_dir": "",
+  "filename": "клип_финал",
+  "enrich": {
+    "enabled": true
+  },
+  "denoise_strength": -20,
+  "denoise_normalize": true,
+  "denoise_engine": "deepfilter",
+  "burn_subtitles": true,
+  "burn_style": {
+    "font": "Montserrat",
+    "size": 48,
+    "position": "bottom",
+    "karaoke": true,
+    "primary_color": "&H00FFFFFF",
+    "karaoke_color": "&H0000FFFF",
+    "outline_color": "&H00000000",
+    "outline": 2.0,
+    "shadow": 0.0,
+    "margin_v": 40
+  }
+}

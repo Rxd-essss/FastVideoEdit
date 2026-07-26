@@ -1,0 +1,728 @@
+# -*- coding: utf-8 -*-
+"""P1: планировщик plan_render (ENRICH_PLAN §1.3, §2.1, §7-P1, §9).
+
+Покрытие из §7-P1: ремап-кейсы у швов, >50%-дроп, карточка с пунктом в
+вырезе, конфликт-приоритеты card>cta>image>animation, зазоры >=2 c, потолки
+(2.5/мин, 2 image/мин, CTA 2/10мин, экранное время 25%), CTA<60 c, чистые
+зоны (первые 30 / последние 20 c), engine-лимиты 6 still / 3 anim, выбор
+ассетов (user-файл/эмодзи-кэш/CTA-webm) и статусы/notes в плане.
+
+Timeline и words — синтетические (паттерн tests/test_timeline.py).
+"""
+import pytest
+
+from vpipe import enrich
+from vpipe.enrich import (AnimationPayload, CardItem, CtaCommentPayload,
+                          CtaLikePayload, CtaSubscribePayload, EnrichItem,
+                          EnrichPlan, ImagePayload, ListCardPayload,
+                          plan_render)
+from vpipe.models import Word
+from vpipe.timeline import Timeline
+
+W, H = 1920, 1080
+
+
+# --- builders (прямое конструирование, как после item_from_dict) ----------------
+def img(iid, t, score=70, dur=3.0, kind="none", path="", pos="top_right",
+        wf=0.32, kenburns=False, emoji="", enabled=True):
+    return EnrichItem(
+        id=iid, type=enrich.ENR_IMAGE, score=score, enabled=enabled,
+        t_start=t, t_end=t + dur,
+        payload=ImagePayload(asset_kind=kind, asset_path=path, emoji=emoji,
+                             position=pos, width_frac=wf, kenburns=kenburns))
+
+
+def anim(iid, t, score=70, dur=3.0, kind="none", path="", preset="pulse"):
+    return EnrichItem(
+        id=iid, type=enrich.ENR_ANIMATION, score=score,
+        t_start=t, t_end=t + dur,
+        payload=AnimationPayload(preset=preset, asset_kind=kind,
+                                 asset_path=path))
+
+
+def card(iid, t, items, score=70, hold=1.2, word_start=-1, title=""):
+    """items: список (text, word_idx, t_word)."""
+    return EnrichItem(
+        id=iid, type=enrich.ENR_LIST_CARD, score=score,
+        t_start=t, t_end=0.0, word_start=word_start,
+        payload=ListCardPayload(
+            title=title, hold_s=hold,
+            items=[CardItem(text=tx, word_idx=ix, t_word=tw)
+                   for tx, ix, tw in items]))
+
+
+def cta_sub(iid, t, score=70, dur=4.0):
+    return EnrichItem(id=iid, type=enrich.ENR_CTA_SUBSCRIBE, score=score,
+                      t_start=t, t_end=t + dur, payload=CtaSubscribePayload())
+
+
+def cta_like(iid, t, score=70, dur=3.0):
+    return EnrichItem(id=iid, type=enrich.ENR_CTA_LIKE, score=score,
+                      t_start=t, t_end=t + dur, payload=CtaLikePayload())
+
+
+def cta_comment(iid, t, score=70, dur=5.0, q="Какой дистрибутив выбрал?"):
+    return EnrichItem(id=iid, type=enrich.ENR_CTA_COMMENT, score=score,
+                      t_start=t, t_end=t + dur,
+                      payload=CtaCommentPayload(question=q))
+
+
+def run(items, tl, words=None):
+    plan = EnrichPlan(items=items)
+    return plan, plan_render(plan, tl, words, None, W, H)
+
+
+@pytest.fixture
+def png(tmp_path):
+    p = tmp_path / "asset.png"
+    p.write_bytes(b"\x89PNG fake")
+    return str(p)
+
+
+@pytest.fixture
+def webm(tmp_path):
+    p = tmp_path / "asset.webm"
+    p.write_bytes(b"\x1aE\xdf\xa3 fake")
+    return str(p)
+
+
+@pytest.fixture
+def cta_dir(tmp_path, monkeypatch):
+    d = tmp_path / "cta"
+    d.mkdir()
+    monkeypatch.setattr(enrich, "CTA_ASSET_DIR", d)
+    return d
+
+
+def words_grid(n=900, step=0.5, dur=0.4):
+    return [Word(f"w{i}", i * step, i * step + dur) for i in range(n)]
+
+
+# --- ремап у швов (§1.3) ---------------------------------------------------------
+def test_remap_window_snapped_to_seam_is_nudged(png):
+    tl = Timeline([(50, 60)], duration=210)        # шов в финальной 50.0
+    # окно [59.5..62.5]: 0.5 c из 3 в вырезе (16%) -> живёт; t0 прилипает к шву
+    plan, re = run([img("a", 59.5, path=png, kind="user")], tl)
+    assert len(re.stills) == 1
+    st = re.stills[0]
+    assert st.t0 == pytest.approx(50.0 + enrich.SEAM_GAP_S)   # 50.5, не 50.0
+    assert st.t1 == pytest.approx(52.5)
+    assert plan.items[0].status == enrich.ST_OK
+    assert plan.items[0].enabled is True
+
+
+def test_remap_window_ending_at_seam_trimmed_back(png):
+    tl = Timeline([(50, 60)], duration=210)
+    plan, re = run([img("b", 47.0, dur=2.8, path=png, kind="user")], tl)
+    st = re.stills[0]
+    assert st.t0 == pytest.approx(47.0)
+    assert st.t1 == pytest.approx(50.0 - enrich.SEAM_GAP_S)   # 49.8 -> 49.5
+
+
+def test_window_collapsed_at_seam_goes_off_limits(png):
+    tl = Timeline([(50, 60)], duration=210)
+    # [49.2..50.2]: 20% в вырезе -> живёт ремап, но после отступов от шва
+    # остаётся 0.3 c < MIN_WINDOW_S -> off_limits
+    plan, re = run([img("c", 49.2, dur=1.0, path=png, kind="user")], tl)
+    assert re.stills == []
+    assert plan.items[0].status == enrich.ST_OFF_LIMITS
+    assert plan.items[0].enabled is False
+    assert "шва" in plan.items[0].status_note
+
+
+# --- >50%-дроп (правило remap_words) ----------------------------------------------
+def test_in_cut_drop_rule(png):
+    tl = Timeline([(50, 60)], duration=210)
+    plan, re = run([
+        img("full", 52.0, path=png, kind="user"),            # целиком в вырезе
+        img("major", 49.0, path=png, kind="user"),           # 2/3 в вырезе
+        img("half", 48.0, dur=4.0, path=png, kind="user"),   # ровно 50% — живёт
+    ], tl)
+    assert plan.items[0].status == enrich.ST_IN_CUT
+    assert plan.items[1].status == enrich.ST_IN_CUT
+    assert plan.items[0].enabled is False and plan.items[1].enabled is False
+    assert ">50%" in plan.items[0].status_note
+    assert plan.items[2].status == enrich.ST_OK
+    assert len(re.stills) == 1
+    assert re.stills[0].t0 == pytest.approx(48.0)
+    assert re.stills[0].t1 == pytest.approx(49.5)             # шов 50 - 0.5
+
+
+# --- карточки: пункт в вырезе, intro, <2 выживших (§1.3) ----------------------------
+def test_card_item_inside_cut_dropped_card_survives():
+    tl = Timeline([(100, 110)], duration=400)
+    words = words_grid()
+    c = card("crd", 90.0, [("Раз", 184, 92.0),
+                           ("Два", 210, 105.0),     # слово 105.0-105.4 в вырезе
+                           ("Три", 240, 120.0)], word_start=180)
+    plan, re = run([c], tl, words)
+    assert plan.items[0].status == enrich.ST_OK
+    assert len(re.cards) == 1
+    cp = re.cards[0]
+    assert [i.text for i in cp.items] == ["Раз", "Три"]
+    assert cp.items[1].t == pytest.approx(110.0)              # 120 - 10 выреза
+    assert cp.t0 == pytest.approx(90.0 - enrich.CARD_LEAD_S)
+    # хвост: max(hold 1.2, 6 симв /13*2 = 0.92) = 1.2
+    assert cp.t1 == pytest.approx(110.0 + 1.2)
+
+
+def test_card_with_less_than_two_survivors_in_cut():
+    tl = Timeline([(100, 110)], duration=400)
+    words = words_grid()
+    c = card("crd2", 90.0, [("Раз", 184, 92.0),
+                            ("Два", 204, 102.0),
+                            ("Три", 210, 105.0)], word_start=180)
+    plan, re = run([c], tl, words)
+    assert plan.items[0].status == enrich.ST_IN_CUT
+    assert plan.items[0].enabled is False
+    assert "пунктов" in plan.items[0].status_note
+    assert re.cards == []
+
+
+def test_card_intro_inside_cut():
+    tl = Timeline([(100, 110)], duration=400)
+    words = words_grid()
+    c = card("crd3", 105.0, [("Раз", 240, 120.0), ("Два", 250, 125.0)],
+             word_start=210)                       # интро-слово 105.0 в вырезе
+    plan, re = run([c], tl, words)
+    assert plan.items[0].status == enrich.ST_IN_CUT
+    assert "интро" in plan.items[0].status_note
+    assert re.cards == []
+
+
+# --- конфликты: приоритет card > cta > image > animation (§9) -----------------------
+def test_conflict_card_beats_cta_despite_score():
+    tl = Timeline([], duration=300)
+    c = card("crd", 60.0, [("Раз", -1, 60.5), ("Два", -1, 61.0)], score=50)
+    s = cta_sub("cta", 61.0, score=99)
+    plan, re = run([c, s], tl)
+    assert len(re.cards) == 1
+    assert s.status == enrich.ST_CONFLICT and s.enabled is False
+    assert "list_card" in s.status_note and "crd" in s.status_note
+    assert "приоритет" in s.status_note
+
+
+def test_conflict_cta_beats_image_and_image_beats_animation():
+    tl = Timeline([], duration=300)
+    k = cta_comment("cta", 100.0, score=40)
+    i1 = img("im1", 102.0, score=99)
+    i2 = img("im2", 150.0, score=40)
+    a1 = anim("an1", 151.5, score=99)
+    plan, re = run([k, i1, i2, a1], tl)
+    assert k.status == enrich.ST_OK                 # cta выиграл у image
+    assert i1.status == enrich.ST_CONFLICT and "cta_comment" in i1.status_note
+    assert i2.status == enrich.ST_OK                # image выиграл у animation
+    assert a1.status == enrich.ST_CONFLICT and "image" in a1.status_note
+
+
+def test_conflict_same_type_higher_score_wins():
+    tl = Timeline([], duration=300)
+    hi = img("hi", 200.0, score=90)
+    lo = img("lo", 201.0, score=50)
+    plan, re = run([hi, lo], tl)
+    assert hi.status == enrich.ST_OK
+    assert lo.status == enrich.ST_CONFLICT and "hi" in lo.status_note
+
+
+# --- зазор >= 2 c между любыми окнами ------------------------------------------------
+def test_gap_under_two_seconds_is_conflict(png):
+    tl = Timeline([], duration=300)
+    a = img("a", 60.0, score=90, path=png, kind="user")       # [60..63]
+    b = img("b", 64.5, score=50, path=png, kind="user")       # зазор 1.5 c
+    plan, re = run([a, b], tl)
+    assert len(re.stills) == 1
+    assert b.status == enrich.ST_CONFLICT
+    assert "ближе 2" in b.status_note
+
+
+def test_gap_exactly_two_seconds_ok(png):
+    tl = Timeline([], duration=300)
+    a = img("a", 60.0, score=90, path=png, kind="user")       # [60..63]
+    b = img("b", 65.0, score=50, path=png, kind="user")       # зазор ровно 2 c
+    plan, re = run([a, b], tl)
+    assert len(re.stills) == 2
+
+
+# --- чистые зоны и CTA >= 60 c ---------------------------------------------------------
+def test_clean_zones_head_and_tail(png):
+    tl = Timeline([], duration=300)
+    head = img("head", 25.0, path=png, kind="user")
+    tail = img("tail", 285.0, path=png, kind="user")          # f1=288 > 280
+    mid = img("mid", 100.0, path=png, kind="user")
+    plan, re = run([head, tail, mid], tl)
+    assert head.status == enrich.ST_OFF_LIMITS
+    assert tail.status == enrich.ST_OFF_LIMITS
+    assert "чистая зона" in head.status_note
+    assert mid.status == enrich.ST_OK
+    assert len(re.stills) == 1 and re.stills[0].t0 == pytest.approx(100.0)
+
+
+def test_cta_not_before_60s_final():
+    tl = Timeline([], duration=300)
+    early = cta_sub("early", 45.0)
+    fine = cta_sub("fine", 65.0)
+    plan, re = run([early, fine], tl)
+    assert early.status == enrich.ST_OFF_LIMITS
+    assert "60" in early.status_note
+    assert fine.status == enrich.ST_OK
+
+
+def test_clean_zone_measured_on_final_timeline(png):
+    # вырез 0..40: оригинальная 65-я секунда — финальная 25-я -> чистая зона
+    tl = Timeline([(0, 40)], duration=340)
+    plan, re = run([img("a", 65.0, path=png, kind="user")], tl)
+    assert plan.items[0].status == enrich.ST_OFF_LIMITS
+
+
+# --- потолки плотности (§9, R5) ---------------------------------------------------------
+def test_images_max_two_per_minute(png):
+    tl = Timeline([], duration=300)
+    items = [img("i1", 60.0, score=90, path=png, kind="user"),
+             img("i2", 80.0, score=85, path=png, kind="user"),
+             img("i3", 100.0, score=80, path=png, kind="user")]
+    plan, re = run(items, tl)
+    assert len(re.stills) == 2
+    assert items[2].status == enrich.ST_OFF_LIMITS            # минимальный score
+    assert "картинок в минуту" in items[2].status_note
+
+
+def test_cta_max_two_per_ten_minutes(cta_dir):
+    (cta_dir / "subscribe_like.webm").write_bytes(b"webm")
+    tl = Timeline([], duration=700)
+    items = [cta_sub("c1", 100.0, score=90),
+             cta_sub("c2", 200.0, score=80),
+             cta_sub("c3", 300.0, score=70)]
+    plan, re = run(items, tl)
+    assert len(re.anims) == 2
+    assert items[2].status == enrich.ST_OFF_LIMITS
+    assert "10 минут" in items[2].status_note
+
+
+def test_total_density_budget_trims_lowest_score():
+    # 120 c финала -> int(2.5 * 2) = 5 окон максимум
+    tl = Timeline([], duration=120)
+    items = [card(f"c{i}", 35.0 + 5 * i,
+                  [("Раз", -1, 35.5 + 5 * i), ("Два", -1, 36.0 + 5 * i)],
+                  score=90 - 5 * i, hold=1.2)
+             for i in range(6)]
+    plan, re = run(items, tl)
+    assert len(re.cards) == 5
+    loser = items[5]                                          # score 65
+    assert loser.status == enrich.ST_OFF_LIMITS
+    assert "плотности" in loser.status_note
+
+
+def test_screen_time_capped_at_quarter():
+    # 200 c финала -> суммарное экранное время <= 50 c; карточки по ~7.3 c
+    tl = Timeline([], duration=200)
+    items = [card(f"c{i}", 35.0 + 10 * i,
+                  [("х" * 60, -1, 35.5 + 10 * i),
+                   ("у" * 60, -1, 36.0 + 10 * i)],
+                  score=90 - i, hold=1.2)
+             for i in range(7)]
+    plan, re = run(items, tl)
+    assert len(re.cards) == 6
+    assert items[6].status == enrich.ST_OFF_LIMITS
+    assert "25%" in items[6].status_note
+    total = sum(c.t1 - c.t0 for c in re.cards)
+    assert total <= 0.25 * 200 + 1e-6
+
+
+# --- выбор ассетов (задача 3) -------------------------------------------------------------
+def test_user_asset_missing_drops_from_render_keeps_item(tmp_path):
+    tl = Timeline([], duration=300)
+    a = img("a", 100.0, kind="user", path=str(tmp_path / "нет.png"))
+    plan, re = run([a], tl)
+    assert re.stills == []
+    assert a.enabled is True and a.status == enrich.ST_OK     # остаётся в плане
+    assert "не найден" in a.status_note
+
+
+def test_user_still_geometry_and_fade(png):
+    tl = Timeline([], duration=300)
+    a = img("a", 100.0, kind="user", path=png, pos="top_right", kenburns=True)
+    b = img("b", 150.0, kind="user", path=png, pos="top_left")
+    plan, re = run([a, b], tl)
+    st_a, st_b = re.stills
+    assert st_a.path == png
+    assert st_a.x_expr == "W-w-48" and st_a.y_expr == "48"    # 48 px @1080p
+    assert st_b.x_expr == "48" and st_b.y_expr == "48"
+    assert st_a.scale_w == round(0.32 * W) == 614             # 30-34% ширины
+    assert st_a.fade_s == pytest.approx(0.22)
+    assert st_a.kenburns is True and st_b.kenburns is False
+    assert st_a.t0 == pytest.approx(100.0)
+    assert st_a.t1 == pytest.approx(103.0)
+
+
+def test_emoji_uses_cache_or_drops(tmp_path, monkeypatch):
+    cache = tmp_path / "ecache"
+    cache.mkdir()
+    monkeypatch.setattr(enrich, "EMOJI_CACHE_DIR", cache)
+    cached = cache / f"u26a1_{enrich.EMOJI_PNG_SIZE}.png"
+    cached.write_bytes(b"png")                                # уже в кэше
+    tl = Timeline([], duration=300)
+    ok = img("ok", 100.0, kind="emoji", emoji="u26a1")
+    # битый кодпойнт не разворачивается в символ -> дроп из рендера (P5: реальная
+    # растеризация; невалидное имя честно даёт status_note, item остаётся в плане)
+    miss = img("miss", 150.0, kind="emoji", emoji="zzz")
+    plan, re = run([ok, miss], tl)
+    assert len(re.stills) == 1
+    assert re.stills[0].path == str(cached)                   # из кэша как есть
+    assert "zzz" in miss.status_note                          # честная пометка
+    assert miss.enabled is True
+
+
+def test_emoji_png_path_interface(tmp_path):
+    cache = tmp_path / "c"
+    cache.mkdir()
+    assert enrich.emoji_png_path("", cache) is None           # пустое имя
+    assert enrich.emoji_png_path("zzz", cache) is None        # битый кодпойнт
+    # уже закэшированный файл отдаётся как есть (идемпотентно)
+    p = cache / f"u26a1_{enrich.EMOJI_PNG_SIZE}.png"
+    p.write_bytes(b"png")
+    assert enrich.emoji_png_path("u26a1", cache) == p
+    # валидный noto-кодпойнт без кэша -> растеризуется в НЕпустой PNG (P5).
+    # Растеризация нуждается в РАБОЧЕМ цветном emoji-глифе (нет на CI — ни файла
+    # на Linux, ни живого COLR на Windows Server); логика выше (None/кэш-хит)
+    # проверяется на любой машине.
+    from conftest import can_rasterize_emoji
+    if not can_rasterize_emoji():
+        pytest.skip("colour-emoji glyph does not rasterise on this host (CI)")
+    p2 = enrich.emoji_png_path("u1f5c3", cache)
+    assert p2 is not None and p2.is_file() and p2.stat().st_size > 0
+
+
+def test_asset_kind_none_skipped_silently():
+    tl = Timeline([], duration=300)
+    a = img("a", 100.0, kind="none")
+    plan, re = run([a], tl)
+    assert re.stills == [] and a.status_note == ""
+    assert a.status == enrich.ST_OK
+
+
+# --- «Монтаж V2» resolved_asset()-роутинг (schematic / diffusion кандидаты) -----
+def _img_with_candidates(iid, t, candidates, selected=0, source="none",
+                         wf=0.32, score=70, dur=3.0):
+    """ENR_IMAGE с кандидатами «Монтаж V2» (минуя плоский img(), напрямую)."""
+    return EnrichItem(
+        id=iid, type=enrich.ENR_IMAGE, score=score,
+        t_start=t, t_end=t + dur,
+        payload=ImagePayload(source=source, candidates=list(candidates),
+                             selected=selected, width_frac=wf))
+
+
+def test_schematic_candidate_renders_fullframe_still(png):
+    # schematic код-графики: PNG выбранного кандидата (preview) рендерится
+    # ПОЛНОКАДРОВО (1920x1080 cut-out с альфой), а не угловым PiP. До фикса
+    # plan_render свитчил по плоскому asset_kind ('none') и молча дропал точку.
+    tl = Timeline([], duration=300)
+    a = _img_with_candidates(
+        "a", 100.0, source="schematic",
+        candidates=[{"source": "schematic", "intent": "stat",
+                     "fields": {"stats": [{"value": "96", "unit": "%"}]},
+                     "style": "minimal", "preview": png}])
+    plan, re = run([a], tl)
+    assert len(re.stills) == 1
+    st = re.stills[0]
+    assert st.path == png
+    assert (st.x_expr, st.y_expr, st.scale_w) == ("0", "0", W)
+    assert st.kenburns is False                              # не джиттерим текст
+    assert a.status == enrich.ST_OK
+    assert st.t0 == pytest.approx(100.0)
+
+
+def test_schematic_candidate_without_png_dropped_with_note():
+    # выбран schematic, но PNG код-графики ещё не отрендерен (нет preview/
+    # asset_path) -> честный дроп из рендера со status_note, item остаётся.
+    tl = Timeline([], duration=300)
+    a = _img_with_candidates(
+        "a", 100.0, source="schematic",
+        candidates=[{"source": "schematic", "intent": "stat",
+                     "fields": {"stats": [{"value": "96", "unit": "%"}]},
+                     "style": "minimal"}])
+    plan, re = run([a], tl)
+    assert re.stills == []
+    assert "не готов" in a.status_note
+    assert a.enabled is True and a.status == enrich.ST_OK
+
+
+def test_diffusion_candidate_renders_corner_pip(png):
+    # регрессия: диффузия (SD-PNG) выбранного кандидата остаётся угловым PiP
+    # (полный кадр — ТОЛЬКО для schematic cut-out).
+    tl = Timeline([], duration=300)
+    a = _img_with_candidates(
+        "a", 100.0, source="diffusion", wf=0.32,
+        candidates=[{"source": "diffusion", "prompt": "x", "seed": -1,
+                     "asset_path": png}])
+    plan, re = run([a], tl)
+    assert len(re.stills) == 1
+    st = re.stills[0]
+    assert st.path == png
+    assert st.scale_w == round(W * 0.32)                     # не полнокадр
+    assert (st.x_expr, st.y_expr) == ("W-w-48", "48")
+
+
+def test_cta_subscribe_webm_overlay(cta_dir):
+    f = cta_dir / "subscribe_like.webm"
+    f.write_bytes(b"webm")
+    tl = Timeline([], duration=300)
+    plan, re = run([cta_sub("c", 100.0)], tl)
+    assert len(re.anims) == 1
+    an = re.anims[0]
+    assert an.path == str(f)
+    assert an.x_expr == "48" and an.y_expr == "H-h-160"       # §2.3 низ-лево
+    assert an.scale_w == round(W * enrich.CTA_WIDTH_FRAC) == 220
+    # §5: subscribe_like.webm -> пресет cta_slide_in (loop=false в
+    # anim_presets.json) — финитный въезд играет ОДИН раз от t0, НЕ зациклен.
+    assert an.loop is False
+    assert an.t0 == pytest.approx(100.0) and an.t1 == pytest.approx(104.0)
+
+
+def test_cta_finite_entrance_not_looped(cta_dir):
+    """V11 §5 (регрессия): финитный въезд CTA должен играть ОДИН раз от t0, НЕ
+    зацикливаться. Раньше enrich.py хардкодил loop=True для ВСЕХ CTA — въезд
+    (slide+отскок) повторялся ~3-4× за окно (кринж, гейт §8.3). Теперь loop
+    берётся из пресета ассета (anim_presets.json: subscribe_like.webm ->
+    cta_slide_in loop=false, like.webm -> pop_in loop=false). loop=False =>
+    render НЕ ставит -stream_loop -1 / shortest=1 (см. test_enrich_render_graph)."""
+    (cta_dir / "subscribe_like.webm").write_bytes(b"webm")
+    (cta_dir / "like.webm").write_bytes(b"webm")
+    tl = Timeline([], duration=300)
+    plan, re = run([cta_sub("s", 100.0), cta_like("l", 150.0)], tl)
+    by_path = {a.path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]: a
+               for a in re.anims}
+    assert by_path["subscribe_like.webm"].loop is False     # cta_slide_in
+    assert by_path["like.webm"].loop is False               # pop_in
+
+
+def test_asset_loop_defaults_true_for_unmapped(monkeypatch):
+    """_asset_loop: незамапленный (неизвестный) webm -> дефолт вызывающего
+    (True = старое looped-поведение, аддитивная обратная совместимость)."""
+    # реальный пресет читается из anim_presets.json (cta_slide_in -> False)
+    assert enrich._asset_loop("subscribe_like.webm", True) is False
+    # имя, которого нет в карте assets -> возвращается переданный дефолт
+    assert enrich._asset_loop("definitely_not_a_real_asset.webm", True) is True
+    assert enrich._asset_loop("definitely_not_a_real_asset.webm", False) is False
+
+
+def test_cta_comment_text_survives_missing_icon(cta_dir):
+    tl = Timeline([], duration=300)
+    k = cta_comment("c", 100.0, q="Какой дистрибутив выбрал и зачем?")
+    plan, re = run([k], tl)
+    assert len(re.cta_texts) == 1                             # вопрос — в ASS
+    ct = re.cta_texts[0]
+    assert ct.text == "Какой дистрибутив выбрал и зачем?"
+    assert ct.t0 == pytest.approx(100.0) and ct.t1 == pytest.approx(105.0)
+    assert re.anims == []                                     # иконки нет
+    assert "не найден" in k.status_note
+    assert k.enabled is True and k.status == enrich.ST_OK
+
+
+def test_cta_comment_with_icon(cta_dir):
+    (cta_dir / "comment.webm").write_bytes(b"webm")
+    tl = Timeline([], duration=300)
+    plan, re = run([cta_comment("c", 100.0)], tl)
+    assert len(re.cta_texts) == 1 and len(re.anims) == 1
+    assert re.anims[0].path.endswith("comment.webm")
+
+
+def test_cta_like_uses_like_webm(cta_dir):
+    (cta_dir / "like.webm").write_bytes(b"webm")
+    tl = Timeline([], duration=300)
+    plan, re = run([cta_like("c", 100.0)], tl)
+    assert len(re.anims) == 1
+    assert re.anims[0].path.endswith("like.webm")
+
+
+def test_animation_webm_loop_by_preset(webm):
+    tl = Timeline([], duration=300)
+    pulse = anim("p", 100.0, kind="user", path=webm, preset="pulse")
+    pop = anim("q", 150.0, kind="user", path=webm, preset="pop_in")
+    plan, re = run([pulse, pop], tl)
+    assert [a.loop for a in re.anims] == [True, False]
+    assert re.anims[0].scale_w == round(0.18 * W)
+
+
+def test_animation_png_degrades_to_still(png):
+    tl = Timeline([], duration=300)
+    a = anim("a", 100.0, kind="user", path=png)
+    plan, re = run([a], tl)
+    assert re.anims == []
+    assert len(re.stills) == 1
+    assert re.stills[0].fade_s == pytest.approx(0.18)         # fade_ms анимации
+
+
+# --- engine-лимиты §2.1 п.5 ------------------------------------------------------------------
+def test_engine_limit_six_stills(png):
+    tl = Timeline([], duration=600)
+    items = [img(f"i{i}", 60.0 + 60 * i, score=90 - i, path=png, kind="user")
+             for i in range(8)]
+    plan, re = run(items, tl)
+    assert len(re.stills) == 6
+    for trimmed in items[6:]:
+        assert "лимит движка" in trimmed.status_note
+        assert trimmed.enabled is True                        # страховка, не вето
+    assert [st.t0 for st in re.stills] == sorted(st.t0 for st in re.stills)
+
+
+def test_engine_limit_three_anims(webm):
+    tl = Timeline([], duration=600)
+    items = [anim(f"a{i}", 60.0 + 60 * i, score=90 - i, kind="user", path=webm)
+             for i in range(5)]
+    plan, re = run(items, tl)
+    assert len(re.anims) == 3
+    assert "лимит движка" in items[4].status_note
+
+
+# --- прочее поведение планировщика ------------------------------------------------------------
+def test_disabled_item_untouched_and_not_blocking(png):
+    tl = Timeline([], duration=300)
+    off = img("off", 100.0, score=99, path=png, kind="user", enabled=False)
+    off.status = enrich.ST_CONFLICT
+    off.status_note = "старая пометка"
+    on = img("on", 101.0, score=10, path=png, kind="user")
+    plan, re = run([off, on], tl)
+    assert off.status == enrich.ST_CONFLICT                   # не трогаем
+    assert off.status_note == "старая пометка"
+    assert on.status == enrich.ST_OK                          # конфликта нет
+    assert len(re.stills) == 1 and re.stills[0].t0 == pytest.approx(101.0)
+
+
+def test_accepted_item_status_reset(png):
+    tl = Timeline([], duration=300)
+    a = img("a", 100.0, path=png, kind="user")
+    a.status = enrich.ST_CONFLICT
+    a.status_note = "устарело после правки вырезов"
+    plan, re = run([a], tl)
+    assert a.status == enrich.ST_OK and a.status_note == ""
+    assert len(re.stills) == 1
+
+
+def test_render_enrich_shape_and_fonts_dir():
+    tl = Timeline([], duration=300)
+    plan, re = run([], tl)
+    assert re.stills == [] and re.anims == []
+    assert re.cards == [] and re.cta_texts == []
+    assert re.cards_ass is None                               # ASS строит P1.2
+    import vpipe
+    from pathlib import Path
+    expected = Path(vpipe.__file__).resolve().parent / "data" / "enrich" / "fonts"
+    assert Path(re.fonts_dir) == expected
+
+
+def test_card_tail_helper_matches_spec():
+    # дочитывание: сумма длин / 13 симв/с * 2, не больше потолка
+    assert enrich.card_tail_s(["абв", "где"], 1.2) == pytest.approx(1.2)
+    assert enrich.card_tail_s(["х" * 26], 1.0) == pytest.approx(4.0)
+    assert enrich.card_tail_s(["х" * 60, "у" * 60], 1.0) == \
+        pytest.approx(enrich.CARD_TAIL_MAX_S)
+
+
+# === card_windows (§3, blur-backplate) ==========================================
+def test_card_windows_match_drawn_cards():
+    tl = Timeline([], duration=400)
+    c = card("crd", 120.0, [("Раз", -1, 121.0), ("Два", -1, 123.0)])
+    plan, re = run([c], tl)
+    assert len(re.cards) == 1
+    assert len(re.card_windows) == 1
+    cp = re.cards[0]
+    t0, t1 = re.card_windows[0]
+    # окно совпадает с CardPlan.t0/t1 (floor по той же формуле дочитывания)
+    expected_t1 = max(cp.t1, cp.items[-1].t
+                      + enrich.card_tail_s([i.text for i in cp.items], cp.hold_s))
+    assert t0 == pytest.approx(cp.t0)
+    assert t1 == pytest.approx(expected_t1)
+
+
+def test_card_windows_empty_without_cards():
+    tl = Timeline([], duration=300)
+    plan, re = run([cta_sub("s1", 100.0)], tl)
+    assert re.card_windows == []
+
+
+# === punch-zoom (§4a) — анти-кринж лимиты в КОДЕ ================================
+def test_punch_from_card_within_caps():
+    tl = Timeline([], duration=400)
+    c = card("crd", 120.0, [("Раз", -1, 121.0), ("Два", -1, 124.0)], score=90)
+    plan, re = run([c], tl)
+    assert len(re.punches) == 1
+    p = re.punches[0]
+    # длительность 2–3 c, центр в окне карточки, z в потолке
+    assert enrich.PUNCH_DUR_MIN - 1e-6 <= p.t1 - p.t0 <= enrich.PUNCH_DUR_MAX + 1e-6
+    assert p.z_max <= enrich.PUNCH_Z_CAP
+    cp = re.cards[0]
+    center = 0.5 * (cp.t0 + cp.t1)
+    assert p.t0 <= center <= p.t1
+    assert p.cx == pytest.approx(0.5) and p.cy == pytest.approx(0.5)  # v1 центр
+
+
+def test_punch_density_one_per_30_60s():
+    # три карточки впритык (зазор < 30 c) -> только один зум (не подряд).
+    tl = Timeline([], duration=400)
+    cards = [card(f"c{i}", 120.0 + 12.0 * i,
+                  [("Раз", -1, 121.0 + 12.0 * i), ("Два", -1, 123.0 + 12.0 * i)],
+                  score=90 - i)
+             for i in range(3)]
+    plan, re = run(cards, tl)
+    assert len(re.cards) >= 2                            # карточки прошли
+    assert len(re.punches) == 1                          # но зум один (плотность)
+
+
+def test_punch_two_when_far_apart():
+    # две карточки на расстоянии > 30 c -> два зума.
+    tl = Timeline([], duration=400)
+    c1 = card("c1", 100.0, [("Раз", -1, 101.0), ("Два", -1, 103.0)], score=90)
+    c2 = card("c2", 200.0, [("Раз", -1, 201.0), ("Два", -1, 203.0)], score=85)
+    plan, re = run([c1, c2], tl)
+    assert len(re.punches) == 2
+    centers = [0.5 * (p.t0 + p.t1) for p in re.punches]
+    assert abs(centers[0] - centers[1]) >= enrich.PUNCH_MIN_GAP_S
+
+
+def test_punch_skips_clean_zones():
+    # карточка в самом начале (после чистой головы 30 c) — зум не залезает в
+    # первые 30 c. Карточка целиком в зоне 30..end-20.
+    tl = Timeline([], duration=400)
+    c = card("crd", 31.0, [("Раз", -1, 32.0), ("Два", -1, 34.0)], score=90)
+    plan, re = run([c], tl)
+    for p in re.punches:
+        assert p.t0 >= enrich.CLEAN_HEAD_S
+        assert p.t1 <= 400 - enrich.CLEAN_TAIL_S
+
+
+def test_punch_does_not_overlap_other_overlay(cta_dir):
+    # CTA-like рядом с карточкой: зум карточки центрируется в её окне, но не
+    # должен пересечь СОСЕДНЕЕ оверлейное окно (CTA -> anim). Своё окно-источник
+    # пересекать можно (PiP живёт поверх зума).
+    (cta_dir / "like.webm").write_bytes(b"\x1aE\xdf\xa3 fake")
+    tl = Timeline([], duration=400)
+    c = card("crd", 120.0, [("Раз", -1, 121.0), ("Два", -1, 123.0)], score=90)
+    cta = cta_like("l1", 130.0, score=80, dur=3.0)      # после карточки, в зазоре
+    plan, re = run([c, cta], tl)
+    assert re.anims and re.punches                       # оба приняты
+    for p in re.punches:
+        for other in re.anims:                          # CTA-like -> anim-окно
+            assert not (p.t0 < other.t1 and p.t1 > other.t0)
+
+
+def test_punch_empty_without_emphasis():
+    tl = Timeline([], duration=300)
+    plan, re = run([img("i1", 100.0, kind="none")], tl)   # image без ассета
+    assert re.punches == []
+
+
+def test_punch_clean_zones_scale_on_short_video():
+    """W6: короткий ролик (90 c) — оверлеи живут по МАСШТАБИРОВАННЫМ зонам
+    (15%/10% => 13.5/9 c), и punch-zoom обязан использовать ТЕ ЖЕ зоны: с
+    фиксированными 30/20 c зум молча не срабатывал никогда на контенте < 52 c
+    и почти никогда < 2 мин (fail-before: re.punches == [])."""
+    tl = Timeline([], duration=90)
+    c = card("crd", 20.0, [("Раз", -1, 21.0), ("Два", -1, 23.0)], score=90)
+    plan, re = run([c], tl)
+    assert len(re.cards) == 1              # карточка размещена (зоны 13.5/9)
+    assert len(re.punches) == 1            # и зум не съеден жёсткими 30/20
+    p = re.punches[0]
+    assert p.t0 >= min(enrich.CLEAN_HEAD_S,
+                       enrich.CLEAN_HEAD_FRAC * 90) - 1e-6
+    assert p.t1 <= 90 - min(enrich.CLEAN_TAIL_S,
+                            enrich.CLEAN_TAIL_FRAC * 90) + 1e-6

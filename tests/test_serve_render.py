@@ -79,7 +79,7 @@ def _patch_render(monkeypatch):
 
     def fake_render(ff, media, cl, cfg, out, work_dir, *, on_progress=None,
                     log=None, scale_h=None, fps=None, ass_path=None,
-                    crop_filter=None, edge_fade=0.0):
+                    crop_filter=None, edge_fade=0.0, **kw):
         calls.append({"cl": cl, "out": out, "ass_path": ass_path,
                       "crop_filter": crop_filter, "scale_h": scale_h,
                       "fps": fps, "edge_fade": edge_fade})
@@ -183,7 +183,7 @@ def test_metadata_without_key_keeps_prior_behavior(monkeypatch, tmp_path):
                                      _SILENT, _SILENT)
     assert len(meta_calls) == 1                  # дефолт конфига: метаданные идут
     assert res["metadata"] == "Т"
-    assert (out_dir / "metadata.txt").exists()
+    assert (out_dir / "fake.metadata.txt").exists()   # #62: stem-keyed sidecar
 
 
 # --- 4. burn ASS from the override cutlist + per-clip file name ----------------
@@ -283,3 +283,148 @@ def test_resolve_clips_censor_to_surviving_part_at_clip_boundary():
     assert any(c is c_inside for c in censors)
     # обрезанные сохраняют id родителя (один выживший кусок -> без суффикса)
     assert {c.id for c in censors} == {"c1", "c2", "c4"}
+
+
+# --- R1: subs/chapters/metadata built from the sliver-filtered effective cut ---
+def test_subs_built_from_effective_cutlist_no_drift(monkeypatch, tmp_path):
+    """Two cuts 30 ms apart leave a sub-min_segment kept sliver render() drops.
+    subs must be generated from the MERGED effective removed set (cue timing
+    then matches the video), not the raw two-interval set that drifts."""
+    s = _mk_session(tmp_path, duration=20.0, cuts=[
+        CutSegment(id="a", start=10.0, end=12.0, type=TYPE_MANUAL,
+                   action=ACTION_REMOVE, enabled=True),
+        CutSegment(id="b", start=12.03, end=15.0, type=TYPE_MANUAL,
+                   action=ACTION_REMOVE, enabled=True),
+    ])
+    _patch_render(monkeypatch)
+    seen: dict = {}
+    monkeypatch.setattr(
+        serve.subs_mod, "generate",
+        lambda tr, removed, *a, **k: seen.update(removed=list(removed))
+        or {"cues": 0})
+    opts = {"subtitles": True, "chapters": False, "metadata": False}
+    cfg, scale_h, fps, out_dir, base = serve._resolve_render_opts(s, opts)
+    res = serve._run_render_pipeline(s, cfg, scale_h, fps, out_dir, base,
+                                     _SILENT, _SILENT)
+    # merged effective set (30 ms sliver folded away), NOT [(10,12),(12.03,15)]
+    assert seen["removed"] == [(10.0, 15.0)]
+    # reported duration is the effective (post-sliver) one
+    assert res["new_duration"] == 15.0
+
+
+# --- R1 render-output-validate: ffprobe the mp4, fail on a gross shortfall -----
+def _stub_ff_probe(duration):
+    return SimpleNamespace(probe=lambda path: {"format": {"duration": duration}})
+
+
+def _patch_render_dur(monkeypatch, new_duration):
+    def fake_render(ff, media, cl, cfg, out, work_dir, **kw):
+        Path(out).write_bytes(b"x")          # a real file exists to be "probed"
+        return {"out": str(out), "encoder": "fake", "new_duration": new_duration}
+    monkeypatch.setattr(serve.render_mod, "render", fake_render)
+
+
+def test_truncated_output_raises(monkeypatch, tmp_path):
+    import pytest
+    s = _mk_session(tmp_path)
+    s.ff = _stub_ff_probe(5.0)               # mp4 decodes to only 5 s …
+    _patch_render_dur(monkeypatch, new_duration=20.0)   # … but 20 s expected
+    cfg, scale_h, fps, out_dir, base = serve._resolve_render_opts(
+        s, dict(_BASE_OPTS))
+    with pytest.raises(RuntimeError) as ei:
+        serve._run_render_pipeline(s, cfg, scale_h, fps, out_dir, base,
+                                   _SILENT, _SILENT)
+    msg = str(ei.value)
+    assert "5.0" in msg and "20.0" in msg
+
+
+def test_matching_output_ok_reports_probed(monkeypatch, tmp_path):
+    s = _mk_session(tmp_path)
+    s.ff = _stub_ff_probe(20.0)
+    _patch_render_dur(monkeypatch, new_duration=20.0)
+    cfg, scale_h, fps, out_dir, base = serve._resolve_render_opts(
+        s, dict(_BASE_OPTS))
+    res = serve._run_render_pipeline(s, cfg, scale_h, fps, out_dir, base,
+                                     _SILENT, _SILENT)
+    assert res["new_duration_probed"] == 20.0
+    assert res["succeeded"]["render"] is True
+
+
+def test_probe_failure_keeps_mp4(monkeypatch, tmp_path):
+    def boom(path):
+        raise RuntimeError("ffprobe blew up")
+    s = _mk_session(tmp_path)
+    s.ff = SimpleNamespace(probe=boom)
+    _patch_render_dur(monkeypatch, new_duration=20.0)
+    cfg, scale_h, fps, out_dir, base = serve._resolve_render_opts(
+        s, dict(_BASE_OPTS))
+    res = serve._run_render_pipeline(s, cfg, scale_h, fps, out_dir, base,
+                                     _SILENT, _SILENT)
+    assert res["new_duration_probed"] is None
+    assert res["mp4"] is not None
+
+
+# --- #50: burn karaoke default follows config.yaml when the key is absent ------
+def test_karaoke_absent_keeps_config_default(tmp_path):
+    """Без ключа karaoke в burn_style значение берётся из config.yaml (а не
+    форсится True), как у всех соседних полей burn_style."""
+    s = _mk_session(tmp_path)
+    s.cfg.subtitles.burn.karaoke = False
+    cfg, *_ = serve._resolve_render_opts(
+        s, {"burn_subtitles": True, "burn_style": {"font": "Arial"}})
+    assert cfg.subtitles.burn.karaoke is False
+
+
+def test_karaoke_explicit_true_overrides(tmp_path):
+    s = _mk_session(tmp_path)
+    s.cfg.subtitles.burn.karaoke = False
+    cfg, *_ = serve._resolve_render_opts(
+        s, {"burn_subtitles": True, "burn_style": {"karaoke": True}})
+    assert cfg.subtitles.burn.karaoke is True
+
+
+def test_karaoke_explicit_false_overrides(tmp_path):
+    s = _mk_session(tmp_path)
+    s.cfg.subtitles.burn.karaoke = True
+    cfg, *_ = serve._resolve_render_opts(
+        s, {"burn_subtitles": True, "burn_style": {"karaoke": False}})
+    assert cfg.subtitles.burn.karaoke is False
+
+
+# --- #36-restore: render mirrors chapters/metadata into the preview cache ------
+# Integration bug caught in the live E2E: #62 stem-keyed the render sidecars to
+# out/<stem>.chapters.txt, but GET /api/chapters+/api/metadata (the reload
+# restore, #35/#36) read work_dir/preview_*. After a render + reload the tabs
+# came back EMPTY. The pipeline now mirrors both into the preview cache.
+def test_render_mirrors_chapters_and_metadata_to_preview_cache(monkeypatch,
+                                                               tmp_path):
+    s = _mk_session(tmp_path)
+    s.llm = object()                      # enables the metadata branch
+    _patch_render(monkeypatch)
+
+    def fake_chapters(tr, removed, cfg, out_path, **kw):
+        Path(out_path).write_text("00:00 Интро\n00:10 Тема\n", encoding="utf-8")
+        return {"path": str(out_path), "chapters": 2}
+
+    def fake_metadata(tr, removed, cfg, llm, **kw):
+        return {"title": "Заголовок", "hook": "Хук",
+                "description": "Описание", "tags": ["a", "b"]}
+
+    monkeypatch.setattr(serve.chapters_mod, "generate", fake_chapters)
+    monkeypatch.setattr(serve.metadata_mod, "generate", fake_metadata)
+
+    cfg, scale_h, fps, out_dir, base = serve._resolve_render_opts(
+        s, {"subtitles": False, "chapters": True, "metadata": True})
+    res = serve._run_render_pipeline(s, cfg, scale_h, fps, out_dir, base,
+                                     _SILENT, _SILENT)
+    assert res["succeeded"]["chapters"] and res["succeeded"]["metadata"]
+    # render sidecars (stem-keyed, #62)
+    assert (out_dir / "fake.chapters.txt").exists()
+    assert (out_dir / "fake.metadata.txt").exists()
+    # preview cache mirrored — the reload-restore source (#35/#36)
+    pc = s.work_dir / "preview_chapters.txt"
+    pm = s.work_dir / "preview_metadata.json"
+    assert pc.exists() and "Интро" in pc.read_text(encoding="utf-8")
+    assert pm.exists()
+    data = json.loads(pm.read_text(encoding="utf-8"))
+    assert data["title"] == "Заголовок" and data["tags"] == ["a", "b"]

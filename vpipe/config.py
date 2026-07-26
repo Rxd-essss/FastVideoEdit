@@ -17,11 +17,31 @@ class PathsCfg(_Base):
     out_dir: str = "./out"
     cache_dir: str = "./cache"
     work_dir: str = "./work"
+    # Startup LRU sweep of the IMAGE caches only (enrich_img/codegfx). 0 =
+    # disabled (default; unbounded, as today). >0 deletes PNGs older than N
+    # days by mtime. Never touches transcript/peaks (correctness caches) or
+    # active work dirs. (#96, verdict unverified — validate growth before
+    # picking a non-zero default.)
+    cache_img_max_age_days: int = 0
 
 
 class FfmpegCfg(_Base):
     ffmpeg_bin: str = "ffmpeg"
     ffprobe_bin: str = "ffprobe"
+    # No-progress watchdog window (seconds). If a render emits nothing on either
+    # ffmpeg pipe for this long it is presumed hung (NVENC/TDR lockup, dropped
+    # network-drive input, starved filtergraph) and terminated so the worker
+    # thread and every mutating endpoint stop waiting forever. Deliberately
+    # generous — a healthy encode ticks progress sub-second, so this never trips
+    # a real render. 0 disables the watchdog (legacy: run until ffmpeg exits).
+    stall_timeout: float = 180.0
+    # No-progress watchdog window (seconds). If a render emits nothing on either
+    # ffmpeg pipe for this long it is presumed hung (NVENC/TDR lockup, dropped
+    # network-drive input, starved filtergraph) and terminated so the worker
+    # thread and every mutating endpoint stop waiting forever. Deliberately
+    # generous — a healthy encode ticks progress sub-second, so this never trips
+    # a real render. 0 disables the watchdog (legacy: run until ffmpeg exits).
+    stall_timeout: float = 180.0
 
 
 class TranscribeCfg(_Base):
@@ -34,6 +54,10 @@ class TranscribeCfg(_Base):
     vad_min_silence_ms: int = 500
     fallback_models: list[str] = Field(default_factory=lambda: ["medium", "small"])
     cache: bool = True
+    # держать модель Whisper в VRAM между заданиями очереди (эконом на N клипов);
+    # по умолчанию ВЫКЛ — на 8ГБ карте она конфликтует с qwen3 detect/SD. Требует
+    # явной выгрузки перед LLM/рендером (transcribe.release_whisper_cache()).
+    cache_model: bool = False
 
 
 class PausesCfg(_Base):
@@ -254,6 +278,102 @@ class MusicCfg(_Base):
     release: float = 400.0        # ms — how fast it comes back in pauses
 
 
+class EnrichRenderCfg(_Base):
+    """Авто-обогащение при рендере (ENRICH_PLAN §5, render.enrich).
+
+    Контракт как у music: без явного ``opts.enrich`` в /api/render обогащение
+    ВЫКЛЮЧЕНО («нет ключа = выключено») — serve.py выставляет ``enabled`` из
+    запроса на deep copy конфига. Клипы Clip Maker и автопак-клипы
+    (cutlist_override-путь) обогащение не получают никогда (анти-скоуп §9).
+
+    ``min_score`` — порог отсечки предложений ПОВЕРХ пер-предложенческого
+    ``enabled``: Авто-пак шлёт 70 (консервативное применение без ревью-вкладки),
+    обычный рендер живёт с 0 («берём всё, что включил юзер»).
+    """
+    enabled: bool = False
+    min_score: int = 0                # 0..100; 0 = без отсечки по score
+
+
+class ImageGenCfg(_Base):
+    """Локальная SD-генерация контекстных картинок для авто-обогащения
+    (PLAN_V11 §2, render.enrich.imagegen).
+
+    Бэкенд — внешний бинарь stable-diffusion.cpp CUDA (паттерн
+    ``denoise.deepfilter_bin``: ``sd-cli.exe`` + DLL рядом), модель SDXL-Turbo
+    Q4_0 GGUF (~3.94 ГБ) скачивает ПОЛЬЗОВАТЕЛЬ — в репо не кладём. Полностью
+    оффлайн (zero-upload), torch НЕ нужен.
+
+    Дефолт ``imagegen_enabled=False`` — честный opt-in (тяжёлая модель). Если
+    выключено / бинарь / модель не найдены → graceful degrade на эмодзи-фолбэк,
+    задача НЕ падает (как ``engine="deepfilter"`` при отсутствии бинаря).
+
+    ``imagegen_model`` — путь к .gguf, ОБЯЗАТЕЛЕН для работы (пусто = SD не
+    настроен). ``imagegen_size`` — сторона кадра (768 — дефолт, VRAM-пик ~5.3 ГБ
+    < 8 ГБ; 1024 только при выделенном GPU). ``imagegen_steps`` — шаги сэмплера
+    (4 для Turbo). ``imagegen_vae_on_cpu`` — аварийный путь при дефиците VRAM
+    (GPU-пик 2.7 ГБ, но ~10× медленнее) — НЕ дефолт."""
+    imagegen_enabled: bool = False
+    imagegen_bin: str = "tools/sd-cli.exe"   # abs / repo-root-rel / PATH
+    imagegen_model: str = ""                 # путь к .gguf (обязателен для работы)
+    imagegen_size: int = 768                 # сторона кадра, px
+    imagegen_steps: int = 4                  # шаги сэмплера (Turbo = 4)
+    imagegen_vae_on_cpu: bool = False        # аварийный VRAM-путь (медленно)
+    # «Монтаж V2» §5 (диффузия СТРОГО для фото-сцен): арт-дирекшн-промпт + эти
+    # числа лечат слоп (доказано A/B 07a vs 07b). Дефолты — рекомендация §5;
+    # фактический промпт/суффикс/маршрут правит backend-агент (imagegen.py),
+    # config лишь держит числа (политика репо «числа в коде, не в промпте»).
+    imagegen_cfg: float = 1.5                 # cfg-scale (Turbo крепче держит на 1.5)
+    imagegen_candidates: int = 4             # N сидов на момент (-b 4 -s -1) → выбор
+    imagegen_vae: str = ""                   # путь к sdxl_vae_fp16fix.safetensors (--vae); ""=без
+    imagegen_max_vram: float = -1.0          # ГиБ-бюджет VRAM для sd-cli graph-split; <0=авто-детект свободной, 0=выкл
+
+
+class CodegfxCfg(_Base):
+    """Код-графика «Монтаж V2» (MONTAGE_V2_PLAN §2, render.codegfx).
+
+    Движок схем/инфографики: речь → точная карточка с РЕАЛЬНЫМ текстом/числами
+    через системный headless-Chrome (HTML→PNG с альфой). CPU-only, 0 VRAM,
+    zero-upload (всё локально). Контракт функции рендера зафиксирован в
+    ``vpipe/enrich.py`` (см. «КОНТРАКТ КОД-ГРАФИКИ»); реализацию кладёт
+    codegfx-агент в ``vpipe/codegfx/`` (новая папка) — config лишь несёт
+    настройки.
+
+    ``codegfx_enabled`` — дефолт True: код-графика дешёвая (CPU, мгновенно) и
+    есть рабочий движок; при отсутствии Chrome рендер честно деградирует
+    (render_schematic → None, кадр дропается, задача НЕ падает). ``codegfx_chrome``
+    пусто = автопоиск (системный Chrome→Edge→Playwright-фолбэк; НЕ хардкодить
+    путь — §10). ``codegfx_style`` — канальный дефолт-тема (одна из 4).
+    ``codegfx_size`` — канвас «WxH» (1920x1080 — доказанный прототип)."""
+    codegfx_enabled: bool = True
+    codegfx_chrome: str = ""               # "" = автопоиск (Chrome→Edge→Playwright)
+    codegfx_style: str = "minimal"         # minimal | neon | business | whiteboard
+    codegfx_size: str = "1920x1080"        # канвас рендера, «WxH»
+
+
+class VisionRouteCfg(_Base):
+    """Vision-роутер монтажа («variant C»): локальная VLM СМОТРИТ реальные кадры
+    момента и ветит/переназначает предложенный текстовым планировщиком визуал —
+    убивает «слоп» (схема поверх говорящей головы ИЛИ поверх уже-визуального
+    экрана: скринкаст/вайтборд/код). Своя VRAM-фаза (после текстовых детекторов,
+    до SD) — на 8 ГБ модели идут строго последовательно.
+
+    Opt-in: ``enabled`` дефолт ВЫКЛ — стадия меняет решения монтажа, поэтому не
+    включается без явного согласия («главное — ничего не сломать»). Недоступная
+    Ollama / нескачанная модель → стадия честно пропускается (монтаж не падает).
+    ``model`` — qwen3-vl:4b-instruct (Q4 ~3.3 ГБ, влезает в 8 ГБ с запасом; есть
+    2b дешевле и 8b качественнее). ``frames`` — сколько кадров момента показать
+    (t-1c / t+0.5c / t+2c). ``reroute`` — не только вето, но и смена kind среди
+    УЖЕ найденных планировщиком кандидатов (никогда не выдумывает ассет).
+    ``min_confidence`` — порог доверия вердикту (0 = доверять всем)."""
+    enabled: bool = False
+    model: str = "qwen3-vl:4b-instruct"
+    frames: int = 3                        # кадров на момент (1..5)
+    frame_size: int = 512                  # длинная сторона кадра, px (меньше = быстрее)
+    reroute: bool = True                   # вето + смена kind (False = только вето)
+    min_confidence: int = 0                # 0..100; вердикт ниже — игнорируем
+    timeout_s: int = 90                    # на один вердикт (cold-load первого ~45с)
+
+
 class RenderCfg(_Base):
     encoder: str = "nvenc"
     nvenc: NvencCfg = Field(default_factory=NvencCfg)
@@ -263,6 +383,10 @@ class RenderCfg(_Base):
     vertical: VerticalCfg = Field(default_factory=VerticalCfg)
     denoise: DenoiseCfg = Field(default_factory=DenoiseCfg)
     music: MusicCfg = Field(default_factory=MusicCfg)
+    enrich: EnrichRenderCfg = Field(default_factory=EnrichRenderCfg)
+    imagegen: ImageGenCfg = Field(default_factory=ImageGenCfg)
+    codegfx: CodegfxCfg = Field(default_factory=CodegfxCfg)
+    vision_route: VisionRouteCfg = Field(default_factory=VisionRouteCfg)
     # Smoothing at every cut seam. Without it the kept audio segments are
     # hard-concatenated and each join is a waveform discontinuity → an audible
     # click and an overall "choppy" feel. A short equal-length fade-out/fade-in
@@ -277,6 +401,13 @@ class RenderCfg(_Base):
     # shortest real speech token (~60-80 ms) so it only removes breath/VAD-edge
     # remnants, never a word. 0 keeps the old behaviour (drop only sub-frame).
     min_segment: float = 0.04
+    # Snap every kept-segment boundary to the source frame grid (round(t*fps)/fps)
+    # BEFORE building the ffmpeg trim graph AND the subtitle/chapter timelines, so
+    # the video (whole-frame trims) and audio (sample-exact atrim) share ONE
+    # quantised timeline -- concat pads no silence at the seams and burned subs /
+    # overlays / chapters never drift on long files. True = correct (default);
+    # False restores the byte-exact legacy (unsnapped) cut offsets.
+    frame_snap: bool = True
 
 
 class AssStyleCfg(_Base):
@@ -297,6 +428,10 @@ class AssStyleCfg(_Base):
     shadow: float = 1.0
     position: str = "bottom"           # "bottom" | "top" | "center"
     karaoke: bool = True
+    # Kinetic keyword "pop": the spoken keyword swells to 120% + flashes an accent
+    # colour. OFF by default — it reads as amateur ("колхоз") on most content;
+    # opt in per preset/render for a punchy TikTok look.
+    kinetic: bool = False
     margin_v: int = 40                 # vertical margin in PlayRes pixels
 
 

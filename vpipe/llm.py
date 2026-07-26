@@ -77,8 +77,41 @@ class OllamaClient:
         names = [m.get("name", "") for m in tags.get("models", [])]
         return [n for n in names if n]
 
+    def unload(self, model: Optional[str] = None) -> bool:
+        """Принудительно выгрузить модель из VRAM (POST /api/generate с
+        ``keep_alive=0`` и пустым промптом — официальный приём Ollama).
+
+        VRAM-менеджер ТРЕК-2 (§2): детекторы качают qwen3 в VRAM; перед SD-этапом
+        её надо освободить (8 ГБ карта не вместит и LLM, и SDXL). Зовётся в
+        задаче обогащения ПОСЛЕ детекторов, ПЕРЕД генерацией картинок; вызывающий
+        затем ждёт пустого ``GET /api/ps``. НИКОГДА не бросает — недоступная
+        Ollama / таймаут просто вернут False (генерация всё равно попробует
+        стартовать; --max-vram у sd-cli подстрахует). Возврат — True при успешном
+        ответе сервера."""
+        payload = {"model": model or self.cfg.model, "keep_alive": 0,
+                   "prompt": "", "stream": False}
+        try:
+            self._post("/api/generate", payload)
+            return True
+        except Exception:  # noqa: BLE001 — Ollama off / таймаут: выгрузка best-effort
+            return False
+
+    def loaded_models(self) -> list[str]:
+        """Имена моделей, СЕЙЧАС держащих VRAM (``GET /api/ps`` -> models[].name).
+
+        VRAM-менеджер (§2) опрашивает этот список после ``unload`` — пустой =
+        путь к SD свободен. Сеть/Ollama off -> ``[]`` (как «ничего не загружено»),
+        никогда не бросает."""
+        try:
+            data = self._get("/api/ps")
+        except Exception:  # noqa: BLE001 — Ollama off / unreachable
+            return []
+        return [m.get("name", "") for m in data.get("models", [])
+                if m.get("name")]
+
     def _build_payload(self, system: str, user: str, schema: dict,
-                       temperature: float, keep_alive=None) -> dict:
+                       temperature: float, keep_alive=None,
+                       images: Optional[list] = None) -> dict:
         # qwen3 (and other reasoning models) otherwise emit a <think>...</think>
         # block that consumes the whole context/output budget on structured
         # calls. Disable it both ways: the top-level "think" flag (newer Ollama)
@@ -87,10 +120,14 @@ class OllamaClient:
             sys_prompt = system
         else:
             sys_prompt = system.rstrip() + " /no_think"
+        # Vision models take base64 frames in the user message's ``images`` array
+        # (Ollama /api/chat). Absent -> a plain text call, unchanged.
+        user_msg = {"role": "user", "content": user}
+        if images:
+            user_msg["images"] = list(images)
         payload = {
             "model": self.cfg.model,
-            "messages": [{"role": "system", "content": sys_prompt},
-                         {"role": "user", "content": user}],
+            "messages": [{"role": "system", "content": sys_prompt}, user_msg],
             "stream": False,
             "format": schema,
             "think": bool(getattr(self.cfg, "think", False)),
@@ -153,20 +190,22 @@ class OllamaClient:
             # this opener didn't yield a parseable object — try the next "{"
             search_from = start + 1
 
-    def chat_json(self, system: str, user: str, schema: dict, keep_alive=None) -> dict:
+    def chat_json(self, system: str, user: str, schema: dict, keep_alive=None,
+                  images: Optional[list] = None) -> dict:
         """One-shot chat that must return JSON validating against ``schema``.
 
         Retries once (at temperature 0) on a parse miss, and tries to salvage a
         balanced ``{...}`` substring before giving up. Transport failures raise
         ``LLMUnavailable`` so callers can fall back gracefully. ``keep_alive``
         overrides the config default for this call (e.g. keep the model warm
-        between chapter windows, then unload on the last one).
+        between chapter windows, then unload on the last one). ``images`` (list
+        of base64 strings) turns this into a vision call for a VLM model.
         """
         last_content = ""
         for attempt in range(2):
             temperature = self.cfg.temperature if attempt == 0 else 0.0
             payload = self._build_payload(system, user, schema, temperature,
-                                          keep_alive=keep_alive)
+                                          keep_alive=keep_alive, images=images)
             try:
                 resp = self._post("/api/chat", payload)
             except (urllib.error.URLError, TimeoutError, OSError) as e:

@@ -75,3 +75,48 @@ def test_profanity_roots_and_allow():
     assert len(out) == 1
     assert out[0].action == "censor"
     assert out[0].word == "блядь"
+
+
+# --- #83: badtakes keeps qwen3 warm between windows ---------------------------
+class _RecLLM:
+    """Records keep_alive per chat_json call; returns no removals (mock — no
+    real Ollama, plan F1)."""
+
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    def chat_json(self, system, user, schema, keep_alive=None):
+        self.calls.append({"keep_alive": keep_alive})
+        return {"removals": []}
+
+
+def _badtakes_transcript(n):
+    from vpipe.models import Segment, Transcript
+    segs = [Segment(i * 1.0, i * 1.0 + 0.9, f"текст {i}") for i in range(n)]
+    return Transcript(language="ru", duration=float(n), model="t",
+                      audio_hash="h", segments=segs)
+
+
+def test_badtakes_keeps_model_warm_between_windows():
+    from vpipe.config import Config
+    from vpipe.detect import badtakes
+    cfg = Config()
+    cfg.llm.max_segments_per_call = 10
+    cfg.llm.segment_overlap = 0            # 16 segs -> exactly 2 windows
+    llm = _RecLLM()
+    badtakes.detect(_badtakes_transcript(16), cfg, llm, log=lambda *_: None)
+    assert len(llm.calls) >= 2
+    # warm (60s) between windows, unload (0) only on the last (chapters pattern)
+    assert llm.calls[0]["keep_alive"] == 60
+    assert llm.calls[-1]["keep_alive"] == 0
+
+
+def test_badtakes_single_window_unloads():
+    from vpipe.config import Config
+    from vpipe.detect import badtakes
+    cfg = Config()
+    cfg.llm.max_segments_per_call = 80     # 3 segs -> one window
+    llm = _RecLLM()
+    badtakes.detect(_badtakes_transcript(3), cfg, llm, log=lambda *_: None)
+    assert len(llm.calls) == 1
+    assert llm.calls[0]["keep_alive"] == 0   # lone window frees VRAM (== today)

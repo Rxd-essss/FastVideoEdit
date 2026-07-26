@@ -31,7 +31,7 @@ except ModuleNotFoundError:
     raise SystemExit(1)
 
 from vpipe.config import (load_config, load_fillers, load_profanity)
-from vpipe.cutlist import resolve, save_txt
+from vpipe.cutlist import save_txt
 from vpipe.detect import run_detection
 from vpipe.detect.profanity import ProfanityMatcher
 from vpipe.ffmpeg_utils import FFmpeg, FFmpegError
@@ -195,7 +195,11 @@ def main() -> int:
             return 0
         print(f"  using edited cut list: {cutlist_path.name} ({n_en} enabled)")
 
-    removed, _ = resolve(cutlist)
+    # R1 (W6 #7): сабы/главы/итог строятся от ЭФФЕКТИВНОГО катлиста (frame-snap
+    # + сливер-фильтр) — ровно того, что реально исполняет render() (serve
+    # делает так же). Сырой resolve() расходился с готовым видео: каждая
+    # граница снапится к сетке кадров, дрейф копится по длине ролика.
+    _, removed = render_mod.effective_cut(cutlist, media, cfg)
     tl = Timeline(removed, media.duration)
 
     # --- Stage 6: render -----------------------------------------------------

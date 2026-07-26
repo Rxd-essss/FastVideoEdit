@@ -7,7 +7,9 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -16,6 +18,40 @@ from .config import FfmpegCfg
 
 class FFmpegError(RuntimeError):
     pass
+
+
+# A many-cut / censor-dense -filter_complex overflows the Windows 32767-char
+# CreateProcess limit (~196 chars per kept segment). Any graph longer than this
+# is written to a temp file and passed via -filter_complex_script so it never
+# touches the command line. Small graphs pass through byte-for-byte unchanged so
+# short renders keep their exact argv (and every FakeFF test still sees an inline
+# -filter_complex). Keep this ABOVE the largest single-statement graph the
+# enrich/music fast-paths build, or those would start spilling too (harmless but
+# would change their argv).
+_FILTERGRAPH_INLINE_MAX = 8000
+
+
+def _spill_filtergraph(cmd: "list[str]") -> "tuple[list[str], Optional[str]]":
+    """If cmd carries an oversized inline -filter_complex, spill it to a temp
+    file and swap in -filter_complex_script. Returns (new_cmd, temp_path|None).
+
+    Only the local command is rewritten; the caller's ``args`` list is never
+    touched, so the FFmpegError diagnostic and FakeFF tests still read the
+    inline graph from ``args``.
+    """
+    try:
+        i = cmd.index("-filter_complex")
+    except ValueError:
+        return cmd, None
+    graph = cmd[i + 1] if i + 1 < len(cmd) else ""
+    if len(graph) <= _FILTERGRAPH_INLINE_MAX:
+        return cmd, None
+    fd, path = tempfile.mkstemp(suffix=".ffscript", prefix="fve_fc_")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(graph)
+    out = list(cmd)
+    out[i:i + 2] = ["-filter_complex_script", path]
+    return out, path
 
 
 # --- running-process registry -----------------------------------------------
@@ -92,6 +128,12 @@ class FFmpeg:
         self.ffmpeg = resolve_bin(cfg.ffmpeg_bin, "ffmpeg")
         self.ffprobe = resolve_bin(cfg.ffprobe_bin, "ffprobe")
         self._caps: dict[str, set[str]] = {}
+        # Seconds of total silence on both ffmpeg pipes before the no-progress
+        # watchdog kills a presumed-hung render (see _run_proc). 0 disables it.
+        self.stall_timeout = float(getattr(cfg, "stall_timeout", 180.0) or 0.0)
+        # Seconds of total silence on both ffmpeg pipes before the no-progress
+        # watchdog kills a presumed-hung render (see _run_proc). 0 disables it.
+        self.stall_timeout = float(getattr(cfg, "stall_timeout", 180.0) or 0.0)
 
     # --- capability probing --------------------------------------------------
     def _list(self, kind: str) -> set[str]:
@@ -146,9 +188,57 @@ class FFmpeg:
         """
         cmd = [self.ffmpeg, "-hide_banner", "-nostdin", "-y",
                "-progress", "pipe:1", "-nostats", *args]
+        # Spill an oversized -filter_complex to a temp file (Windows 32k argv
+        # limit). No-op for normal graphs; the temp file is removed in the outer
+        # finally below even on error/cancel.
+        cmd, _fc_script = _spill_filtergraph(cmd)
+        try:
+            return self._run_proc(cmd, args, total, on_progress, desc)
+        finally:
+            if _fc_script:
+                try:
+                    os.remove(_fc_script)
+                except OSError:
+                    pass
+
+    def _run_proc(self, cmd: list[str], args: list[str], total: Optional[float],
+                  on_progress: Optional[Callable[[float], None]], desc: str) -> str:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, encoding="utf-8", errors="replace", bufsize=1)
         _register_proc(proc)
+
+        # No-progress watchdog: if ffmpeg goes silent on BOTH pipes for
+        # ``stall_timeout`` seconds it is presumed hung (an NVENC/TDR lockup, a
+        # dropped network-drive input, a starved filtergraph) and terminated, so
+        # the worker thread — and with it every mutating endpoint _guard_no_task
+        # would 409 — stops waiting forever. Armed only when a positive window
+        # AND a known ``total`` are set, so capability probes (-encoders/-filters)
+        # and any zero-total call are never watched. ANY line on either pipe
+        # resets the timer (progress OR stderr, so a caller that passes ``total``
+        # without ``on_progress`` — e.g. the loudnorm measure pass — is not
+        # false-killed), and a healthy encode ticks sub-second, so the generous
+        # default never trips a real render.
+        last_progress = [time.monotonic()]
+        stalled = [False]
+        # W6 #9: progress=end -> энкод ЗАВЕРШЁН. Дальше ffmpeg может минутами
+        # МОЛЧА двигать moov-атом (faststart, вторая проходка) при тишине на
+        # обоих пайпах — сторож обязан сняться, иначе готовый многочасовой
+        # рендер убивается на ~100% и _run_atomic удаляет .part.
+        finished = [False]
+        win = getattr(self, "stall_timeout", 0.0) or 0.0
+
+        def _watchdog() -> None:
+            while proc.poll() is None:
+                if finished[0]:
+                    return              # здоровая тихая фаза после progress=end
+                if time.monotonic() - last_progress[0] > win:
+                    stalled[0] = True
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                    return
+                time.sleep(min(2.0, win / 2.0))
 
         # Keep the first ~20 lines (config/setup errors land here) AND the last
         # ~40 lines (the actual failure) so diagnostics are not truncated to one
@@ -159,6 +249,7 @@ class FFmpeg:
         def drain_stderr() -> None:
             assert proc.stderr is not None
             for line in proc.stderr:
+                last_progress[0] = time.monotonic()
                 if len(stderr_head) < 20:
                     stderr_head.append(line)
                 stderr_tail.append(line)
@@ -168,9 +259,13 @@ class FFmpeg:
         t = threading.Thread(target=drain_stderr, daemon=True)
         t.start()
 
+        if win > 0 and total:
+            threading.Thread(target=_watchdog, daemon=True).start()
+
         try:
             assert proc.stdout is not None
             for line in proc.stdout:
+                last_progress[0] = time.monotonic()
                 line = line.strip()
                 if line.startswith("out_time_us=") and total and on_progress:
                     try:
@@ -178,12 +273,22 @@ class FFmpeg:
                         on_progress(min(1.0, max(0.0, (us / 1e6) / total)))
                     except (ValueError, ZeroDivisionError):
                         pass
-                elif line == "progress=end" and on_progress:
-                    on_progress(1.0)
+                elif line == "progress=end":
+                    finished[0] = True  # W6 #9: снять сторожа (moov-трейлер)
+                    if on_progress:
+                        on_progress(1.0)
             proc.wait()
             t.join(timeout=1.0)
         finally:
             _unregister_proc(proc)
+
+        # A watchdog kill terminates the process, so proc.returncode is non-zero;
+        # surface the stall as its own clear error BEFORE the generic exit-code
+        # dump below, which would otherwise mask it with a truncated stderr tail.
+        if stalled[0]:
+            raise FFmpegError(
+                f"{desc}: нет прогресса дольше {int(win)} c — процесс остановлен "
+                f"(возможно, зависание кодировщика или потерян вход).")
 
         if proc.returncode != 0:
             head = "".join(stderr_head).strip()
@@ -198,6 +303,16 @@ class FFmpeg:
             if "-filter_complex" in args:
                 try:
                     graph = args[args.index("-filter_complex") + 1]
+                    # Cap the reconstructed graph: a long many-cut render has an
+                    # ~18-30KB graph that would otherwise BECOME task['error'],
+                    # flood the SSE payload and push the real ffmpeg line (kept
+                    # FIRST in `detail`) off the auto-dismissing toast. A
+                    # head+tail excerpt keeps it diagnosable; the full graph is
+                    # also on disk as the spilled .ffscript during the run.
+                    if len(graph) > 1200:
+                        graph = (graph[:600]
+                                 + f"\n… [{len(graph) - 1200} chars omitted] …\n"
+                                 + graph[-600:])
                     parts.append(f"\nfilter_complex graph:\n{graph}")
                 except (IndexError, ValueError):
                     pass

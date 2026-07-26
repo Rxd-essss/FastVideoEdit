@@ -20,11 +20,39 @@ class MediaInfo:
     acodec: str
     has_audio: bool
     sample_rate: int
+    color_trc: str = ""
+    color_primaries: str = ""
+    pix_fmt: str = ""
 
     def describe(self) -> str:
         return (f"{self.width}x{self.height} @ {self.fps:.3f} fps, "
                 f"{self.duration:.1f}s, v={self.vcodec}, "
                 f"a={self.acodec or 'none'}@{self.sample_rate or 0}Hz")
+
+
+def _stream_rotation(v: dict) -> int:
+    """Net display rotation in degrees (0/90/180/270).
+
+    Reads the Display Matrix side-data (ffprobe reports a signed ``rotation``,
+    e.g. -90 for a clockwise-90 display) and falls back to the legacy stream
+    ``tags.rotate``. Returns a normalized non-negative multiple of 90 so callers
+    only need to test the axis-swapping values 90 and 270 -- the sign is
+    irrelevant to a width/height swap.
+    """
+    rot = 0.0
+    for sd in (v.get("side_data_list") or []):
+        if "rotation" in sd:
+            try:
+                rot = float(sd.get("rotation") or 0.0)
+            except (TypeError, ValueError):
+                rot = 0.0
+            break
+    else:
+        try:
+            rot = float((v.get("tags", {}) or {}).get("rotate", 0) or 0)
+        except (TypeError, ValueError):
+            rot = 0.0
+    return int(round(rot)) % 360
 
 
 def probe_media(ff: FFmpeg, path: str | Path) -> MediaInfo:
@@ -38,16 +66,45 @@ def probe_media(ff: FFmpeg, path: str | Path) -> MediaInfo:
     if duration <= 0 and v and v.get("duration"):
         duration = float(v["duration"])
 
+    # Container format.duration is the MAX of all streams, so a track that ends
+    # early (OBS audio outliving video, damaged/cover-art recordings) is
+    # invisible and a kept segment past its EOF makes concat silently
+    # truncate/desync. Clamp to the SHORTEST real stream so every downstream
+    # trim/atrim stays in-bounds -- but ONLY when BOTH streams are present AND
+    # BOTH report a positive duration (many containers omit per-stream
+    # duration), and ONLY when the gap exceeds ~1 frame so frame-quantization
+    # noise never shifts the value.
+    v_dur = float(v.get("duration", 0.0) or 0.0) if v else 0.0
+    a_dur = float(a.get("duration", 0.0) or 0.0) if a else 0.0
+    if v is not None and a is not None and v_dur > 0.0 and a_dur > 0.0:
+        shortest = min(v_dur, a_dur)
+        if duration - shortest > 0.05:
+            duration = shortest
+
+    # ffprobe reports PRE-rotation coded width/height while ffmpeg autorotates
+    # every decoded frame at ingest. A phone/portrait clip tagged +/-90/270
+    # (Display Matrix side-data or legacy tags.rotate) therefore probes as
+    # landscape though every frame in the filtergraph is portrait. Swap to the
+    # DISPLAY dims so PlayRes, punch-zoom, blur-backplate, aspect dup-skip and
+    # the enrich planner all see what actually renders. 0/180 keep the axes.
+    width = int(v.get("width", 0)) if v else 0
+    height = int(v.get("height", 0)) if v else 0
+    if v is not None and _stream_rotation(v) in (90, 270):
+        width, height = height, width
+
     return MediaInfo(
         path=str(path),
         duration=duration,
         fps=parse_fps(v.get("avg_frame_rate") or v.get("r_frame_rate") or "0/0") if v else 0.0,
-        width=int(v.get("width", 0)) if v else 0,
-        height=int(v.get("height", 0)) if v else 0,
+        width=width,
+        height=height,
         vcodec=v.get("codec_name", "") if v else "",
         acodec=a.get("codec_name", "") if a else "",
         has_audio=a is not None,
         sample_rate=int(a.get("sample_rate", 0)) if a else 0,
+        color_trc=v.get("color_transfer", "") if v else "",
+        color_primaries=v.get("color_primaries", "") if v else "",
+        pix_fmt=v.get("pix_fmt", "") if v else "",
     )
 
 
@@ -90,7 +147,12 @@ def extract_audio(ff: FFmpeg, src: str | Path, out_wav: str | Path,
     """Extract 16 kHz mono PCM WAV (what faster-whisper wants)."""
     out_wav = str(out_wav)
     Path(out_wav).parent.mkdir(parents=True, exist_ok=True)
-    ff.run(["-i", str(src), "-vn", "-ac", "1", "-ar", "16000",
+    # FVE uses the FIRST audio track everywhere (extract/censor/render): a
+    # multi-track OBS source (mic + desktop) otherwise lets ffmpeg's default
+    # stream selection pick the MOST-channels track for Whisper while render
+    # keeps [0:a] — the analyzed audio would not be the rendered one. `0:a:0?`
+    # = first audio stream; `?` non-fatal so video-only sources still work.
+    ff.run(["-i", str(src), "-map", "0:a:0?", "-vn", "-ac", "1", "-ar", "16000",
             "-c:a", "pcm_s16le", out_wav],
            total=total, on_progress=on_progress, desc="audio extraction")
     return out_wav

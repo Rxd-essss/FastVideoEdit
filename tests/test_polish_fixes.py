@@ -11,6 +11,7 @@ Covers the parts that don't need ffmpeg/whisper/GPU:
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -138,6 +139,52 @@ def test_output_rejects_non_whitelisted_extension(client, cfg):
     (out / "secrets.env").write_text("TOKEN=abc")
     # Even though the file exists in the out dir, a non-artifact ext -> 404.
     assert client.get("/api/output/secrets.env").status_code == 404
+
+
+# --- MONTAGE_V2 §3: honest previews — cache PNGs must be servable -------------
+def test_output_serves_codegfx_preview(client, cfg):
+    """Code-graphic candidate PNG lives in cache/codegfx — the UI requests it as
+    /api/output/<basename>; it must resolve (not 404), else the «Монтаж» card
+    shows a broken tile instead of the real rendered schematic."""
+    cg = Path(cfg.paths.cache_dir) / "codegfx"
+    cg.mkdir(parents=True, exist_ok=True)
+    (cg / "abc123.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    r = client.get("/api/output/abc123.png")
+    assert r.status_code == 200
+    assert r.content.startswith(b"\x89PNG")
+
+
+def test_output_serves_diffusion_preview(client, cfg):
+    """Diffusion candidate PNG lives in cache/enrich_img — same contract."""
+    eg = Path(cfg.paths.cache_dir) / "enrich_img"
+    eg.mkdir(parents=True, exist_ok=True)
+    (eg / "deadbeef.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    assert client.get("/api/output/deadbeef.png").status_code == 200
+
+
+def test_output_image_ext_now_whitelisted(client, cfg):
+    """Image extensions are part of the whitelist (regression for the V2 fix:
+    previously .png was rejected before the cache lookup even ran)."""
+    for ext in (".png", ".jpg", ".jpeg", ".webp"):
+        assert ext in serve.OUTPUT_EXT_ALLOWED
+
+
+def test_output_preview_no_path_traversal(client, cfg, monkeypatch):
+    """The relative-path guard still confines reads to the cache subdirs even
+    after adding them as roots — a basename can never escape upward."""
+    # A real .png sitting one level above the cache root must NOT be reachable.
+    secret = Path(cfg.paths.cache_dir).parent / "outside.png"
+    secret.parent.mkdir(parents=True, exist_ok=True)
+    secret.write_bytes(b"\x89PNG\r\n\x1a\n")
+    # FastAPI's path param won't pass raw '../', but assert the resolver itself
+    # rejects anything that escapes the configured roots.
+    roots = serve._enrich_preview_roots()
+    # os.path.join gives a real parent-escaping component on the host (``..\`` on
+    # Windows, ``../`` on POSIX); a literal backslash is NOT a separator on Linux,
+    # so the hard-coded ``..\\`` used to resolve INSIDE the root there and fail.
+    escape = os.path.join("..", "outside.png")
+    assert all(not (r / escape).resolve().is_relative_to(r)
+               for r in roots)
 
 
 # --- P0-3b: privacy summary honest about a non-local LLM host ----------------

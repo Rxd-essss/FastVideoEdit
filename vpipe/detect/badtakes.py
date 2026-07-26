@@ -49,7 +49,9 @@ def detect(transcript: Transcript, cfg: Config,
     # gets analysed. Walk fixed windows and offset per-window indices back to
     # GLOBAL segment indices, deduping the overlap.
     chosen: dict[int, str] = {}
-    for win_start, win_end in segment_windows(n, cfg.llm):
+    windows = segment_windows(n, cfg.llm)
+    n_win = len(windows)
+    for wi, (win_start, win_end) in enumerate(windows):
         window = segments[win_start:win_end]
         lines = []
         for local_i, s in enumerate(window):
@@ -57,7 +59,11 @@ def detect(transcript: Transcript, cfg: Config,
         user = ("Сегменты расшифровки:\n" + "\n".join(lines) +
                 "\n\nВерни JSON: {\"removals\": [{\"index\": <номер>, \"reason\": <причина>}]}")
         try:
-            data = llm.chat_json(_SYSTEM, user, _SCHEMA)
+            # Keep qwen3 warm BETWEEN windows (default keep_alive=0 reloads the
+            # ~6 GB model once per window on a long video); unload after the last
+            # so it frees VRAM for the next stage (chapters.py pattern).
+            ka = 0 if wi == n_win - 1 else 60
+            data = llm.chat_json(_SYSTEM, user, _SCHEMA, keep_alive=ka)
         except (LLMUnavailable, Exception) as e:  # noqa: BLE001
             # Graceful: a single bad window must not lose the whole pass. Skip
             # this window and keep whatever the other windows produced.

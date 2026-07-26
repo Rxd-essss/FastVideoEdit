@@ -14,16 +14,31 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from .censor import build_censor_graph
 from .config import Config
 from .cutlist import resolve
-from .ffmpeg_utils import FFmpeg
+from .enrich import (MAX_ANIMS, MAX_STILLS, AnimOverlay, RenderEnrich,
+                     StillOverlay, ZoomWindow)
+from .ffmpeg_utils import (FFmpeg, FFmpegError, _register_proc,
+                           _unregister_proc)
 from .models import CutList
 from .probe import MediaInfo
-from .timeline import Timeline
+from .timeline import Timeline, merge_intervals
+
+
+class RenderCancelled(RuntimeError):
+    """Raised inside :func:`render` (and its pass helpers) when the caller's
+    ``should_cancel()`` turns True at a pass boundary.
+
+    A dedicated type — not a bare RuntimeError — so a user cancel is
+    distinguishable from a genuine failure. In practice the serve worker keys
+    off ``task['cancelled']`` and reports «cancelled» for either, so this simply
+    propagates as a clean cancel instead of an ffmpeg error dump.
+    """
 
 
 def _f(x: float) -> str:
@@ -93,8 +108,19 @@ _CONTAINER_FMT = {".mp4": "mp4", ".mov": "mov", ".mkv": "matroska",
                   ".webm": "webm", ".m4v": "mp4"}
 
 
+# HDR transfer characteristics that must be tonemapped to SDR BT.709 before the
+# 8-bit yuv420p encode; otherwise the 10-bit PQ/HLG values are bit-truncated and
+# play back washed-out/desaturated (#60). SDR (bt709/empty) never matches, so
+# every SDR source keeps its byte-for-byte fast-paths untouched.
+_HDR_TRC = {"smpte2084", "arib-std-b67"}   # PQ (HDR10) / HLG
+
+
+def _is_hdr(media) -> bool:
+    return str(getattr(media, "color_trc", "") or "").lower() in _HDR_TRC
+
+
 def _run_atomic(ff: FFmpeg, args: list[str], out_path: str, *,
-                total=None, on_progress=None, desc="ffmpeg") -> None:
+                total=None, on_progress=None, desc="ffmpeg") -> str:
     """Run ffmpeg writing to ``out_path + '.part'`` then atomically replace.
 
     The final file appears only after ffmpeg exits 0, so a crashed/cancelled
@@ -126,7 +152,42 @@ def _run_atomic(ff: FFmpeg, args: list[str], out_path: str, *,
         except OSError:
             pass
         raise
-    os.replace(tmp, out_path)
+    # ffmpeg can exit 0 yet write a SHORT file (interrupted source, VFR metadata
+    # overstating the decodable stream). Reject a GROSS shortfall so a truncated
+    # render is never atomically promoted to the final name and reported as done.
+    # Only >10% AND >0.5s missing counts — normal keyframe/container rounding
+    # lands within a frame of `total` and must never trip this. A probe that
+    # itself fails is swallowed so a broken ffprobe never fails a good render.
+    if total and total > 0:
+        try:
+            got = float(ff.probe(tmp).get("format", {}).get("duration", 0.0) or 0.0)
+        except Exception:      # noqa: BLE001
+            got = 0.0
+        if got > 0.0 and got < total - max(0.5, 0.10 * total):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise FFmpegError(
+                f"{desc}: output truncated — got {got:.1f}s of an expected "
+                f"{total:.1f}s. The render was rejected (no file written).")
+    # os.replace can raise PermissionError on Windows when the previous output at
+    # out_path is held open (media player / an in-flight /api/output stream).
+    # Retry briefly, then fall back to a sibling timestamped name rather than
+    # discarding a finished multi-GB encode at 100%. Returns the path actually
+    # written so the caller can report the file the user should open.
+    for attempt in range(5):
+        try:
+            os.replace(tmp, out_path)
+            return out_path
+        except PermissionError:
+            if attempt < 4:
+                time.sleep(0.4)
+                continue
+            p = Path(out_path)
+            alt = str(p.with_name(f"{p.stem} ({int(time.time())}){p.suffix}"))
+            os.replace(tmp, alt)
+            return alt
 
 
 def video_encoder_args(cfg: Config, has_nvenc: bool, log=print) -> list[str]:
@@ -384,6 +445,7 @@ def measure_loudness(ff: FFmpeg, cfg: Config, inputs: list[str], asrc_idx: str,
                      kept: Optional[list[tuple[float, float]]], *,
                      cut_fade: float = 0.0, total: Optional[float] = None,
                      music_idx: Optional[int] = None, music_dur: float = 0.0,
+                     should_cancel: Optional[Callable[[], bool]] = None,
                      log=print) -> Optional[dict]:
     """Loudnorm measurement pass: replay the FINAL audio into ``-f null``.
 
@@ -437,6 +499,10 @@ def measure_loudness(ff: FFmpeg, cfg: Config, inputs: list[str], asrc_idx: str,
     try:
         stderr = ff.run(args, total=total, desc="loudnorm measure")
     except Exception as e:  # noqa: BLE001 — measurement is strictly best-effort
+        if should_cancel is not None and should_cancel():
+            # A cancel killed the measurement ffmpeg — propagate it instead of
+            # swallowing into a one-pass fallback that then starts the encode.
+            raise RenderCancelled("cancelled")
         log(f"  loudnorm 2pass: измерение не удалось ({e}) — "
             "включаю обычный однопроходный режим.")
         return None
@@ -455,11 +521,14 @@ def _faststart(cfg: Config) -> list[str]:
 
 
 def censor_audio(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
-                 work_dir: str | Path, on_progress=None, log=print) -> Optional[str]:
+                 work_dir: str | Path, on_progress=None, log=print,
+                 should_cancel: Optional[Callable[[], bool]] = None) -> Optional[str]:
     """Stage 1: write a lossless FLAC with profanity censored. None if no-op."""
     _, censors = resolve(cl)
     if not censors:
         return None
+    if should_cancel is not None and should_cancel():
+        raise RenderCancelled("cancelled")
     has_rb = ff.has_filter("rubberband")
     graph = build_censor_graph(censors, cfg.censor, media.duration,
                                media.sample_rate, has_rb)
@@ -525,7 +594,8 @@ def _cleanup_dfn_temp(work_dir: str | Path) -> None:
 
 def enhance_audio(ff: FFmpeg, src: str, cfg: Config, work_dir: str | Path,
                   log=print, on_progress=None,
-                  total: Optional[float] = None) -> Optional[str]:
+                  total: Optional[float] = None,
+                  should_cancel: Optional[Callable[[], bool]] = None) -> Optional[str]:
     """Stage 1.5: neural speech denoise via the DeepFilterNet 3 CLI.
 
     Modelled on :func:`censor_audio`: consumes ``src`` (the censored FLAC when
@@ -567,6 +637,9 @@ def enhance_audio(ff: FFmpeg, src: str, cfg: Config, work_dir: str | Path,
                 "-c:a", "pcm_s16le", str(in_wav)],
                total=total, on_progress=on_progress, desc="extract wav (DFN)")
     except Exception as e:  # noqa: BLE001 — enhancement is strictly best-effort
+        if should_cancel is not None and should_cancel():
+            _cleanup_dfn_temp(wd)     # drop the partial wav, then propagate cancel
+            raise RenderCancelled("cancelled")
         log(f"  DeepFilterNet: извлечение WAV не удалось ({e}) — использую afftdn.")
         _cleanup_dfn_temp(wd)   # a partial dfn_in.wav must not pile up (audit C-1)
         return None
@@ -575,16 +648,60 @@ def enhance_audio(ff: FFmpeg, src: str, cfg: Config, work_dir: str | Path,
         ["-D", "-o", str(out_dir), str(in_wav)]
     log("  DeepFilterNet: нейроденойз (CPU"
         + (", post-filter" if post_filter else "") + ")…")
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True,
-                           encoding="utf-8", errors="replace")
-    except OSError as e:
-        log(f"  DeepFilterNet: запуск не удался ({e}) — использую afftdn.")
-        _cleanup_dfn_temp(wd)
-        return None
-    if r.returncode != 0:
-        tail = " | ".join((r.stderr or r.stdout or "").strip().splitlines()[-3:])
-        log(f"  DeepFilterNet: exe завершился с ошибкой (exit {r.returncode})"
+    if should_cancel is None:
+        # Legacy blocking path — byte-for-byte the pre-Wave1 behaviour for the
+        # non-serve callers (clips/tests) that don't thread a cancel flag.
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace")
+        except OSError as e:
+            log(f"  DeepFilterNet: запуск не удался ({e}) — использую afftdn.")
+            _cleanup_dfn_temp(wd)
+            return None
+        rc, out, err = r.returncode, r.stdout, r.stderr
+    else:
+        # Cancellable path: run the (multi-minute, CPU-only) CLI as a REGISTERED
+        # Popen so cancel_all() can terminate it like any ffmpeg, polled on a
+        # short timeout to honour should_cancel at a real boundary AND nudge the
+        # bar — DFN emits no progress fraction, so the bar would otherwise sit
+        # frozen for the whole stage. communicate(timeout=) sidesteps the
+        # classic pipe-fill deadlock of reading the streams by hand.
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True,
+                                    encoding="utf-8", errors="replace")
+        except OSError as e:
+            log(f"  DeepFilterNet: запуск не удался ({e}) — использую afftdn.")
+            _cleanup_dfn_temp(wd)
+            return None
+        _register_proc(proc)
+        start = time.monotonic()
+        out = err = ""
+        try:
+            while True:
+                try:
+                    out, err = proc.communicate(timeout=2.0)
+                    break
+                except subprocess.TimeoutExpired:
+                    el = time.monotonic() - start
+                    if on_progress is not None:
+                        # Bounded 0..0.95 within the DFN slice — motion, never «done».
+                        on_progress(min(0.95, el / max(total or el, el + 1.0)))
+                    if should_cancel():
+                        proc.terminate()
+                        try:
+                            proc.communicate(timeout=5.0)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                            proc.communicate()
+                        _cleanup_dfn_temp(wd)
+                        raise RenderCancelled("cancelled")
+        finally:
+            _unregister_proc(proc)
+        rc = proc.returncode
+    if rc != 0:
+        tail = " | ".join((err or out or "").strip().splitlines()[-3:])
+        log(f"  DeepFilterNet: exe завершился с ошибкой (exit {rc})"
             + (f": {tail}" if tail else "") + " — использую afftdn.")
         _cleanup_dfn_temp(wd)
         return None
@@ -616,8 +733,273 @@ def _ass_path_for_filter(p: str) -> str:
     # Filtergraph option delimiters that could prematurely end the value.
     p = p.replace(",", "\\,").replace("[", "\\[").replace("]", "\\]")
     p = p.replace(";", "\\;")
-    p = p.replace("'", "\\'")   # a quote in the path must not close the value
+    # A literal single quote inside a single-quoted filter value must be written
+    # as the close-escape-reopen idiom '\'' -- a bare backslash does NOT escape it
+    # (the quote still terminates the value). Callers wrap the result in '...'.
+    p = p.replace("'", "'\\''")
     return p
+
+
+# --- enrich dynamics: punch-zoom + blur-backplate (V11 §3, §4a) ---------------
+# Анти-кринж / перф-числа в КОДЕ (R3/R2 — qwen числа игнорирует). Окна (t0/t1) и
+# z_max приходят из плана (FINAL-секунды); здесь — техника фильтра.
+PUNCH_RAMP_S = 0.7            # рамп-ин/рамп-аут зума (smoothstep), §4a
+# Даунскейл-blur (R2 §4): blur на 1/16 пикселей + bilinear-upscale ≡ boxblur=20,
+# в 3.5× дешевле наивного полноэкранного boxblur. Числа доказаны кадрами спайка.
+BLUR_DS_W = 480              # даунскейл-ширина ветки blur
+BLUR_DS_H = 270              # даунскейл-высота
+BLUR_BOX = "boxblur=4:2"     # boxblur на даунскейле (≡ sigma≈20 после upscale)
+BLUR_EQ = "eq=brightness=-0.16:saturation=0.85"   # затемнение + десатурация фона
+
+
+def _smoothstep_z_expr(zw: "ZoomWindow", ramp: float = PUNCH_RAMP_S) -> str:
+    r"""Кусочная smoothstep-огибающая Z(t) для одного окна punch-zoom (§4a).
+
+    Z(t): 1.0 вне окна; рамп-ин ``ramp`` c (smoothstep 1->z_max), hold на пике,
+    рамп-аут ``ramp`` c (z_max->1). smoothstep ``p*p*(3-2p)`` — джиттер 0.082
+    против 0.153 у zoompan (R3: zoompan ~1.9× дёрганей, отвергнут). Рампы
+    клампятся, чтобы для короткого окна вход/выход не наложились.
+    """
+    t0, t1 = float(zw.t0), float(zw.t1)
+    zmax = float(zw.z_max)
+    rin = min(ramp, max(0.0, (t1 - t0) / 2.0))
+    rout = rin
+    ti0, ti1 = t0, t0 + rin              # рамп-ин
+    to0, to1 = t1 - rout, t1            # рамп-аут
+    one = "1"
+    if rin <= 0:                        # вырожденное окно -> без зума
+        return one
+    # p_in = (t-ti0)/rin; ss_in = p*p*(3-2p); z_in = 1 + (zmax-1)*ss_in
+    pin = f"((t-{_f(ti0)})/{_f(rin)})"
+    ssin = f"({pin}*{pin}*(3-2*{pin}))"
+    zin = f"(1+{_f(zmax - 1.0)}*{ssin})"
+    pout = f"((t-{_f(to0)})/{_f(rout)})"
+    ssout = f"({pout}*{pout}*(3-2*{pout}))"
+    zout = f"({_f(zmax)}-{_f(zmax - 1.0)}*{ssout})"
+    # if(in-window) { if(ramp-in) zin else if(ramp-out) zout else zmax } else 1
+    inwin = f"between(t,{_f(t0)},{_f(t1)})"
+    inramp = f"lt(t,{_f(ti1)})"
+    outramp = f"gt(t,{_f(to0)})"
+    body = (f"if({inramp},{zin},"
+            f"if({outramp},{zout},{_f(zmax)}))")
+    return f"if({inwin},{body},{one})"
+
+
+def _punch_dims(media: MediaInfo, scale_h: Optional[int],
+                crop_filter: Optional[str]) -> tuple[int, int]:
+    r"""Финальные дименшены кадра (W, H) для punch-zoom scale-back.
+
+    Зеркало ``serve._final_render_dims``: для вертикального рендера цель уже
+    запечена в ``crop_filter`` (``...,scale=W:H``) — берём её; иначе высота =
+    ``scale_h`` (или исходная), ширина пропорциональна источнику. Дименшены
+    нужны ТОЛЬКО когда есть punch-окна; при их отсутствии не используются.
+    """
+    if crop_filter:
+        m = re.search(r"scale=(\d+):(\d+)", crop_filter)
+        if m:
+            return int(m.group(1)), int(m.group(2))
+    out_h = int(scale_h) if scale_h else int(media.height or 1080)
+    src_w = int(media.width or 1920)
+    src_h = int(media.height or 1080)
+    out_w = int(round(src_w * out_h / src_h)) if src_h else 1920
+    # W6 #6: yuv420p требует ЧЁТНЫХ размеров. Генерический путь скейлит через
+    # scale=-2 (авто-чёт), а punch-scale задаёт W:H явно — нечётная ширина
+    # (1366x768@720 -> 1281) роняла ВЕСЬ рендер («width not divisible by 2»).
+    out_w -= out_w % 2
+    out_h -= out_h % 2
+    return max(2, out_w), max(2, out_h)
+
+
+def _punch_filter(punches: list["ZoomWindow"], out_w: int, out_h: int) -> str:
+    r"""crop+scale punch-zoom (§4a, ПОБЕДИЛ zoompan): кадр кропится по Z(t) и
+    скейлится обратно в ``out_w``×``out_h`` — scale интерполирует субпиксельно
+    (crop целочисленно снапит top-left, но финальный scale это прячет).
+
+    Несколько окон складываются в ОДНУ Z(t) перемножением огибающих (окна
+    планировщик разносит зазором ≥30-60 c, так что перемножение = max — активна
+    максимум одна). Возвращает строку фильтра ``crop=...,scale=W:H`` (без
+    меток) для вставки в comma-chain. Пустой список окон -> "" (no-op).
+    """
+    if not punches or out_w <= 0 or out_h <= 0:
+        return ""
+    exprs = [_smoothstep_z_expr(zw) for zw in punches]
+    z = exprs[0] if len(exprs) == 1 else "*".join(f"({e})" for e in exprs)
+    # crop по Z(t), центрированный; scale обратно в фикс. финальные дименшены
+    # (НЕ iw:ih — после crop iw=cropped). \Z живёт в crop-выражениях.
+    return (f"crop=w='iw/({z})':h='ih/({z})'"
+            f":x='(iw-iw/({z}))/2':y='(ih-ih/({z}))/2',"
+            f"scale={int(out_w)}:{int(out_h)}")
+
+
+# --- enrich overlays (ENRICH_PLAN §2.1) ---------------------------------------
+def _enrich_video_chain(src_lbl: str, vpre: list[str],
+                        stills: list[StillOverlay], anims: list[AnimOverlay],
+                        first_idx: int, vsubs: list[str],
+                        *, card_windows: Optional[list[tuple[float, float]]] = None,
+                        punches: Optional[list["ZoomWindow"]] = None,
+                        out_w: int = 0, out_h: int = 0) -> str:
+    r"""Video sub-graph from ``src_lbl`` to ``[outv]`` with enrich overlays.
+
+    Statement order is the §2.1/§3/§4a contract: ``vpre`` (crop -> scale -> fps)
+    first, then — V11 — punch-zoom (whole-frame crop+scale, §4a) and per-card
+    blur-backplate (§3) BEFORE the overlay nodes (zoom the whole frame, then PiP
+    on top; the frosted panel floats over its own blurred backdrop), then one
+    overlay node per still/anim — the input indices follow the order the enrich
+    ``-i`` entries were appended after the music input — and finally the
+    subtitles filters from ``vsubs`` (enrich.ass with fontsdir FIRST, burn.ass
+    LAST). All t0/t1 are FINAL (post-concat) seconds; the fractions are formatted
+    by :func:`_f` (f-strings — always a dot, the filtergraph never sees a locale
+    comma). Empty ``card_windows``/``punches`` keep the graph byte-for-byte the
+    pre-V11 chain (purely additive).
+
+    PNG stills get ``format=rgba`` + alpha fade in/out (R2 §1); WebM anims get
+    ``setpts=PTS+t0/TB`` to shift their clock to the show window and — ONLY
+    when the input is looped with ``-stream_loop -1`` — ``shortest=1`` on the
+    overlay, otherwise framesync's default ``eof_action=repeat`` keeps
+    repeating the bed's last frame FOREVER and the render never ends (R2
+    trap #2). A finite (non-looped) anim must NOT get ``shortest=1`` — that
+    would truncate the whole program at the anim's end.
+
+    Blur-backplate (§3) is the R2 ``trimdscale`` technique: a ``split`` branch
+    is down-scaled (``480:270``) → ``boxblur`` → darkened → up-scaled bilinear
+    (≡ ``boxblur=20``, 3.5× cheaper, no blockiness) then ``trim``+``setpts``
+    into the card window and overlaid with ``eof_action=pass``. The TRAP (R2 §4):
+    ``enable=`` on the overlay does NOT gate the upstream blur — without ``trim``
+    the blur is computed on EVERY frame of the whole clip. ``trim``+``setpts``
+    confines the cost to the card seconds; ``eof_action=pass`` lets the main
+    stream continue past the trimmed branch's end.
+    """
+    stmts: list[str] = []
+    cur = src_lbl
+    nb = 0
+    if vpre:
+        stmts.append(f"{cur}{','.join(vpre)}[vb{nb}]")
+        cur = f"[vb{nb}]"
+        nb += 1
+    # V11 §4a — punch-zoom (whole-frame), BEFORE overlays/backplate.
+    punch_f = _punch_filter(list(punches or []), out_w, out_h)
+    if punch_f:
+        out = f"[vb{nb}]"
+        stmts.append(f"{cur}{punch_f}{out}")
+        cur, nb = out, nb + 1
+    # V11 §3 — blur-backplate per card window (R2 trimdscale), BEFORE overlays.
+    for ci, (c0, c1) in enumerate(card_windows or []):
+        c0 = max(0.0, float(c0))
+        c1 = max(c0, float(c1))
+        blur_lbl = f"[bbk{ci}]"
+        base_lbl = f"[bbs{ci}]"
+        trim_lbl = f"[bbb{ci}]"         # blur-ветка обрезана в окно карточки
+        out = f"[vb{nb}]"
+        # split: одна ветка — фон, вторая → blur-backplate в окно карточки.
+        stmts.append(f"{cur}split=2{base_lbl}{blur_lbl}")
+        # КРИТ-ПОРЯДОК (LAW §3/§4, R2 ловушка #1): trim ИДЁТ ПЕРВЫМ, ДО boxblur.
+        # Раньше тут стоял scale2ref+trim-после — scale2ref тянет кадры из
+        # ПОЛНОДЛИННОЙ reference-ветки в лок-степе, поэтому boxblur считался на
+        # ВЕСЬ клип (+537% перф), а trim лишь выбрасывал готовые кадры. Перенос
+        # trim перед даунскейл-blur ограничивает дорогой boxblur только секундами
+        # карточки (оконно-пропорциональная стоимость, +60% как в спайке), а
+        # плоский scale=W:H:flags=bilinear (вместо scale2ref) даёт тот же
+        # bilinear-upscale ≡ boxblur=20 без полнодлинной reference-привязки.
+        # setpts держит PTS в окне [c0,c1]; overlay eof_action=pass даёт main
+        # пройти за конец обрезанной ветки.
+        stmts.append(
+            f"{blur_lbl}trim={_f(c0)}:{_f(c1)},setpts=PTS-STARTPTS+{_f(c0)}/TB,"
+            f"scale={BLUR_DS_W}:{BLUR_DS_H},{BLUR_BOX},{BLUR_EQ},"
+            f"scale={int(out_w)}:{int(out_h)}:flags=bilinear{trim_lbl}")
+        stmts.append(
+            f"{base_lbl}{trim_lbl}overlay=0:0"
+            f":enable='between(t,{_f(c0)},{_f(c1)})':eof_action=pass{out}")
+        cur, nb = out, nb + 1
+    idx = first_idx
+    for k, st in enumerate(stills):
+        # TODO(kenburns v1.1): st.kenburns renders as a plain PNG overlay for
+        # now; the zoompan + alphamerge branch (R2 §2) is deferred — the model
+        # field exists so plans stay forward-compatible.
+        fade = max(0.0, float(st.fade_s or 0.0))
+        prep = f"[{idx}:v]format=rgba,scale={int(st.scale_w)}:-1"
+        if fade > 0:
+            prep += (f",fade=t=in:st={_f(st.t0)}:d={_f(fade)}:alpha=1"
+                     f",fade=t=out:st={_f(max(st.t0, st.t1 - fade))}"
+                     f":d={_f(fade)}:alpha=1")
+        stmts.append(prep + f"[ov{k}]")
+        out = f"[vb{nb}]"
+        stmts.append(f"{cur}[ov{k}]overlay={st.x_expr}:{st.y_expr}"
+                     f":enable='between(t,{_f(st.t0)},{_f(st.t1)})'{out}")
+        cur, nb, idx = out, nb + 1, idx + 1
+    for k, an in enumerate(anims):
+        stmts.append(f"[{idx}:v]scale={int(an.scale_w)}:-1,"
+                     f"setpts=PTS+{_f(an.t0)}/TB[an{k}]")
+        out = f"[vb{nb}]"
+        stmts.append(f"{cur}[an{k}]overlay={an.x_expr}:{an.y_expr}"
+                     f":enable='between(t,{_f(an.t0)},{_f(an.t1)})'"
+                     f"{':shortest=1' if an.loop else ''}{out}")
+        cur, nb, idx = out, nb + 1, idx + 1
+    if vsubs:
+        stmts.append(f"{cur}{','.join(vsubs)}[outv]")
+    else:
+        # No subtitles: rename the last overlay's output label to [outv].
+        stmts[-1] = stmts[-1][:-len(cur)] + "[outv]"
+    return ";".join(stmts)
+
+
+def sliver_min_seg(media: MediaInfo, cfg: Config) -> float:
+    """Minimum kept-segment length render() will actually encode.
+
+    A kept segment shorter than ~1.2 video frames (a zero-width trim breaks
+    concat) OR shorter than ``cfg.render.min_segment`` is a sliver — a
+    breath/VAD-edge blip between two near-adjacent cuts. Shared so the encoder
+    and every subtitle/chapter/metadata/enrich Timeline agree on the boundary.
+    """
+    frame = (1.2 / media.fps) if media.fps > 0 else 0.04
+    return max(frame, float(getattr(cfg.render, "min_segment", 0.0) or 0.0))
+
+
+def effective_cut(cl: CutList, media: MediaInfo, cfg: Config
+                  ) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+    """THE cutlist render() actually executes. Returns ``(kept, removed_eff)``.
+
+    ``kept`` is the sliver-filtered list of kept segments; ``removed_eff`` is the
+    merged removed set whose complement over ``[0, media.duration]`` is EXACTLY
+    ``kept`` (each dropped sliver is folded into the removed intervals it sits
+    between — its endpoints are already removed-interval endpoints, so they merge
+    with gap 0). Every burned/sidecar subtitle, chapter, metadata and enrich
+    Timeline MUST be built from ``removed_eff`` so its timestamps match the
+    encoded video; otherwise each dropped sliver desyncs every following cue and
+    the error accumulates over the length of the video (R1).
+    """
+    removed, _ = resolve(cl)
+    tl = Timeline(removed, media.duration)
+    min_seg = sliver_min_seg(media, cfg)
+    all_kept = tl.kept_segments()
+    # Frame-snap (#22): quantise every kept boundary to the source frame grid
+    # BEFORE the sliver filter so the video trim (whole frames) and the audio
+    # atrim share ONE timeline -- concat then inserts no one-sided silence pad and
+    # the subtitle/chapter Timelines (all built from removed_eff below) ride the
+    # exact rendered positions. Opt out via render.frame_snap=False; skipped for
+    # audio-only / unknown-fps sources (media.fps<=0) so those stay byte-exact.
+    fps = (media.fps if (getattr(cfg.render, "frame_snap", True)
+                         and getattr(media, "fps", 0.0) > 0) else 0.0)
+    kept = []
+    for (a, b) in all_kept:
+        if fps:
+            a = round(a * fps) / fps
+            b = round(b * fps) / fps
+        if (b - a) >= min_seg:
+            kept.append((a, b))
+    # removed_eff = EXACT complement of the (snapped, sliver-filtered) kept set
+    # over [0, media.duration]. Computing it from the SNAPPED kept -- rather than
+    # merging the raw removed set with dropped slivers -- keeps subs/chapters on
+    # the same quantised grid the encoder uses (the two agree byte-for-byte when
+    # snapping is a no-op, e.g. boundaries already on the grid or frame_snap=off).
+    removed_eff, cursor = [], 0.0
+    for (a, b) in kept:
+        if a > cursor:
+            removed_eff.append((cursor, a))
+        cursor = b
+    if cursor < media.duration:
+        removed_eff.append((cursor, media.duration))
+    removed_eff = merge_intervals(removed_eff)
+    return kept, removed_eff
 
 
 def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
@@ -626,7 +1008,9 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
            scale_h: Optional[int] = None, fps: Optional[float] = None,
            ass_path: Optional[str] = None,
            crop_filter: Optional[str] = None,
-           edge_fade: float = 0.0) -> dict:
+           edge_fade: float = 0.0,
+           enrich: Optional[RenderEnrich] = None,
+           should_cancel: Optional[Callable[[], bool]] = None) -> dict:
     """Run both stages and write the final mp4. Returns a small summary dict.
 
     ``scale_h``/``fps`` override the output resolution height / frame rate; None
@@ -650,21 +1034,55 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
     FINAL speech, mixed in BEFORE loudnorm (see :func:`_music_audio_graph`).
     Disabled (the default) keeps every graph byte-for-byte unchanged. Clip
     Maker renders never receive it — serve strips ``music`` from clip opts.
+
+    ``enrich`` (ENRICH_PLAN §2.1): a render-ready :class:`vpipe.enrich
+    .RenderEnrich` — already remapped to FINAL coordinates, validated and
+    conflict-resolved by ``vpipe.enrich.plan_render``; render.py stays a dumb
+    executor (the ``ass_path`` pattern). Its PNG stills / WebM-alpha anims
+    enter as extra ``-i`` inputs AFTER the music bed, the overlay nodes sit
+    between the crop/scale/fps prefix and the subtitles filters, and its
+    ``cards_ass`` burns FIRST (with ``fontsdir``) so the card scrim never dims
+    the karaoke subs — ``ass_path`` (burn.ass) stays the LAST video filter.
+    A non-empty ``enrich`` forces a re-encode through the existing non-empty-
+    vpost mechanism; ``None`` (or an all-empty plan) keeps every graph and
+    fast-path byte-for-byte unchanged. The audio graph is NEVER touched.
     """
+    def _ck() -> None:
+        """Abort at a pass boundary when the caller asked to cancel.
+
+        Raises RenderCancelled (a RuntimeError). The serve worker already reports
+        «cancelled» for any exception raised while task['cancelled'] is set, so
+        this surfaces as a clean cancel rather than an error dump. Called only at
+        pass boundaries — never inside tight per-segment loops — to avoid noise.
+        """
+        if should_cancel is not None and should_cancel():
+            raise RenderCancelled("cancelled")
+
+    def _ck() -> None:
+        """Abort at a pass boundary when the caller asked to cancel.
+
+        Raises RenderCancelled (a RuntimeError). The serve worker already reports
+        «cancelled» for any exception raised while task['cancelled'] is set, so
+        this surfaces as a clean cancel rather than an error dump. Called only at
+        pass boundaries — never inside tight per-segment loops — to avoid noise.
+        """
+        if should_cancel is not None and should_cancel():
+            raise RenderCancelled("cancelled")
+
     removed, censors = resolve(cl)
-    tl = Timeline(removed, media.duration)
-    new_dur = tl.new_duration()
     # Drop kept slivers shorter than ~1 video frame (a zero-width trim breaks
     # concat) OR shorter than min_segment — a tiny breath/VAD-edge blip between
     # two near-adjacent cuts that would just stutter. min_segment stays below the
-    # shortest real word, so this merges cuts without dropping speech.
-    frame = (1.2 / media.fps) if media.fps > 0 else 0.04
-    min_seg = max(frame, float(getattr(cfg.render, "min_segment", 0.0) or 0.0))
-    all_kept = tl.kept_segments()
-    kept = [(a, b) for (a, b) in all_kept if (b - a) >= min_seg]
+    # shortest real word, so this merges cuts without dropping speech. effective_cut
+    # is the SINGLE source of truth: serve builds every subtitle/chapter/metadata/
+    # enrich Timeline from the same removed_eff, so overlays never drift (R1).
+    kept, removed_eff = effective_cut(cl, media, cfg)
+    tl = Timeline(removed_eff, media.duration)   # total_removed / new_duration are
+    new_dur = tl.new_duration()                  #   now the EFFECTIVE (post-sliver) values
+    all_kept = Timeline(removed, media.duration).kept_segments()
     if len(kept) < len(all_kept):
         log(f"  dropped {len(all_kept) - len(kept)} tiny kept sliver(s) "
-            f"(< {min_seg*1000:.0f} ms) — merged near-adjacent cuts.")
+            f"— merged near-adjacent cuts.")
     if not kept:
         raise RuntimeError("Every part of the video is marked for removal — nothing to render.")
 
@@ -695,8 +1113,10 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
     censor_prog = _censor_prog if will_censor else None
 
     # Censoring needs an audio track; skip it entirely for video-only sources.
+    _ck()   # honour a cancel that landed before Stage 1 (censor) begins.
     censored = (censor_audio(ff, media, cl, cfg, work_dir,
-                             on_progress=censor_prog, log=log)
+                             on_progress=censor_prog, log=log,
+                             should_cancel=should_cancel)
                 if has_audio else None)
 
     # Stage 1.5 (opt-in): neural denoise of the censored/original audio via the
@@ -712,9 +1132,11 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
 
             def enh_prog(p, _op=on_progress, _s=e_start):
                 _op(_s + 0.10 * min(1.0, max(0.0, p)))
+        _ck()   # abort before the (long, CPU-only) DFN neural denoise begins.
         enhanced = enhance_audio(ff, censored or media.path, cfg, work_dir,
                                  log=log, on_progress=enh_prog,
-                                 total=media.duration)
+                                 total=media.duration,
+                                 should_cancel=should_cancel)
         if enhanced is None:
             log("  DeepFilterNet недоступен — использую afftdn.")
             cfg = cfg.model_copy(deep=True)
@@ -733,21 +1155,77 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
     out_path = str(out_path)
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
 
-    vpost = []
+    # An all-empty enrich plan behaves exactly like None (byte-for-byte legacy
+    # graphs); a non-empty one rides the non-empty-vpost re-encode mechanism.
+    # V11: punch-zoom (§4a) / card blur-backplate (§3) also make the plan
+    # non-empty even with no stills/anims/cards_ass (they are pure video-chain
+    # effects, no extra inputs).
+    enr = (enrich if enrich is not None
+           and (enrich.stills or enrich.anims or enrich.cards_ass
+                or enrich.punches or enrich.card_windows) else None)
+    enr_stills: list[StillOverlay] = list(enr.stills) if enr else []
+    enr_anims: list[AnimOverlay] = list(enr.anims) if enr else []
+    enr_punches: list[ZoomWindow] = list(enr.punches) if enr else []
+    enr_card_windows: list[tuple[float, float]] = (
+        list(enr.card_windows) if enr else [])
+    # Engine safety net (§2.1 п.5, duplicates the planner's score-trim): the
+    # planner already trimmed by score and sorted by t0 — here we only cap the
+    # input count so a hand-written plan cannot explode the filtergraph.
+    if len(enr_stills) > MAX_STILLS:
+        log(f"  ВНИМАНИЕ: enrich даёт {len(enr_stills)} PNG-оверлеев — "
+            f"лимит движка {MAX_STILLS}, лишние отброшены.")
+        enr_stills = enr_stills[:MAX_STILLS]
+    if len(enr_anims) > MAX_ANIMS:
+        log(f"  ВНИМАНИЕ: enrich даёт {len(enr_anims)} WebM-оверлеев — "
+            f"лимит движка {MAX_ANIMS}, лишние отброшены.")
+        enr_anims = enr_anims[:MAX_ANIMS]
+    has_overlays = bool(enr_stills or enr_anims)
+    # V11: chain is needed when there are overlays OR video-chain dynamics.
+    has_dynamics = bool(enr_punches or enr_card_windows)
+    use_chain = has_overlays or has_dynamics
+    # Финальные дименшены кадра — нужны punch-zoom (scale=W:H обратно после crop).
+    # Та же логика, что serve._final_render_dims: vertical crop -> baked scale в
+    # crop_filter; иначе высота = scale_h|исходная, ширина пропорциональна.
+    pz_w, pz_h = _punch_dims(media, scale_h, crop_filter)
+
+    # vpost = vpre (crop -> scale -> fps) + vsubs (subtitles last). Without
+    # enrich overlays it is one comma chain — byte-for-byte the legacy vpost.
+    vpre = []
+    # HDR (PQ/HLG) -> SDR: tonemap FIRST (on the full-range source) so the
+    # downstream crop/scale/subtitles composite on correct BT.709 colours and the
+    # final 8-bit yuv420p is not a washed-out truncation (#60). A non-empty vpre
+    # also forces the re-encode path, bypassing the untonemapped video-copy
+    # fast-path. Guarded on zscale (libzimg): if unavailable, warn and skip (no
+    # hard fail) so a build without zimg still renders.
+    if _is_hdr(media):
+        if ff.has_filter("zscale"):
+            vpre.append("zscale=t=linear:npl=100,tonemap=hable,"
+                        "zscale=t=bt709:m=bt709:r=tv,format=yuv420p")
+            log("  HDR-источник (PQ/HLG) — тонмаппинг в SDR (BT.709).")
+        else:
+            log("  HDR-источник (PQ/HLG), но фильтр zscale недоступен — "
+                "тонмаппинг пропущен (возможен размытый цвет).")
     # Vertical 9:16 crop+scale must run FIRST: crop -> scale -> fps -> subtitles.
     # crop_filter already bakes in the exact target scale (e.g. ...,scale=1080:1920),
     # so the caller passes scale_h=None and the generic scale step below is skipped.
     if crop_filter:
-        vpost.append(crop_filter)
+        vpre.append(crop_filter)
     if scale_h:
-        vpost.append(f"scale=-2:{int(scale_h)}")
+        vpre.append(f"scale=-2:{int(scale_h)}")
     if fps:
-        vpost.append(f"fps={fps}")
+        vpre.append(f"fps={fps}")
+    vsubs = []
+    # Card/CTA-text ASS goes FIRST with the vendored Inter fontsdir (§2.2: the
+    # card scrim must not dim the karaoke subs below).
+    if enr is not None and enr.cards_ass:
+        vsubs.append(f"subtitles='{_ass_path_for_filter(enr.cards_ass)}'"
+                     f":fontsdir='{_ass_path_for_filter(enr.fonts_dir)}'")
     # Burn-in subtitles MUST be the last filter so karaoke timings line up with
     # the final (scaled/retimed) frames. A non-empty vpost forces re-encode, so
     # the no-cuts/no-scale copy fast-path is correctly bypassed when burning.
     if ass_path:
-        vpost.append(f"subtitles='{_ass_path_for_filter(ass_path)}'")
+        vsubs.append(f"subtitles='{_ass_path_for_filter(ass_path)}'")
+    vpost = vpre + vsubs
     vpost_s = ",".join(vpost)
     # The graph's audio source: the DFN-enhanced wav (already censored, when
     # there was anything to censor) wins over the censored FLAC, which wins
@@ -775,6 +1253,26 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
         log(f"  фоновая музыка: {Path(music_path).name} "
             f"(громкость {cfg.render.music.gain_db:g} дБ, "
             f"приглушение при речи {cfg.render.music.duck_db:g} дБ)")
+    # Enrich overlay inputs (§2.1) — ALWAYS after the music bed, same dynamic
+    # index pattern as music_idx. PNG stills need `-loop 1 -t <end of window>`
+    # (a single frame otherwise — the alpha fades have nothing to run on, R2
+    # §1); WebM-alpha anims MUST be decoded with `-c:v libvpx-vp9` BEFORE the
+    # `-i` (ffmpeg's native vp9 decoder silently drops the alpha — R2 trap #1)
+    # and loop via `-stream_loop -1` (their overlay then carries shortest=1).
+    # measure_loudness later receives these inputs too: it maps only [mout]
+    # audio, so the extra video inputs are never decoded (R1 §1.6) — verified
+    # live against ffmpeg 8.1.1, incl. a looped webm (the -f null pass ends).
+    enrich_in_idx = (2 if audio_src else 1) + (1 if music_path else 0)
+    if has_overlays:
+        for st in enr_stills:
+            inputs = inputs + ["-loop", "1", "-t", _f(st.t1 + 0.5),
+                               "-i", st.path]
+        for an in enr_anims:
+            inputs = (inputs + (["-stream_loop", "-1"] if an.loop else [])
+                      + ["-c:v", "libvpx-vp9", "-i", an.path])
+    if enr is not None:
+        log(f"  обогащение: {len(enr_stills)} PNG + {len(enr_anims)} WebM"
+            + (" + карточки/CTA-текст (ASS)" if enr.cards_ass else ""))
     # Two-pass loudnorm (opt-in via denoise.loudnorm_mode="2pass"): measure the
     # FINAL audio (cuts + censor + denoise + deesser + the ducked music bed,
     # WITHOUT loudnorm) first, then hand the stats to build_apost for the
@@ -784,11 +1282,12 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
     measured: Optional[dict] = None
     if has_audio and _wants_loudnorm_2pass(cfg):
         m_fade = max(0.0, float(getattr(cfg.render, "cut_fade", 0.0) or 0.0))
+        _ck()   # abort before the (audio-only, seconds-long) measurement pass.
         measured = measure_loudness(ff, cfg, inputs, asrc_idx,
                                     kept if removed else None,
                                     cut_fade=m_fade, total=new_dur,
                                     music_idx=music_idx, music_dur=out_adur,
-                                    log=log)
+                                    should_cancel=should_cancel, log=log)
     # Audio post-chain (denoise). Empty list when disabled -> the audio path stays
     # byte-for-byte identical to before (copy / passthrough fast-paths preserved).
     apost = build_apost(cfg, loudnorm_measured=measured) if has_audio else []
@@ -801,9 +1300,11 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
     # stay byte-for-byte identical.
     efades = _edge_fade_filters(edge_fade, out_adur) if has_audio else []
 
-    if not removed and not vpost:
+    if not removed and not vpost and not use_chain:
         # No cuts, no rescale: just mux (video copied — no quality loss). Denoise,
         # when on, forces the audio through filter_complex (video still copied).
+        # (use_chain joins the non-empty-vpost gate: overlay/punch/blur-only
+        # enrich has an empty vpost string yet still demands a video re-encode.)
         if not has_audio:
             log("  no cuts — remuxing (video copied).")
             args = ["-i", media.path, "-map", "0:v",
@@ -830,53 +1331,65 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
                     "-c:v", "copy", *_audio_args(cfg), *_faststart(cfg), out_path]
         else:
             log("  no cuts — remuxing (video copied).")
-            args = ["-i", media.path, "-map", "0:v", "-map", "0:a",
+            # FVE uses the FIRST audio track everywhere (extract/censor/render);
+            # bare 0:a copied ALL tracks here while every filtered path keeps one.
+            args = ["-i", media.path, "-map", "0:v", "-map", "0:a:0",
                     "-c:v", "copy", "-c:a", "copy", *_faststart(cfg), out_path]
         # finally: the ~220 MB DFN temp wavs must not survive a failed/cancelled
         # encode either (audit C-1) — same in the other two _run_atomic branches.
+        _ck()   # last chance to abort before the encode/remux launches.
+        _ck()   # last chance to abort before the encode/remux launches.
         try:
-            _run_atomic(ff, args, out_path, total=media.duration,
-                        on_progress=encode_prog, desc="remux")
+            saved = _run_atomic(ff, args, out_path, total=media.duration,
+                                on_progress=encode_prog, desc="remux")
         finally:
             if enhanced:
                 _cleanup_dfn_temp(work_dir)
-        return {"out": out_path, "new_duration": media.duration,
+        return {"out": saved, "new_duration": media.duration,
                 "removed": 0.0, "censored": len(censors),
                 "encoder": "copy", "denoise": bool(apost) or bool(enhanced),
                 "music": bool(music_path)}
 
     if not removed:
-        # No cuts but rescale/fps requested -> re-encode video; pass audio through.
+        # No cuts but rescale/fps/enrich requested -> re-encode video; pass
+        # audio through. With overlays the video part becomes the §2.1 chain
+        # ([0:v] -> vpre -> overlay nodes -> subtitles), byte-for-byte the
+        # legacy single statement otherwise.
+        vgraph = (_enrich_video_chain("[0:v]", vpre, enr_stills, enr_anims,
+                                      enrich_in_idx, vsubs,
+                                      card_windows=enr_card_windows,
+                                      punches=enr_punches,
+                                      out_w=pz_w, out_h=pz_h)
+                  if use_chain else f"[0:v]{vpost_s}[outv]")
         if has_audio and (apost or efades or music_path):
             # Audio must enter the graph for the denoise/edge-fade/music filters.
             if music_path:
-                graph = (f"[0:v]{vpost_s}[outv];"
+                graph = (vgraph + ";"
                          + _music_audio_graph(cfg, f"[{asrc_idx}:a]", music_idx,
                                               out_adur, apost, efades))
             else:
                 achain = ",".join(apost + efades)
-                graph = (f"[0:v]{vpost_s}[outv];"
+                graph = (vgraph + ";"
                          f"[{asrc_idx}:a]{achain}[outa]")
             args = [*inputs, "-filter_complex", graph, "-map", "[outv]",
                     "-map", "[outa]", *venc, *_audio_args(cfg),
                     *_faststart(cfg), out_path]
         elif has_audio:
-            graph = f"[0:v]{vpost_s}[outv]"
-            args = [*inputs, "-filter_complex", graph, "-map", "[outv]",
+            args = [*inputs, "-filter_complex", vgraph, "-map", "[outv]",
                     "-map", f"{asrc_idx}:a", *venc, *_audio_args(cfg),
                     *_faststart(cfg), out_path]
         else:
-            graph = f"[0:v]{vpost_s}[outv]"
-            args = [*inputs, "-filter_complex", graph, "-map", "[outv]",
+            args = [*inputs, "-filter_complex", vgraph, "-map", "[outv]",
                     "-an", *venc, *_faststart(cfg), out_path]
         log(f"  re-encoding (no cuts, {vpost_s or 'reencode'}) -> {enc_name}")
+        _ck()   # last chance to abort before the (multi-hour) encode launches.
         try:
-            _run_atomic(ff, args, out_path, total=media.duration,
-                        on_progress=encode_prog, desc="render")
+            saved = _run_atomic(ff, args, out_path, total=media.duration,
+                                on_progress=encode_prog, desc="render")
         finally:
             if enhanced:
                 _cleanup_dfn_temp(work_dir)
-        return {"out": out_path, "new_duration": media.duration,
+        return {"out": saved, "new_duration": media.duration,
                 "removed": 0.0, "censored": len(censors),
                 "encoder": enc_name, "denoise": bool(apost) or bool(enhanced),
                 "music": bool(music_path)}
@@ -899,7 +1412,16 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
         # _edge_fade_filters for why that order protects the de-click ramp.
         afinal = apost + efades
         a_lbl = "[outa_raw]" if (afinal or music_path) else "[outa]"
-        if vpost:
+        if use_chain:
+            # §2.1/§3/§4a: overlays + punch-zoom + blur-backplate live AFTER
+            # concat, on the FINAL timeline ([vc]).
+            graph = (base + f"concat=n={len(kept)}:v=1:a=1[vc]{a_lbl};"
+                     + _enrich_video_chain("[vc]", vpre, enr_stills, enr_anims,
+                                           enrich_in_idx, vsubs,
+                                           card_windows=enr_card_windows,
+                                           punches=enr_punches,
+                                           out_w=pz_w, out_h=pz_h))
+        elif vpost:
             graph = base + f"concat=n={len(kept)}:v=1:a=1[vc]{a_lbl};[vc]{vpost_s}[outv]"
         else:
             graph = base + f"concat=n={len(kept)}:v=1:a=1[outv]{a_lbl}"
@@ -919,20 +1441,28 @@ def render(ff: FFmpeg, media: MediaInfo, cl: CutList, cfg: Config,
             vparts.append(f"[0:v]trim=start={_f(a)}:end={_f(b)},setpts=PTS-STARTPTS[v{i}]")
             concat.append(f"[v{i}]")
         base = ";".join(vparts) + ";" + "".join(concat)
-        if vpost:
+        if use_chain:
+            graph = (base + f"concat=n={len(kept)}:v=1:a=0[vc];"
+                     + _enrich_video_chain("[vc]", vpre, enr_stills, enr_anims,
+                                           enrich_in_idx, vsubs,
+                                           card_windows=enr_card_windows,
+                                           punches=enr_punches,
+                                           out_w=pz_w, out_h=pz_h))
+        elif vpost:
             graph = base + f"concat=n={len(kept)}:v=1:a=0[vc];[vc]{vpost_s}[outv]"
         else:
             graph = base + f"concat=n={len(kept)}:v=1:a=0[outv]"
         args = [*inputs, "-filter_complex", graph, "-map", "[outv]",
                 "-an", *venc, *_faststart(cfg), out_path]
     log(f"  encoding {len(kept)} kept segment(s) -> {new_dur:.1f}s ({enc_name})")
+    _ck()   # last chance to abort before the (multi-hour) encode launches.
     try:
-        _run_atomic(ff, args, out_path, total=new_dur,
-                    on_progress=encode_prog, desc="render")
+        saved = _run_atomic(ff, args, out_path, total=new_dur,
+                            on_progress=encode_prog, desc="render")
     finally:
         if enhanced:
             _cleanup_dfn_temp(work_dir)
-    return {"out": out_path, "new_duration": new_dur, "removed": tl.total_removed,
+    return {"out": saved, "new_duration": new_dur, "removed": tl.total_removed,
             "censored": len(censors), "encoder": enc_name,
             "denoise": bool(apost) or bool(enhanced),
             "music": bool(music_path)}

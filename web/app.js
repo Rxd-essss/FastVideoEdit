@@ -77,6 +77,22 @@ const st = {
   // страницы. collectRenderOpts читает их и БЕЗ открытия модалки — без посева
   // ушли бы «сырые» HTML-значения (range=22, пустые out_dir/filename).
   _rSeeded: false,
+  // P4 — авто-обогащение (вкладка «Монтаж»). Предложения в ОРИГИНАЛЬНЫХ
+  // координатах (как clips/cuts); правки сохраняются в out/<stem>.enrich.json
+  // через POST /api/enrich/save.
+  enrichItems: [],         // [{id,type,enabled,score,t_start,t_end,quote,reason,status,status_note,payload,...}]
+  enrichParams: null,      // params последнего анализа (для пере-сидинга модалки)
+  enrichOpts: null,        // /api/state.enrich_opts — сохранённые настройки запуска
+  imagegenReady: false,    // /api/state.imagegen_ready — SD настроена (бинарь+модель)
+  enrichFilter: 'all',     // активный фильтр-чип ('all' | image | animation | list_card | cta)
+  enrichActive: null,      // id карточки под фокусом (j/k/e/Enter)
+  enrichCutlistChanged: false,  // мягкий баннер «вырезы изменились»
+  enrichStale: false,      // план от другого аудио (hash) — лента пуста
+  _enrPreviewEnd: null,    // ▶-превью предложения: авто-стоп оверлея на этом orig-времени
+  _enrPreviewItem: null,   // предложение, чей кадр-превью сейчас лежит поверх плеера
+  // ТРЕК-2 V2 (§3): индекс листаемого кандидата В СТРИПЕ (НЕ сохранённый выбор) —
+  // визуальное окно прокрутки мини-превью; сохранённый выбор живёт в visual.chosen.
+  enrichCandPage: {},      // id предложения -> индекс первого видимого кандидата в стрипе
 }
 const UNDO_CAP = 50
 const undoStack = [], redoStack = []
@@ -101,10 +117,14 @@ const TABS = [
   { id: 'chapters', tab: 'tab-chapters', panel: 'panel-chapters' },
   { id: 'meta', tab: 'tab-meta', panel: 'panel-meta' },
   { id: 'clips', tab: 'tab-clips', panel: 'panel-clips' },
+  // P4 — авто-обогащение: 5-я вкладка «Монтаж»
+  { id: 'enrich', tab: 'tab-enrich', panel: 'panel-enrich' },
 ]
 const TAB_KEY = 'fve_tab'
 // Вкладка-адресат фоновой задачи (busy-спиннер вместо бейджа, точка при ошибке).
-const TASK_TAB = { transcribe: 'cuts', detect: 'cuts', preview_chapters: 'chapters', preview_metadata: 'meta', preview_clips: 'clips', render_clips: 'clips' }
+const TASK_TAB = { transcribe: 'cuts', detect: 'cuts', preview_chapters: 'chapters', preview_metadata: 'meta', preview_clips: 'clips', render_clips: 'clips', enrich: 'enrich' }
+// Русские подписи внутренних id задач для полосы прогресса (иначе в RU-интерфейсе течёт английский id).
+const TASK_RU = { transcribe: 'Транскрипция', detect: 'Поиск вырезов', render: 'Рендер', preview_chapters: 'Главы', preview_metadata: 'Метаданные', preview_clips: 'Подбор клипов', render_clips: 'Рендер клипов', enrich: 'Монтаж', autopack: 'Авто-пак' }
 // C4 — title кнопки «Авто-пак» в доступном состоянии (см. setRunning).
 const AUTOPACK_TITLE = 'Сырец → готовый ролик + пак Shorts одной кнопкой'
 let activeTab = 'cuts'
@@ -159,19 +179,29 @@ function clearSaveError() { if (errorToastEl && errorToastEl.parentNode) errorTo
 
 // Warn before leaving with unsaved or in-flight changes.
 window.addEventListener('beforeunload', (e) => {
-  if (st.dirty || st.saving) { e.preventDefault(); e.returnValue = ''; return '' }
+  if (st.dirty || st.saving || st.metaDirty || enrPending.size || enrSaveTimer) { e.preventDefault(); e.returnValue = ''; return '' }
 })
 
-init()
+init().catch((e) => {
+  toast('Сервер недоступен — повторяю…', 'error')
+  setTimeout(() => { init().catch(() => {}) }, 3000)
+})
 
 async function init() {
-  bindFiles()
-  bindQueue()
-  bindPrivacy()
-  bindModels()
-  bindTabs()      // ДО ранних return'ов: таб-бар жив и кликабелен в пустой сессии
+  // Ретрай init() после сбоя /api/state НЕ должен вешать слушатели второй раз
+  // (двойной upload/queue-add, табы прыгают через один): bind* — строго однократно.
+  if (!st._bound) {
+    st._bound = true
+    bindFiles()
+    bindQueue()
+    bindPrivacy()
+    bindModels()
+    bindTabs()    // ДО ранних return'ов: таб-бар жив и кликабелен в пустой сессии
+  }
   checkHealth()   // A7: карточка «ffmpeg не найден» (не блокирует загрузку — fire-and-forget)
-  const s = await (await fetch('/api/state')).json()
+  let s
+  try { const r = await fetch('/api/state'); if (!r.ok) throw new Error('HTTP ' + r.status); s = await r.json() }
+  catch (e) { toast('Не удалось загрузить состояние: ' + e.message, 'error'); throw e }
   if (s.network) renderNetBadge(s.network)   // P2-#4: zero-upload badge from bootstrap
   if (s.no_session) {
     st.hasSession = false; st.curDir = s.start_dir
@@ -197,6 +227,12 @@ async function init() {
   // B5: статус LLM + сохранённые настройки детекции (для модалки ⚙ «Вырезов»)
   st.llmReady = s.llm_ready !== false
   st.detectOpts = s.detect_opts || null
+  // P4: сохранённые настройки запуска «Предложить монтаж» (cache/enrich_ui.json);
+  // тихий счётчик вкладки из компактной сводки (полный план — GET /api/enrich).
+  st.enrichOpts = s.enrich_opts || null
+  // ТРЕК-2 §2: SD-генерация настроена? — гейт warning-баннера в модалке монтажа.
+  st.imagegenReady = s.imagegen_ready === true
+  if (s.enrich && !s.enrich.stale) updateTabBadge('enrich', s.enrich.count || 0)
   // Cache-bust by session token so switching clips can never reuse a cached
   // /api/video (the bug where the new clip loaded but the OLD video played).
   const cb = s.v ? ('?v=' + encodeURIComponent(s.v)) : ''
@@ -222,12 +258,29 @@ async function init() {
   bindUI(); bindKeys()
   if (s.has_transcript) await loadData()
   loadClipsFromCache()   // F4: панель клипов из out/<stem>.clips.json — без LLM
+  loadEnrichFromCache()  // P4: вкладка «Монтаж» из out/<stem>.enrich.json — без LLM
+  if (s.has_transcript) { loadChaptersFromCache(); loadMetadataFromCache() }  // #36: восстановить Главы/Мета из кэша сервера (пусто без транскрипта)
   if (s.task && s.task.running) followTask(s.task.name)
+  // Задача завершилась, пока вкладка была перезагружена/усыплена — показать исход
+  // один раз. Клипы/enrich и Главы/Мета уже восстановлены из кэша выше (248-250);
+  // здесь остаётся рендер основного ролика (его ссылки иначе теряются) и
+  // терминальная ошибка. Сервер жив (иначе s.no_session → return на 201).
+  else if (s.task && s.task.done && !s.task.error && !s.task.cancelled && s.task.name === 'render' && s.task.results) {
+    showResults(s.task.results); toast('Рендер завершён', 'success')
+  }
+  else if (s.task && s.task.error && s.task.error !== 'cancelled' && !s.task.cancelled) {
+    toast('Прошлая задача завершилась с ошибкой: ' + s.task.error, 'error')
+  }
 
   video.addEventListener('timeupdate', () => { if (video.paused) onFrame() })
   video.addEventListener('seeked', onFrame)
   video.addEventListener('play', () => { $('#btnPlay').innerHTML = icon('pause'); cancelAnimationFrame(raf); raf = requestAnimationFrame(loop) })
-  video.addEventListener('pause', () => { $('#btnPlay').innerHTML = icon('play'); cancelAnimationFrame(raf); onFrame() })
+  video.addEventListener('pause', () => {
+    $('#btnPlay').innerHTML = icon('play'); cancelAnimationFrame(raf); onFrame()
+    // P4: пауза во время ▶-превью предложения (ручная или авто-стоп) снимает мокап
+    // и возвращает прежний режим «пропускать вырезы».
+    if (st._enrPreviewItem) enrichEndPreview()
+  })
 }
 
 const flash = (t) => { $('#cutSummary').textContent = t }
@@ -345,7 +398,9 @@ const refreshRegionColor = (id) => { const r = regionById.get(id), s = segOf(id)
 
 /* ---------- data ---------- */
 async function loadData() {
-  const tr = await (await fetch('/api/transcript')).json()
+  let tr
+  try { const r = await fetch('/api/transcript'); if (!r.ok) throw new Error('HTTP ' + r.status); tr = await r.json() }
+  catch (e) { toast('Не удалось загрузить транскрипт: ' + e.message, 'error'); return }
   // A6: тихий CPU-фоллбэк — бейдж «CPU» + один тост (device_used пишется в кэш
   // транскрипта; null у старых кэшей или до A6-бэкенда → ничего не показываем).
   updateCpuBadge(tr.device_used, tr.device_configured)
@@ -513,7 +568,7 @@ function stepperHTML(inFiles) {
     '<ol class="steps">' +
       `<li><span class="stepNum">1</span><span>${step1}</span></li>` +
       '<li><span class="stepNum">2</span><span>Нажмите «Транскрибировать» — речь превратится в текст (в первый раз скачается модель распознавания)</span></li>' +
-      '<li><span class="stepNum">3</span><span>Проверьте вырезы и нажмите «Рендер» — или нажмите «Авто-пак»: всё сделается само (вырезы, ролик и пак Shorts)</span></li>' +
+      '<li><span class="stepNum">3</span><span>Проверьте вырезы, во вкладке «Монтаж» при желании добавьте картинки и призывы по контексту, затем «Рендер» — или нажмите «Авто-пак»: всё сделается само (вырезы, ролик и пак Shorts)</span></li>' +
     '</ol>'
 }
 
@@ -780,17 +835,20 @@ function setSubsMode(on) {
 
 /* ---------- F2: главы (фоновая задача — LLM) ---------- */
 async function loadChapters() {
-  if (st.task) { toast('Дождись завершения задачи перед предпросмотром глав', 'info'); return }
-  let res
-  try { res = await fetch('/api/preview/chapters', { method: 'POST' }) }
-  catch (e) { toast('Сеть: не удалось запросить главы (' + e.message + ')', 'error'); return }
-  if (!res.ok) { await failToast(res, 'Не удалось запустить предпросмотр глав'); return }
-  let j; try { j = await res.json() } catch { j = {} }
-  if (j && j.ok === false && j.reason === 'llm_off') {
-    toast('LLM выключена — главы недоступны. Включи Ollama.', 'info'); return
-  }
-  // Задача запущена — следим по SSE (renderChapters вызовется в followTask).
-  followTask('preview_chapters')
+  if (st.task || st._starting) { toast('Дождись завершения задачи перед предпросмотром глав', 'info'); return }
+  st._starting = true
+  try {
+    let res
+    try { res = await fetch('/api/preview/chapters', { method: 'POST' }) }
+    catch (e) { toast('Сеть: не удалось запросить главы (' + e.message + ')', 'error'); return }
+    if (!res.ok) { await failToast(res, 'Не удалось запустить предпросмотр глав'); return }
+    let j; try { j = await res.json() } catch { j = {} }
+    if (j && j.ok === false && j.reason === 'llm_off') {
+      toast('LLM выключена — главы недоступны. Включи Ollama.', 'info'); return
+    }
+    // Задача запущена — следим по SSE (renderChapters вызовется в followTask).
+    followTask('preview_chapters')
+  } finally { st._starting = false }
 }
 // ---- Таб-бар правой колонки (Вырезы/Главы/Мета/Клипы) -----------------------
 // Панели смонтированы ВСЕГДА (contenteditable-правки меты и clipEls живут в
@@ -822,6 +880,11 @@ function setActiveTab(id) {
   activeTab = target.id
   if (focusLost) { const tb = document.getElementById(target.tab); if (tb) tb.focus() }
   try { localStorage.setItem(TAB_KEY, target.id) } catch {}
+  // P4: вкладка «Монтаж» стала видимой — дорисовать превью-кадры карточек,
+  // что не успели сгенерироваться, пока панель была display:none.
+  if (target.id === 'enrich') { if (typeof enrichObserveThumbs === 'function') enrichObserveThumbs() }
+  // Уход с «Монтажа» — закрыть открытое bulk-меню (иначе aria-expanded зависнет).
+  else if (typeof toggleEnrichBulkMenu === 'function') toggleEnrichBulkMenu(false)
 }
 
 // Бейдж вкладки: chapters/clips — счётчик (пуст при 0 → скрыт через :empty),
@@ -887,7 +950,7 @@ function bindTabs() {
   // WAI-ARIA Tabs: roving tabindex; ←/→ — automatic activation (данные уже в
   // st.*, переключение дёшево); Home/End — крайние; 1–4 — прямой переход.
   // stopPropagation обязателен: глобальный keydown иначе словит seek ±5с / play.
-  const TAB_HOTKEYS = { 1: 'cuts', 2: 'chapters', 3: 'meta', 4: 'clips' }
+  const TAB_HOTKEYS = { 1: 'cuts', 2: 'chapters', 3: 'meta', 4: 'clips', 5: 'enrich' }
   list.addEventListener('keydown', (e) => {
     const k = e.key
     let next = null
@@ -934,17 +997,20 @@ function renderChapters(chapters) {
 
 /* ---------- B: метаданные YouTube (фоновая задача — LLM) ---------- */
 async function loadMetadata() {
-  if (st.task) { toast('Дождись завершения задачи перед генерацией метаданных', 'info'); return }
-  let res
-  try { res = await fetch('/api/preview/metadata', { method: 'POST' }) }
-  catch (e) { toast('Сеть: не удалось запросить метаданные (' + e.message + ')', 'error'); return }
-  if (!res.ok) { await failToast(res, 'Не удалось запустить генерацию метаданных'); return }
-  let j; try { j = await res.json() } catch { j = {} }
-  if (j && j.ok === false && j.reason === 'llm_off') {
-    toast('LLM выключена — метаданные недоступны. Включи Ollama.', 'info'); return
-  }
-  // Задача запущена — следим по SSE (renderMetadata вызовется в followTask).
-  followTask('preview_metadata')
+  if (st.task || st._starting) { toast('Дождись завершения задачи перед генерацией метаданных', 'info'); return }
+  st._starting = true
+  try {
+    let res
+    try { res = await fetch('/api/preview/metadata', { method: 'POST' }) }
+    catch (e) { toast('Сеть: не удалось запросить метаданные (' + e.message + ')', 'error'); return }
+    if (!res.ok) { await failToast(res, 'Не удалось запустить генерацию метаданных'); return }
+    let j; try { j = await res.json() } catch { j = {} }
+    if (j && j.ok === false && j.reason === 'llm_off') {
+      toast('LLM выключена — метаданные недоступны. Включи Ollama.', 'info'); return
+    }
+    // Задача запущена — следим по SSE (renderMetadata вызовется в followTask).
+    followTask('preview_metadata')
+  } finally { st._starting = false }
 }
 function renderMetadata(meta) {
   meta = meta || {}
@@ -958,6 +1024,7 @@ function renderMetadata(meta) {
   set('#metaDesc', desc)
   set('#metaTags', tags)
   set('#metaHook', hook)
+  st.metaDirty = false   // #36: свежая генерация/восстановление — это не «несохранённая ручная правка»
   const len = $('#metaTitleLen')
   if (len) len.textContent = title ? `(${title.length}/100)` : ''
   updateTabBadge('meta', !!(title || desc || tags || hook))
@@ -1060,25 +1127,23 @@ function saveClipsOpts() {
 // false и сам, но шлём честно — контракт виден в запросе.
 function clipsRenderOpts() {
   const o = clipsOptsLoad()
-  const d = st.rdefaults || {}
-  const opts = {
-    ...currentRenderOpts(),
-    subtitles: false, chapters: false, metadata: false,
-    vertical: !!o.vertical,
-    denoise_loudnorm: !!d.denoise_loudnorm,
-    loudnorm_mode: d.loudnorm_mode === '2pass' ? '2pass' : 'dynamic',
-    out_dir: o.out_dir || st.outDir || '',
-  }
-  if (d.cut_fade != null) opts.cut_fade = d.cut_fade
+  if (!st._rSeeded) seedRenderModal()   // засеять поля модалки, если её не открывали (паттерн openAutopackModal)
+  const opts = collectRenderOpts()      // ЖИВЫЕ кодек/качество/цензура/громкость/cut_fade/шумоподавление из «Настроек рендера»
+  // Клипы — отдельный артефакт: без глав/меты/субтитр-сайдкаров, без
+  // мультиформатов основного видео/музыки/обогащения/имени файла (сервер их и
+  // так гасит для клипов — просто не шлём конфликтующие значения).
+  opts.subtitles = false; opts.chapters = false; opts.metadata = false
+  delete opts.formats; delete opts.music; delete opts.enrich; delete opts.filename
+  opts.vertical = !!o.vertical
+  opts.out_dir = o.out_dir || st.outDir || ''
   if (o.vertical) {
     opts.vertical_target = '1080x1920'
     opts.vertical_center = o.center === 'manual' ? o.center_pos : 'auto'
+    delete opts.scale_h   // vertical_target задаёт геометрию; лишний scale_h из модалки конфликтует
   }
   if (o.burn) {
     opts.burn_subtitles = true
-    // C1: стиль капшенов клипа = пресет, выбранный в настройках рендера
-    // (localStorage). «Свой» тут не воспроизводим — полей стиля в модалке
-    // клипов нет, так что честный фолбэк — серверные умолчания (как раньше).
+    // Стиль капшенов остаётся пресетом из модалки рендера (в модалке клипов полей стиля нет).
     const p = capPresetFind(capPresetSaved())
     opts.burn_style = p ? { ...p.style } : { karaoke: true }
   } else opts.burn_subtitles = false
@@ -1087,16 +1152,19 @@ function clipsRenderOpts() {
 
 // «Предложить клипы» — фоновая задача preview_clips (паттерн loadChapters).
 async function loadClips() {
-  if (st.task) { toast('Дождись завершения задачи перед подбором клипов', 'info'); return }
-  let res
-  try { res = await fetch('/api/clips/suggest', { method: 'POST' }) }
-  catch (e) { toast('Сеть: не удалось запросить клипы (' + e.message + ')', 'error'); return }
-  if (!res.ok) { await failToast(res, 'Не удалось запустить подбор клипов'); return }
-  let j; try { j = await res.json() } catch { j = {} }
-  if (j && j.ok === false && j.reason === 'llm_off') {
-    toast('LLM выключена — клипы недоступны. Включи Ollama (модель qwen3:8b).', 'info'); return
-  }
-  followTask('preview_clips')
+  if (st.task || st._starting) { toast('Дождись завершения задачи перед подбором клипов', 'info'); return }
+  st._starting = true
+  try {
+    let res
+    try { res = await fetch('/api/clips/suggest', { method: 'POST' }) }
+    catch (e) { toast('Сеть: не удалось запросить клипы (' + e.message + ')', 'error'); return }
+    if (!res.ok) { await failToast(res, 'Не удалось запустить подбор клипов'); return }
+    let j; try { j = await res.json() } catch { j = {} }
+    if (j && j.ok === false && j.reason === 'llm_off') {
+      toast('LLM выключена — клипы недоступны. Включи Ollama (модель qwen3:8b).', 'info'); return
+    }
+    followTask('preview_clips')
+  } finally { st._starting = false }
 }
 
 // Восстановление панели при открытии файла: GET /api/clips (кэш clips.json).
@@ -1106,6 +1174,23 @@ async function loadClipsFromCache() {
   try { const r = await fetch('/api/clips'); if (!r.ok) return; j = await r.json() } catch { return }
   // silent: кэш — не новость; тело + тихий счётчик, БЕЗ пульса/точки/переключения.
   if (j && Array.isArray(j.clips) && j.clips.length && !j.stale) renderClips(j.clips, { silent: true })
+}
+
+// #36: восстановление вкладок «Главы»/«Мета» при перезагрузке из персистентных
+// preview-файлов (GET /api/chapters, /api/metadata). Тихо: кэш — не новость.
+async function loadChaptersFromCache() {
+  try {
+    const r = await fetch('/api/chapters'); if (!r.ok) return
+    const j = await r.json()
+    if (j && Array.isArray(j.chapters) && j.chapters.length) renderChapters(j.chapters)
+  } catch {}
+}
+async function loadMetadataFromCache() {
+  try {
+    const r = await fetch('/api/metadata'); if (!r.ok) return
+    const j = await r.json()
+    if (j && j.metadata) renderMetadata(j.metadata)
+  } catch {}
 }
 
 function renderClips(clips, opts = {}) {
@@ -1467,24 +1552,27 @@ function updateClipsEff() {
 
 // «Рендерить выбранные (N)» → одна фоновая задача render_clips (план §2.4).
 async function clipsRender() {
-  if (st.task) { toast('Дождись завершения текущей задачи', 'info'); return }
+  if (st.task || st._starting) { toast('Дождись завершения текущей задачи', 'info'); return }
   const chosen = st.clipsData.filter((c) => st.clipsSel.has(String(c.id)))
   if (!chosen.length) { toast('Выбери хотя бы один клип — чекбокс на карточке', 'info'); return }
-  await save()   // сервер режет по своему live-катлисту — зафиксировать правки
-  const stem = ($('#filename').textContent || 'clip').replace(/\.[^.]+$/, '')
-  const body = {
-    clips: chosen.map((c, i) => ({
-      start: c.start, end: c.end,
-      filename: `${stem}_clip${String(i + 1).padStart(2, '0')}`,
-    })),
-    render_opts: clipsRenderOpts(),
-  }
-  st._clipsRenderIds = chosen.map((c) => String(c.id))
-  let res
-  try { res = await fetch('/api/clips/render', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }) }
-  catch (e) { toast('Сеть: не удалось запустить рендер клипов (' + e.message + ')', 'error'); return }
-  if (!res.ok) { await failToast(res, 'Не удалось запустить рендер клипов'); return }
-  followTask('render_clips')
+  st._starting = true
+  try {
+    await save()   // сервер режет по своему live-катлисту — зафиксировать правки
+    const stem = ($('#filename').textContent || 'clip').replace(/\.[^.]+$/, '')
+    const body = {
+      clips: chosen.map((c, i) => ({
+        start: c.start, end: c.end,
+        filename: `${stem}_clip${String(i + 1).padStart(2, '0')}`,
+      })),
+      render_opts: clipsRenderOpts(),
+    }
+    st._clipsRenderIds = chosen.map((c) => String(c.id))
+    let res
+    try { res = await fetch('/api/clips/render', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }) }
+    catch (e) { toast('Сеть: не удалось запустить рендер клипов (' + e.message + ')', 'error'); return }
+    if (!res.ok) { await failToast(res, 'Не удалось запустить рендер клипов'); return }
+    followTask('render_clips')
+  } finally { st._starting = false }
 }
 
 // Результаты render_clips → на карточки: ссылка на mp4 или текст ошибки.
@@ -1795,8 +1883,14 @@ function onSelectionChange() {
   if (hi < 0) { float.classList.add('hidden'); st.selRange = null; return }
   st.selRange = [lo, hi]
   const r = range.getBoundingClientRect()
-  float.style.left = (r.left + r.width / 2 - 45) + 'px'; float.style.top = (r.top - 42) + 'px'
-  float.classList.remove('hidden')
+  float.classList.remove('hidden')            // un-hide first so offsetWidth/Height are measurable
+  const fw = float.offsetWidth || 90, fh = float.offsetHeight || 34
+  let left = r.left + r.width / 2 - fw / 2
+  let top = r.top - fh - 8
+  if (top < 8) top = r.bottom + 8             // clipped above → flip below the selection
+  left = Math.max(8, Math.min(left, window.innerWidth - fw - 8))
+  top = Math.max(8, Math.min(top, window.innerHeight - fh - 8))
+  float.style.left = left + 'px'; float.style.top = top + 'px'
 }
 function cutSelection() {
   if (!st.selRange) return
@@ -1812,6 +1906,7 @@ function cutFromMarks() { if (st.inP == null || st.outP == null) { flash('Пос
 let editingSpan = null   // спан .w в режиме правки (null, если правки нет)
 
 function startWordEdit(sp) {
+  if (st.task) { toast('Идёт фоновая задача — правка текста будет доступна после её завершения', 'info'); return }
   if (editingSpan === sp) return
   if (editingSpan) cancelWordEdit(editingSpan)        // одна правка за раз
   const w = st.words[+sp.dataset.i]; if (!w) return
@@ -1904,6 +1999,14 @@ function onFrame() {
       st.preview = !!st._clipPrevPreview
       const sk = $('#skipCuts'); if (sk) sk.checked = st.preview
     }
+  }
+  // P4: ▶-превью предложения «Монтаж» — прогрессивное появление пунктов карточки
+  // по timeupdate, авто-стоп мокапа на конце окна и возврат прежнего «пропускать
+  // вырезы» (как у клипов).
+  if (st._enrPreviewItem) enrichUpdateOverlayKaraoke(t)
+  if (st._enrPreviewEnd != null && t >= st._enrPreviewEnd - 0.03) {
+    video.pause()
+    enrichEndPreview()
   }
   $('#tcCur').textContent = fmtcs(t)
   updatePlayhead(); highlight(t + st.syncOffset)
@@ -2007,7 +2110,7 @@ async function doSave() {
         st.dirty = true                                   // unsaved -> keep dirty
         let detail = 'HTTP ' + res.status
         try { const j = await res.json(); if (j && j.detail) detail = j.detail } catch {}
-        throw new Error(detail)
+        const err = new Error(detail); err.status = res.status; throw err
       }
     }
     st.saveError = false; clearSaveError()
@@ -2017,10 +2120,18 @@ async function doSave() {
       if (st.subsMode) loadSubtitles()   // правки сохранены → обновить реплики
     }
   } catch (e) {
-    st.saveError = true   // keep dirty
-    setSavePill('error', 'Не сохранено')
-    showSaveError('Не удалось сохранить правки: ' + e.message + '. Изменения не потеряны — повтор автоматически.')
-    clearTimeout(saveTimer); saveTimer = setTimeout(save, 2000)   // auto-retry
+    st.dirty = true; st.saveError = true   // keep dirty either way
+    if (e.status === 409) {
+      // Бэк отклоняет запись, пока идёт фоновая задача. Правки НЕ потеряны —
+      // авто-повтор допишет их после. Спокойный статус вместо красной ошибки.
+      setSavePill('saving', 'Отложено — идёт задача')
+      clearSaveError()
+      clearTimeout(saveTimer); saveTimer = setTimeout(save, 2000)
+    } else {
+      setSavePill('error', 'Не сохранено')
+      showSaveError('Не удалось сохранить правки: ' + e.message + '. Изменения не потеряны — повтор автоматически.')
+      clearTimeout(saveTimer); saveTimer = setTimeout(save, 2000)   // auto-retry
+    }
   } finally {
     st.saving = false; st.savingPromise = null
   }
@@ -2030,7 +2141,7 @@ async function doSave() {
 function setRunning(name) {
   st.task = name || null
   const busy = !!name
-  for (const id of ['#btnTranscribe', '#btnRedetect', '#btnRender', '#btnChaptersToggle', '#btnMetaGenerate', '#btnClipsSuggest', '#btnClipsRender', '#btnDetectApply', '#btnFillersSave']) { const b = $(id); if (b) b.disabled = busy }
+  for (const id of ['#btnTranscribe', '#btnRedetect', '#btnRender', '#btnChaptersToggle', '#btnMetaGenerate', '#btnClipsSuggest', '#btnClipsRender', '#btnDetectApply', '#btnFillersSave', '#btnEnrichSuggest']) { const b = $(id); if (b) b.disabled = busy }
   // C4: «Авто-пак» — отдельно от общего цикла: он дизейблится И занятой
   // задачей, И пустой сессией, а title всегда объясняет почему.
   const ap = $('#btnAutopack')
@@ -2050,31 +2161,76 @@ async function cancelTask() {
   catch (e) { toast('Сеть: не удалось отменить (' + e.message + ')', 'error') }
 }
 let taskStart = 0
+function taskLost() {
+  // Бэкенд умер/перезапустился в ходе задачи: гасим спиннер, разблокируем UI и
+  // показываем sticky-тост с подсказкой вместо замершего навсегда прогресс-бара.
+  if (es) { es.close(); es = null }
+  clearTimeout(st._sseWatch); st._sseWatch = 0
+  st._sseErrs = 0
+  $('#progress').classList.add('hidden'); $('#progress').classList.remove('indeterminate')
+  setRunning(null)
+  toast('Связь с задачей потеряна — возможно, сервер перезапустился. Обновите страницу.', 'error', { sticky: true })
+}
 function followTask(name) {
-  setRunning(name); taskStart = Date.now()
+  setRunning(name); taskStart = Date.now(); st._etaBase = null
   $('#progress').classList.remove('hidden'); $('#progress').classList.add('indeterminate')
-  setProgress(35, `${name}…`)
+  setProgress(35, `${TASK_RU[name] || name}…`)
   if (es) es.close()
+  st._sseErrs = 0
   es = new EventSource('/api/events')
-  es.onerror = () => { /* let EventSource auto-retry; final state arrives via message */ }
+  // Единая проверка «жива ли задача»: та же задача идёт — ждём дальше; исчезла
+  // — taskLost(); завершилась в момент сбоя — переоткрыть /api/events (отдаст
+  // финальный снимок). Зовут её и счётчик ошибок ES, и сторож молчания ниже.
+  const probeTask = () => {
+    st._sseErrs = 0
+    fetch('/api/state').then((r) => r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status))).then((s) => {
+      const t = s && s.task
+      if (s.no_session || !t || t.name !== name) { taskLost() }        // сессия/задача исчезла
+      else if (t.running) { armWatch() }                               // сервер жив, задача идёт — ждём
+      else { if (es) { es.close(); es = null }; clearTimeout(st._sseWatch); followTask(name) }
+    }).catch(() => taskLost())                                         // сам /api/state недоступен → сервер лёг
+  }
+  // Сторож молчания (20 с без message): фатально ЗАКРЫТЫЙ поток (reconnect
+  // словил не-200, например 409 после рестарта сервера — readyState=CLOSED,
+  // браузер больше НЕ ретраит) не даёт ни message, ни новых error — без
+  // таймера порог счётчика ошибок недостижим и UI зависал бы навсегда.
+  const armWatch = () => { clearTimeout(st._sseWatch); st._sseWatch = setTimeout(probeTask, 20000) }
+  armWatch()
+  es.onerror = () => {
+    // Разовые сбои — пусть EventSource переподключается сам; после нескольких
+    // подряд ошибок пробуем /api/state. Поток закрыт ФАТАЛЬНО (CLOSED) —
+    // onerror больше не повторится: пробуем сразу, не ждём порога.
+    st._sseErrs = (st._sseErrs || 0) + 1
+    if (es && es.readyState === EventSource.CLOSED) st._sseErrs = 3
+    if (st._sseErrs < 3) return
+    probeTask()
+  }
   es.onmessage = (ev) => {
+    st._sseErrs = 0
+    armWatch()
     let t; try { t = JSON.parse(ev.data) } catch { return }
     const pct = Math.max(0, Math.min(100, t.percent || 0))
     if (pct > 0) {
       $('#progress').classList.remove('indeterminate')
       setProgress(pct)
     }
-    // Simple ETA from percent over wall-clock.
+    // ETA из НАБЛЮДАЕМОГО темпа (Δ% с первого сообщения), а не от taskStart:
+    // после перезагрузки re-attach происходит на середине задачи, и elapsed
+    // от момента переподключения дал бы бессмысленный остаток.
+    if (st._etaBase == null && pct > 0 && pct < 100) st._etaBase = { pct, t: Date.now() }
     let eta = ''
-    if (pct >= 3 && pct < 100) {
-      const elapsed = (Date.now() - taskStart) / 1000
-      const remain = elapsed * (100 - pct) / pct
+    if (st._etaBase && pct > st._etaBase.pct && pct < 100) {
+      const dP = pct - st._etaBase.pct
+      const dT = (Date.now() - st._etaBase.t) / 1000
+      const remain = dT * (100 - pct) / dP
       // секунды при остатке <60с, иначе минуты — не «~1м» для 5 секунд
       if (remain >= 60) eta = `  · осталось ~${Math.round(remain / 60)}м`
       else if (remain > 1) eta = `  · осталось ~${Math.max(1, Math.round(remain))}с`
     }
-    setProgress(pct, `${t.stage || t.name || name || ''} ${Math.round(pct)}%${eta}`)
+    const label = t.stage || TASK_RU[t.name] || TASK_RU[name] || t.name || name || ''
+    setProgress(pct, `${label} ${Math.round(pct)}%${eta}`)
     if (!t.running) {
+      clearTimeout(st._sseWatch); st._sseWatch = 0
       es.close(); es = null; $('#progress').classList.add('hidden'); $('#progress').classList.remove('indeterminate')
       setRunning(null)
       if (t.error) {
@@ -2117,6 +2273,15 @@ function followTask(name) {
         applyClipRenderResults(rs)
         const ok = rs.filter((r) => r && r.ok).length
         toast(`Готово: ${ok}/${rs.length} клипов`, ok === rs.length ? 'success' : 'error')
+      }
+      // P4 — авто-обогащение: задача suggest завершилась → перечитать план с
+      // сервера (results несут items+params, но GET /api/enrich даёт ещё и
+      // stale/cutlist_changed — единый путь рендера ленты).
+      if (t.name === 'enrich') {
+        loadEnrichFromCache()
+        const n = t.results && t.results.enrich && Array.isArray(t.results.enrich.items)
+          ? t.results.enrich.items.length : 0
+        toast(n ? `Предложений монтажа: ${n}` : 'Подходящих мест для монтажа не нашлось', n ? 'success' : 'info')
       }
       // C4: Авто-пак завершён — обновить UI (транскрипт/вырезы/клипы могли
       // появиться в ходе задачи) и показать карточку-сводку с ссылками.
@@ -2387,8 +2552,12 @@ async function reloadCutlist() {
 const QUAL_DEFAULT = { nvenc: 19, x264: 17 }
 function qualLabel(encoder) { return encoder === 'x264' ? 'CRF' : 'QP' }
 function seedQuality(encoder, q) {
-  const val = (q != null) ? q : (QUAL_DEFAULT[encoder] != null ? QUAL_DEFAULT[encoder] : 19)
-  $('#rQuality').value = val
+  const d = st.rdefaults || {}
+  const cfgQ = (encoder === 'x264') ? d.quality_x264 : d.quality_nvenc
+  let val = (q != null) ? q : (cfgQ != null ? cfgQ : (QUAL_DEFAULT[encoder] != null ? QUAL_DEFAULT[encoder] : 19))
+  const el = $('#rQuality'); const lo = +el.min || 14, hi = +el.max || 30
+  val = Math.max(lo, Math.min(hi, val))
+  el.value = val
   $('#rQualVal').textContent = `${qualLabel(encoder)} ${val}`
 }
 
@@ -2438,13 +2607,13 @@ function seedRenderModal() {
   const d = st.rdefaults || {}, m = st.media || {}
   const enc = d.encoder || 'nvenc'
   $('#rEncoder').value = enc
-  seedQuality(enc, (d.quality != null) ? d.quality : null)
+  seedQuality(enc, null)
   $('#rAudio').value = d.audio_bitrate || '320k'
   $('#rCensor').value = d.censor_method || 'partial'
   $('#rScale').options[0].textContent = `Как у источника (${m.width || '?'}×${m.height || '?'})`
   $('#rFps').options[0].textContent = `Как у источника (${m.fps ? Math.round(m.fps) : '?'})`
   $('#rScale').value = ''; $('#rFps').value = ''
-  $('#rSubs').checked = true; $('#rChapters').checked = true
+  $('#rSubs').checked = d.subtitles !== false; $('#rChapters').checked = d.chapters !== false
   if ($('#rBurn')) {
     $('#rBurn').checked = false
     $('#rBurnOpts').classList.add('hidden')
@@ -2501,6 +2670,12 @@ function seedRenderModal() {
     exBtn.disabled = !hasCuts
     exBtn.title = hasCuts ? '' : 'Сначала сделай хотя бы один вырез'
   }
+  // P4: обогащение — по умолчанию включено, если есть применимые предложения.
+  if ($('#rEnrich')) {
+    const n = enrichRenderable()
+    $('#rEnrich').checked = n > 0
+    updateEnrichRenderCheckbox()
+  }
   $('#rOutDir').value = st.outDir || ''
   $('#rFilename').value = ($('#filename').textContent || 'output').replace(/\.[^.]+$/, '')
   st._rSeeded = true
@@ -2508,7 +2683,15 @@ function seedRenderModal() {
 
 function openRenderModal() {
   if (!st.hasSession) return
-  seedRenderModal()
+  // Сеем поля ОДИН раз за сессию (st._rSeeded), чтобы правки юзера (кодек/шум/…)
+  // переживали переоткрытие. На повторных открытиях освежаем только
+  // per-file/динамику: имя файла, папку вывода и доступность обогащения.
+  if (!st._rSeeded) seedRenderModal()
+  else {
+    $('#rFilename').value = ($('#filename').textContent || 'output').replace(/\.[^.]+$/, '')
+    $('#rOutDir').value = st.outDir || ''
+    updateEnrichRenderCheckbox()
+  }
   openOverlay('#renderModal')
 }
 
@@ -2758,6 +2941,9 @@ function collectRenderOpts() {
     out_dir: $('#rOutDir').value.trim(),
     filename: $('#rFilename').value.trim(),
   }
+  // P4: обогащение — контракт как у music: ключ enrich.enabled (дефолт «нет
+  // ключа = выключено» на сервере). Шлём только если чекбокс отмечен.
+  if ($('#rEnrich') && $('#rEnrich').checked) opts.enrich = { enabled: true }
   if (opts.denoise) {
     opts.denoise_strength = parseInt($('#rDenoiseStrength').value, 10)
     opts.denoise_normalize = !!($('#rDenoiseNorm') && $('#rDenoiseNorm').checked)
@@ -2881,6 +3067,19 @@ function openAutopackModal() {
   if (cb) cb.parentElement.title = st.llmReady
     ? 'Локальная LLM подберёт лучшие фрагменты и отрендерит топ-K вертикальных клипов'
     : 'ИИ выключен (Ollama не найдена) — новые клипы не предложатся; уже подобранный список (если есть) отрендерится'
+  // P4: автопак применяет СУЩЕСТВУЮЩИЙ план обогащения (детекторы он не зовёт).
+  // Нет плана / он от другого видео → чекбокс бессмыслен: гасим и объясняем.
+  const enCb = $('#apEnrich'), enHint = $('#apEnrichHint')
+  const hasPlan = st.enrichItems.length > 0 && !st.enrichStale
+  if (enCb) {
+    enCb.disabled = !hasPlan
+    if (!hasPlan) enCb.checked = false
+  }
+  if (enHint) {
+    enHint.textContent = hasPlan
+      ? 'В основной ролик попадут уверенные предложения (оценка ≥ 70) из вкладки «Монтаж» — без ручного ревью.'
+      : 'Сначала во вкладке «Монтаж» нажмите «Предложить монтаж» — автопак применит уже готовый план (оценка ≥ 70).'
+  }
   openOverlay('#autopackModal')
 }
 
@@ -2895,6 +3094,10 @@ async function submitAutopack() {
     top_k: k,
     formats: (() => { const l = apFormatsCollect(); return l.length ? l : ['source'] })(),
     clips: !!($('#apClips') && $('#apClips').checked),
+    // P4: обогащение в автопаке — применяются ТОЛЬКО прошедшие планировщик
+    // предложения со score≥70 из СУЩЕСТВУЮЩЕГО свежего плана (сервер сам
+    // отсекает несвежий/отсутствующий план — стадия просто пропускается).
+    enrich: !!($('#apEnrich') && $('#apEnrich').checked),
     render_opts: ro,
   }
   closeOverlay('#autopackModal')
@@ -2923,6 +3126,7 @@ async function autopackRefresh() {
     await reloadCutlist()  // катлист был пуст → его достроила детекция
   }
   loadClipsFromCache()     // карточки панели «Клипы» из свежего clips.json
+  loadEnrichFromCache()    // P4: вкладка «Монтаж» — автопак мог наполнить enrich.json
 }
 
 // Карточка-сводка результатов Авто-пака (в общем оверлее #results):
@@ -2977,9 +3181,1031 @@ function showAutopackResults(res, stopped) {
   $('#btnCloseResults').onclick = () => closeOverlay('#results')
 }
 
+/* ==================================================================
+   P4 — авто-обогащение: вкладка «Монтаж» (ENRICH_PLAN §6)
+   ИИ ПРЕДЛАГАЕТ — юзер видит карточки и решает — только потом рендер.
+   Данные в ОРИГИНАЛЬНЫХ координатах (как clips/cuts). Правки → POST
+   /api/enrich/save (debounce). Превью ДО рендера — честный CSS-мокап.
+   ================================================================== */
+
+// Цвет-коды типов (расширение палитры вырезов, L*≈55, .dot/.badge):
+// --enr_image циан, --enr_anim зелёный, --enr_list фиолет, --enr_cta красно-оранж.
+const ENR_GROUP = (t) => (t === 'image' ? 'image'
+  : t === 'animation' ? 'animation'
+  : t === 'list_card' ? 'list_card' : 'cta')   // cta_subscribe/cta_like/cta_comment → cta
+const ENR_GROUP_CLASS = { image: 'enrImage', animation: 'enrAnim', list_card: 'enrList', cta: 'enrCta' }
+const ENR_GROUP_RU = { image: 'Картинки', animation: 'Анимации', list_card: 'Карточки', cta: 'Призывы' }
+const ENR_GROUP_ORDER = ['list_card', 'image', 'animation', 'cta']   // приоритет card>cta>image (R5) — но карточки читаются первыми
+const ENR_TYPE_RU = {
+  image: 'картинка', animation: 'анимация', list_card: 'карточка',
+  cta_subscribe: 'подписка', cta_like: 'лайк', cta_comment: 'комментарий',
+}
+const ENR_STATUS_RU = {
+  in_cut: 'Попадает в вырез — выключено (верните вырез, чтобы показать)',
+  conflict: 'Пересекается с другим предложением — выключено (приоритет)',
+  off_limits: 'Вне допустимой зоны (первые 30 с / последние 20 с / лимит плотности)',
+}
+const ENR_DENSITY_RU = { min: 'минимум', normal: 'норма', aggressive: 'агрессивно' }
+const enrIsCta = (t) => t === 'cta_subscribe' || t === 'cta_like' || t === 'cta_comment'
+
+// Восстановление вкладки при открытии файла: GET /api/enrich (кэш enrich.json).
+async function loadEnrichFromCache() {
+  let j
+  try { const r = await fetch('/api/enrich'); if (!r.ok) return; j = await r.json() } catch { return }
+  applyEnrichResponse(j || {}, { silent: true })
+}
+
+// Единый путь приёма ответа GET /api/enrich (после suggest, автопака, открытия).
+function applyEnrichResponse(j, opts = {}) {
+  st.enrichStale = !!j.stale
+  st.enrichCutlistChanged = !!j.cutlist_changed
+  st.enrichParams = j.params || st.enrichParams
+  st.enrichItems = (Array.isArray(j.items) ? j.items : []).filter((it) => it && it.id)
+  // Активная карточка переживает пере-рендер, но не исчезновение из набора.
+  if (st.enrichActive && !st.enrichItems.some((it) => it.id === st.enrichActive)) st.enrichActive = null
+  renderEnrich(opts)
+}
+
+// Счётчик «включённых» предложений (бейдж вкладки + чекбокс рендера).
+function enrichEnabledCount() { return st.enrichItems.filter((it) => it.enabled).length }
+function enrichRenderable() {
+  // Включённое предложение реально пойдёт в рендер только если планировщик не
+  // отклонил его (status ok). Это и есть честное «N включённых».
+  return st.enrichItems.filter((it) => it.enabled && (it.status === 'ok' || !it.status)).length
+}
+
+function renderEnrich(opts = {}) {
+  const box = $('#enrichList'); if (!box) return
+  const count = st.enrichItems.length
+  updateTabBadge('enrich', enrichEnabledCount())
+  if (!opts.silent && count) notifyTab('enrich')
+  updateEnrichRenderCheckbox()
+  updateEnrichTrack()
+  // Шапка: счётчик «Включено N из M» + баннер «вырезы изменились».
+  const cnt = $('#enrichCount')
+  if (cnt) cnt.textContent = count ? `Включено ${enrichEnabledCount()} из ${count}` : ''
+  const banner = $('#enrichStaleBanner')
+  if (banner) banner.classList.toggle('hidden', !st.enrichCutlistChanged || !count)
+
+  if (!count) {
+    $('#enrichFilters').classList.add('hidden')
+    $('#enrichBulkMenu').classList.add('hidden')
+    box.replaceChildren()
+    const ph = document.createElement('div'); ph.className = 'empty placeholder'
+    const msg = st.enrichStale
+      ? 'План относится к другому видео — нажмите «Предложить монтаж» заново'
+      : 'Нажмите «Предложить монтаж» — ИИ найдёт места для картинок, карточек-перечислений и призывов по контексту речи'
+    ph.innerHTML = icon('sparkles') + '<div>' + escapeHtml(msg) + '</div>'
+    box.appendChild(ph)
+    return
+  }
+  renderEnrichFilters()
+  // Группировка по типу + фильтр. Внутри группы — по времени.
+  const visible = st.enrichItems
+    .filter((it) => st.enrichFilter === 'all' || ENR_GROUP(it.type) === st.enrichFilter)
+    .slice().sort((a, b) => (a.t_start || 0) - (b.t_start || 0))
+  box.replaceChildren()
+  if (!visible.length) {
+    const ph = document.createElement('div'); ph.className = 'empty placeholder'
+    ph.innerHTML = icon('sparkles') + '<div>Нет предложений этого типа</div>'
+    box.appendChild(ph); return
+  }
+  // Если фильтр «Все» — группируем заголовками; иначе плоский список.
+  if (st.enrichFilter === 'all') {
+    for (const g of ENR_GROUP_ORDER) {
+      const items = visible.filter((it) => ENR_GROUP(it.type) === g)
+      if (!items.length) continue
+      const h = document.createElement('div'); h.className = 'enrGroupHead'
+      h.innerHTML = `<i class="dot ${ENR_GROUP_CLASS[g]}"></i>${escapeHtml(ENR_GROUP_RU[g])} <span class="muted">${items.length}</span>`
+      box.appendChild(h)
+      for (const it of items) box.appendChild(enrichCard(it))
+    }
+  } else {
+    for (const it of visible) box.appendChild(enrichCard(it))
+  }
+  // Перевесить ленивый грабер кадров (превью у карточек).
+  enrichObserveThumbs()
+}
+
+// Фильтр-чипы с counts («Картинки 5 · Карточки 3 · CTA 2»).
+function renderEnrichFilters() {
+  const box = $('#enrichFilters'); if (!box) return
+  box.classList.remove('hidden')
+  box.replaceChildren()
+  const counts = { image: 0, animation: 0, list_card: 0, cta: 0 }
+  for (const it of st.enrichItems) counts[ENR_GROUP(it.type)]++
+  const mk = (key, label, n, cls) => {
+    const b = document.createElement('button')
+    b.type = 'button'; b.className = 'enrChip' + (st.enrichFilter === key ? ' active' : '') + (cls ? ' ' + cls : '')
+    b.setAttribute('aria-pressed', String(st.enrichFilter === key))
+    b.innerHTML = (cls ? `<i class="dot ${cls}"></i>` : '') + `${escapeHtml(label)} <span class="enrChipN">${n}</span>`
+    b.onclick = () => { st.enrichFilter = key; renderEnrich({ silent: true }) }
+    box.appendChild(b)
+  }
+  mk('all', 'Все', st.enrichItems.length, '')
+  for (const g of ['image', 'animation', 'list_card', 'cta']) {
+    if (counts[g]) mk(g, ENR_GROUP_RU[g], counts[g], ENR_GROUP_CLASS[g])
+  }
+}
+
+// --- ленивый грабер кадров видео для превью карточек -------------------------
+// Один offscreen <video>+<canvas>, серийный seek по очереди видимых превью.
+// Дёшево (один декодер), не дёргает основной плеер.
+let enrThumbVideo = null, enrThumbCanvas = null, enrThumbObs = null
+const enrThumbQueue = []
+let enrThumbBusy = false
+function enrThumbInit() {
+  if (enrThumbVideo) return
+  enrThumbVideo = document.createElement('video')
+  enrThumbVideo.preload = 'auto'; enrThumbVideo.muted = true
+  enrThumbVideo.crossOrigin = 'anonymous'
+  enrThumbVideo.src = '/api/video' + (st.cb || '')
+  enrThumbCanvas = document.createElement('canvas')
+}
+function enrThumbObserve(el, t) {
+  if (!enrThumbObs) {
+    enrThumbObs = new IntersectionObserver((entries) => {
+      for (const en of entries) {
+        if (en.isIntersecting) {
+          enrThumbObs.unobserve(en.target)
+          enrThumbQueue.push(en.target)
+          enrThumbPump()
+        }
+      }
+    }, { root: $('#enrichList'), rootMargin: '120px' })
+  }
+  el.dataset.t = String(t)
+  enrThumbObs.observe(el)
+}
+function enrichObserveThumbs() {
+  // карточки уже создали свои .enrThumb с data-t; (re-)наблюдаем нерисованные.
+  const box = $('#enrichList'); if (!box) return
+  for (const el of box.querySelectorAll('.enrThumb:not(.drawn)')) {
+    enrThumbObserve(el, parseFloat(el.dataset.t) || 0)
+  }
+}
+function enrThumbPump() {
+  if (enrThumbBusy || !enrThumbQueue.length) return
+  const el = enrThumbQueue.shift()
+  if (!el || !document.contains(el) || el.classList.contains('drawn')) { enrThumbPump(); return }
+  enrThumbInit()
+  enrThumbBusy = true
+  const t = Math.max(0, Math.min(parseFloat(el.dataset.t) || 0, st.duration - 0.1))
+  const done = (ok) => {
+    enrThumbVideo.removeEventListener('seeked', onSeek)
+    enrThumbVideo.removeEventListener('error', onErr)
+    if (ok) {
+      try {
+        const vw = enrThumbVideo.videoWidth || 320, vh = enrThumbVideo.videoHeight || 180
+        enrThumbCanvas.width = 160; enrThumbCanvas.height = Math.max(1, Math.round(160 * vh / vw))
+        const cx = enrThumbCanvas.getContext('2d')
+        cx.drawImage(enrThumbVideo, 0, 0, enrThumbCanvas.width, enrThumbCanvas.height)
+        el.style.backgroundImage = `url(${enrThumbCanvas.toDataURL('image/jpeg', 0.7)})`
+        el.classList.add('drawn')
+      } catch { /* CORS/decoder — оставляем тёмный плейсхолдер */ el.classList.add('drawn') }
+    }
+    enrThumbBusy = false
+    enrThumbPump()
+  }
+  const onSeek = () => done(true)
+  const onErr = () => done(false)
+  enrThumbVideo.addEventListener('seeked', onSeek, { once: true })
+  enrThumbVideo.addEventListener('error', onErr, { once: true })
+  try {
+    if (enrThumbVideo.readyState < 1) {
+      enrThumbVideo.addEventListener('loadedmetadata', () => { try { enrThumbVideo.currentTime = t } catch { done(false) } }, { once: true })
+    } else { enrThumbVideo.currentTime = t }
+  } catch { done(false) }
+}
+
+// Карточка предложения (гибрид clipCard + cut-row): слева СТРИП кандидатов
+// (реальные мини-превью), справа бейдж типа, таймкод, цитата, «почему», score,
+// контролы. CSS-мокап удалён — превью только из реальных ассетов движков.
+function enrichCard(it) {
+  const g = ENR_GROUP(it.type)
+  const cls = ENR_GROUP_CLASS[g]
+  const score = Math.max(0, Math.min(100, Math.round(it.score || 0)))
+  const row = document.createElement('div')
+  row.className = 'enr-row ' + cls + (it.enabled ? '' : ' off') + (st.enrichActive === it.id ? ' sel' : '')
+  row.dataset.id = it.id
+
+  // --- слева: стрип кандидатов (РЕАЛЬНЫЕ мини-превью, не CSS-мокап) ---
+  const prevWrap = enrichCandStrip(it)
+
+  // --- справа: метаданные ---
+  const meta = document.createElement('div'); meta.className = 'enrMeta'
+  const top = document.createElement('div'); top.className = 'enrTop'
+  const badge = document.createElement('span'); badge.className = 'badge ' + cls
+  badge.textContent = ENR_TYPE_RU[it.type] || it.type
+  const tc = document.createElement('span'); tc.className = 'enrTc'
+  tc.textContent = `${fmt(it.t_start)}–${fmt(it.t_end)}`
+  top.appendChild(badge); top.appendChild(tc)
+  if (it.source === 'user') { const b = document.createElement('span'); b.className = 'enrFlag'; b.textContent = 'вручную'; top.appendChild(b) }
+  if (it.edited) { const b = document.createElement('span'); b.className = 'enrFlag edited'; b.textContent = 'изменено'; top.appendChild(b) }
+  meta.appendChild(top)
+
+  // Цитата-якорь (триггер-фраза из транскрипта).
+  if (it.quote) {
+    const q = document.createElement('div'); q.className = 'enrQuote'
+    q.textContent = '«' + it.quote + '»'
+    q.title = 'Триггер-фраза в речи'
+    meta.appendChild(q)
+  }
+  // Строка «почему» от LLM.
+  if (it.reason) {
+    const r = document.createElement('div'); r.className = 'enrReason'
+    r.textContent = it.reason
+    meta.appendChild(r)
+  }
+  // score-полоса.
+  const sb = document.createElement('div'); sb.className = 'scoreBar ' + cls; sb.title = `Уверенность: ${score}/100`
+  const fill = document.createElement('i'); fill.style.width = score + '%'; sb.appendChild(fill)
+  meta.appendChild(sb)
+
+  // Inline-предупреждение из status / status_note.
+  if (it.status && it.status !== 'ok') {
+    const warn = document.createElement('div'); warn.className = 'enrWarn'
+    warn.innerHTML = icon('info') + '<span></span>'
+    warn.querySelector('span').textContent = it.status_note || ENR_STATUS_RU[it.status] || 'Предложение отклонено планировщиком'
+    meta.appendChild(warn)
+  } else if (st.enrichCutlistChanged) {
+    const warn = document.createElement('div'); warn.className = 'enrWarn soft'
+    warn.innerHTML = icon('info') + '<span>Вырезы изменились после анализа — позиция могла сместиться</span>'
+    meta.appendChild(warn)
+  }
+
+  // Редакторы по типу (list_card — пункты, cta_comment — вопрос, image — ассет).
+  const ed = enrichEditors(it)
+  if (ed) meta.appendChild(ed)
+
+  // --- контролы ---
+  const acts = document.createElement('div'); acts.className = 'enrActs'
+  // тоггл вкл/выкл
+  const tgl = document.createElement('label'); tgl.className = 'enrTgl'
+  const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = !!it.enabled
+  cb.setAttribute('aria-label', 'Включить предложение в рендер')
+  cb.onclick = (e) => e.stopPropagation()
+  cb.onchange = () => enrichSetEnabled(it.id, cb.checked)
+  const tglv = document.createElement('span'); tglv.className = 'tgl'
+  tgl.appendChild(cb); tgl.appendChild(tglv)
+  acts.appendChild(tgl)
+  // ▶ превью
+  const play = document.createElement('button'); play.className = 'enrBtn'
+  play.innerHTML = icon('play'); play.title = 'Превью поверх плеера'; play.setAttribute('aria-label', 'Превью предложения')
+  play.onclick = (e) => { e.stopPropagation(); enrichPreview(it) }
+  acts.appendChild(play)
+  // ±0.5 c сдвиг
+  const minus = document.createElement('button'); minus.className = 'enrBtn'
+  minus.innerHTML = icon('prev-cut'); minus.title = 'Сдвинуть на −0.5 c'; minus.setAttribute('aria-label', 'Раньше на 0.5 секунды')
+  minus.onclick = (e) => { e.stopPropagation(); enrichShift(it.id, -0.5) }
+  const plus = document.createElement('button'); plus.className = 'enrBtn'
+  plus.innerHTML = icon('next-cut'); plus.title = 'Сдвинуть на +0.5 c'; plus.setAttribute('aria-label', 'Позже на 0.5 секунды')
+  plus.onclick = (e) => { e.stopPropagation(); enrichShift(it.id, +0.5) }
+  acts.appendChild(minus); acts.appendChild(plus)
+
+  row.appendChild(prevWrap); row.appendChild(meta); row.appendChild(acts)
+  row.onclick = () => enrichSetActive(it.id)
+  return row
+}
+
+/* ==================================================================
+   ТРЕК-2 V2 (§3, §6) — кандидаты + ЧЕСТНОЕ превью.
+   CSS-мокап удалён («конец лажи»): превью карточки = РЕАЛЬНЫЙ кадр.
+   - schematic: PNG от headless-Chromium (visual.candidates[].preview);
+   - diffusion: реальный SD-PNG (visual.candidates[].preview);
+   - нет ассета (none) — честная пустая плитка «нечего иллюстрировать»,
+     лучше пусто, чем слоп.
+   Источник кандидатов: payload.visual (новая схема §6). Если бэкенд ещё
+   не отдаёт visual — клиент строит «шим» из плоского payload, чтобы
+   старые планы рендерились как раньше (аддитивная совместимость).
+   ================================================================== */
+
+// Подписи источника визуала (честная подпись «схема/фото/сток/нет»).
+const ENR_SRC_RU = {
+  schematic: 'схема', diffusion: 'фото (ИИ)', stock: 'сток',
+  kinetic: 'текст', icon: 'значок', none: 'нет',
+}
+// Темы схематического движка (§2.4): подпись + дефолтный порядок миниатюр.
+const ENR_THEMES = ['minimal', 'neon', 'business', 'whiteboard']
+const ENR_THEME_RU = { minimal: 'minimal', neon: 'neon', business: 'business', whiteboard: 'whiteboard' }
+// Тип схемы (intent) → русская подпись (таксономия §2.3).
+const ENR_INTENT_RU = {
+  stat: 'статистика', tree: 'дерево', list: 'список', timeline: 'таймлайн',
+  compare: 'сравнение', process: 'шаги', quote: 'цитата', code: 'код',
+  map: 'карта', callout: 'выноска',
+}
+
+// Нормализованный объект visual для предложения. Источник правды — ПЛОСКАЯ схема
+// бэкенда: payload.candidates[] + payload.selected (ImagePayload.to_dict). Каждый
+// кандидат: {source, style, preview, intent, …}. Плоские source/schematic_style —
+// фолбэк для старых планов без candidates (тогда строим шим из asset_kind/path,
+// БЕЗ выдумывания превью: candidate только при реальном готовом ассете).
+function enrichVisual(it) {
+  const p = it.payload || {}
+  if (Array.isArray(p.candidates) && p.candidates.length) {
+    // Кандидатов без готового ассета фильтруем, но ПОМНИМ их исходные индексы
+    // (orig_indices): p.selected и POST /api/enrich/select живут в индексах
+    // НЕфильтрованного серверного массива (в нём всегда есть none-кандидат без
+    // превью) — слать/читать фильтрованный индекс = молча выбрать соседа.
+    const cands = []
+    const origIdx = []
+    p.candidates.forEach((c, i) => { if (c && (c.preview || c.asset_path)) { cands.push(c); origIdx.push(i) } })
+    const want = Number.isInteger(p.selected) ? p.selected : 0
+    // Серверный индекс → локальный; если выбранный сервером кандидат без
+    // ассета (отфильтрован) — подсвечиваем первый доступный.
+    const sel = Math.max(0, origIdx.indexOf(want))
+    const chosenC = cands[sel] || {}
+    return {
+      source: chosenC.source || p.source || 'none',
+      intent: chosenC.intent || p.intent || null,
+      candidates: cands,
+      orig_indices: origIdx,
+      chosen: sel,
+      schematic_style: chosenC.style || p.schematic_style || null,
+    }
+  }
+  // --- шим из плоского payload (asset_kind/asset_path) ---
+  let source = 'none'
+  if (p.asset_kind === 'generate') source = 'diffusion'
+  else if (p.asset_kind === 'user') source = 'stock'
+  else if (p.asset_kind === 'emoji') source = 'icon'
+  const cands = []
+  if (p.asset_path && (p.asset_kind === 'generate' || p.asset_kind === 'user')) {
+    cands.push({ source, preview: p.asset_path })
+  }
+  return { source, intent: null, candidates: cands, orig_indices: cands.map((_, i) => i), chosen: 0, schematic_style: p.schematic_style || null }
+}
+
+// Превью-URL кандидата → src для <img>. Бэкенд кладёт относительное имя ассета,
+// которое отдаёт /api/output (как у клипов/рендера). Абсолютные http(s)/data —
+// как есть; иначе — через /api/output/<basename>.
+function enrichPreviewSrc(preview) {
+  if (!preview) return ''
+  const s = String(preview)
+  if (/^(https?:|data:|blob:|\/api\/)/i.test(s)) return s
+  const base = s.split(/[\\/]/).pop()
+  return '/api/output/' + encodeURIComponent(base) + (st.cb || '')
+}
+
+// Стрип кандидатов слева в карточке: мини-превью 2-4 вариантов (РЕАЛЬНЫЕ PNG),
+// листание ←/→, клик = выбор (chosen), подпись источника + (для схемы) тип.
+function enrichCandStrip(it) {
+  const v = enrichVisual(it)
+  const wrap = document.createElement('div'); wrap.className = 'enrPrev'
+  const stripBox = document.createElement('div'); stripBox.className = 'enrStrip'
+
+  if (!v.candidates.length) {
+    // Честно пусто: нет готового ассета. Для schematic/diffusion с ещё не
+    // отрендеренными кандидатами показываем «кадр из видео» как контекст-фон +
+    // подпись, что вариант ещё не готов. Для none — «нечего иллюстрировать».
+    const tile = document.createElement('div'); tile.className = 'enrCandTile empty'
+    if (v.source === 'none') {
+      tile.classList.add('none')
+      tile.innerHTML = '<div class="enrCandNone">' + icon('image') + '<span>нечего иллюстрировать</span></div>'
+    } else {
+      // кадр видео как контекст (ленивый грабер), подпись «вариант не готов».
+      const f = document.createElement('div'); f.className = 'enrThumb'; f.dataset.t = String(it.t_start || 0)
+      tile.appendChild(f)
+      const note = document.createElement('span'); note.className = 'enrCandPending'; note.textContent = 'вариант не готов'
+      tile.appendChild(note)
+    }
+    stripBox.appendChild(tile)
+    wrap.appendChild(stripBox)
+    wrap.appendChild(enrichSrcCaption(it, v))
+    return wrap
+  }
+
+  // Окно из ≤2 видимых превью + кнопки листания, если кандидатов больше.
+  const VIS = 2
+  const n = v.candidates.length
+  let page = st.enrichCandPage[it.id]
+  if (!Number.isInteger(page)) page = Math.max(0, Math.min(v.chosen, Math.max(0, n - VIS)))
+  page = Math.max(0, Math.min(page, Math.max(0, n - VIS)))
+  st.enrichCandPage[it.id] = page
+
+  const row = document.createElement('div'); row.className = 'enrCandRow'
+  if (n > VIS) {
+    const prev = document.createElement('button'); prev.className = 'enrCandNav'
+    prev.innerHTML = icon('prev-cut'); prev.title = 'Предыдущие варианты'; prev.setAttribute('aria-label', 'Предыдущие варианты')
+    prev.disabled = page <= 0
+    prev.onclick = (e) => { e.stopPropagation(); st.enrichCandPage[it.id] = Math.max(0, page - 1); renderEnrich({ silent: true }) }
+    row.appendChild(prev)
+  }
+  const list = document.createElement('div'); list.className = 'enrCandList'
+  for (let i = page; i < Math.min(n, page + VIS); i++) {
+    list.appendChild(enrichCandTile(it, v, i))
+  }
+  row.appendChild(list)
+  if (n > VIS) {
+    const next = document.createElement('button'); next.className = 'enrCandNav'
+    next.innerHTML = icon('next-cut'); next.title = 'Следующие варианты'; next.setAttribute('aria-label', 'Следующие варианты')
+    next.disabled = page >= n - VIS
+    next.onclick = (e) => { e.stopPropagation(); st.enrichCandPage[it.id] = Math.min(n - VIS, page + 1); renderEnrich({ silent: true }) }
+    row.appendChild(next)
+  }
+  stripBox.appendChild(row)
+  // Счётчик «вариант k/n».
+  if (n > 1) {
+    const cnt = document.createElement('div'); cnt.className = 'enrCandCount muted'
+    cnt.textContent = `вариант ${v.chosen + 1}/${n}`
+    stripBox.appendChild(cnt)
+  }
+  wrap.appendChild(stripBox)
+  wrap.appendChild(enrichSrcCaption(it, v))
+  return wrap
+}
+
+// Одна плитка кандидата: РЕАЛЬНЫЙ <img> превью, рамка-выбор у chosen, клик = выбор.
+function enrichCandTile(it, v, idx) {
+  const c = v.candidates[idx] || {}
+  const tile = document.createElement('button'); tile.type = 'button'
+  tile.className = 'enrCandTile' + (idx === v.chosen ? ' chosen' : '')
+  tile.setAttribute('aria-pressed', String(idx === v.chosen))
+  const src = enrichPreviewSrc(c.preview || c.asset_path)
+  if (src) {
+    const img = document.createElement('img'); img.className = 'enrCandImg'; img.loading = 'lazy'
+    img.alt = (c.source === 'schematic' ? (ENR_THEME_RU[c.style] || 'схема') : 'вариант ' + (idx + 1))
+    img.src = src
+    // Битый/неотданный ассет — честный плейсхолдер, без молчаливой «дыры».
+    img.onerror = () => { img.remove(); tile.classList.add('broken'); tile.innerHTML = icon('image') }
+    tile.appendChild(img)
+  } else {
+    tile.classList.add('broken'); tile.innerHTML = icon('image')
+  }
+  // Метка стиля (для schematic) — какая тема код-схемы на этом кандидате.
+  if (c.source === 'schematic' && c.style) {
+    const tag = document.createElement('span'); tag.className = 'enrCandTag'; tag.textContent = ENR_THEME_RU[c.style] || c.style
+    tile.appendChild(tag)
+  }
+  if (idx === v.chosen) { const ch = document.createElement('span'); ch.className = 'enrCandCheck'; ch.innerHTML = icon('check'); tile.appendChild(ch) }
+  tile.title = (idx === v.chosen ? 'Выбран' : 'Выбрать этот вариант')
+  tile.onclick = (e) => { e.stopPropagation(); enrichChooseCandidate(it.id, idx) }
+  return tile
+}
+
+// Подпись источника визуала под стрипом («схема · сравнение», «фото (ИИ)», «нет»).
+function enrichSrcCaption(it, v) {
+  const cap = document.createElement('div'); cap.className = 'enrSrcCap'
+  const dot = document.createElement('span'); dot.className = 'enrSrcDot src-' + v.source
+  const label = document.createElement('span'); label.className = 'enrSrcLbl'
+  let txt = ENR_SRC_RU[v.source] || v.source
+  if (v.source === 'schematic' && v.intent) txt += ' · ' + (ENR_INTENT_RU[v.intent] || v.intent)
+  label.textContent = txt
+  cap.appendChild(dot); cap.appendChild(label)
+  return cap
+}
+
+// Выбор кандидата (MONTAGE_V2 §3): мутируем payload.selected через ЦЕЛЕВОЙ
+// POST /api/enrich/select {id, idx} — сервер ставит selected И пересинхронизирует
+// плоские asset_kind/asset_path/source под выбранный вариант (именно он уходит в
+// рендер). Оптимистично показываем выбор; при сбое сети/HTTP откатываем.
+async function enrichChooseCandidate(id, idx) {
+  const it = enrichLocal(id); if (!it) return
+  const v = enrichVisual(it)
+  if (idx < 0 || idx >= v.candidates.length || idx === v.chosen) return
+  // idx — индекс в ФИЛЬТРОВАННОМ стрипе; серверу и payload.selected нужен
+  // индекс исходного массива кандидатов (orig_indices — карта соответствия).
+  const srvIdx = (v.orig_indices && Number.isInteger(v.orig_indices[idx])) ? v.orig_indices[idx] : idx
+  const prevSel = Number.isInteger(it.payload && it.payload.selected) ? it.payload.selected
+    : ((v.orig_indices && Number.isInteger(v.orig_indices[v.chosen])) ? v.orig_indices[v.chosen] : v.chosen)
+  it.payload = { ...(it.payload || {}), selected: srvIdx }
+  // Стрип следует за выбором (окно прокрутки центрируется на выбранном).
+  st.enrichCandPage[id] = Math.max(0, Math.min(idx, Math.max(0, v.candidates.length - 2)))
+  renderEnrich({ silent: true })
+  // Сериализация с debounce-сохранением правок: недописанные правки уходят
+  // ПЕРЕД select, иначе два конкурентных load-modify-write enrich.json на
+  // сервере молча затирают друг друга (lost update: откат выбора или потеря
+  // правки текста).
+  if (enrSaveTimer || enrPending.size) { clearTimeout(enrSaveTimer); enrSaveTimer = 0; await enrichFlushSave() }
+  let res
+  try {
+    res = await fetch('/api/enrich/select', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id, idx: srvIdx }),
+    })
+  } catch (e) {
+    it.payload = { ...(it.payload || {}), selected: prevSel }
+    renderEnrich({ silent: true })
+    toast('Сеть: не удалось выбрать вариант (' + e.message + ')', 'error')
+    return
+  }
+  if (!res.ok) {
+    it.payload = { ...(it.payload || {}), selected: prevSel }
+    renderEnrich({ silent: true })
+    await failToast(res, 'Не удалось выбрать вариант')
+    return
+  }
+  let j; try { j = await res.json() } catch { j = null }
+  if (j && Number.isInteger(j.selected)) it.payload.selected = j.selected
+  if (j && j.source) it.payload.source = j.source
+  // Полный GET — плоские поля/статусы соседей станут консистентны. Но если за
+  // время select появились НОВЫЕ несохранённые правки — не перерисовываем
+  // устаревшим снимком (снесло бы фокус/ввод юзера); их flush сам дообновит.
+  if (!enrPending.size && !enrSaveTimer) loadEnrichFromCache()
+}
+
+// Кнопки смены СТИЛЯ схемы (§2.4: minimal/neon/business/whiteboard). Выбор темы =
+// переключение готового кандидата-темы, если он есть (мгновенно, без перерендера),
+// иначе — запрос перерисовки через save (schematic_style); бэкенд дорендерит.
+function enrichStyleSwitch(it, v) {
+  const wrap = document.createElement('div'); wrap.className = 'enrEdit enrStyleEdit'
+  const lbl = document.createElement('div'); lbl.className = 'enrEditLbl muted'
+  lbl.textContent = 'Стиль схемы' + (v.intent ? ` (${ENR_INTENT_RU[v.intent] || v.intent})` : '')
+  wrap.appendChild(lbl)
+  const cur = v.schematic_style || (v.candidates[v.chosen] && v.candidates[v.chosen].style) || 'minimal'
+  const rowEl = document.createElement('div'); rowEl.className = 'enrStyleBtns' + ' ' + 'enrStyleBtns--' + cur
+  for (const th of ENR_THEMES) {
+    const b = document.createElement('button'); b.type = 'button'
+    b.className = 'enrStyleBtn st-' + th + (th === cur ? ' active' : '')
+    b.textContent = ENR_THEME_RU[th]
+    b.setAttribute('aria-pressed', String(th === cur))
+    b.title = 'Стиль ' + th
+    b.onclick = (e) => { e.stopPropagation(); enrichSetStyle(it.id, th) }
+    rowEl.appendChild(b)
+  }
+  wrap.appendChild(rowEl)
+  return wrap
+}
+
+// Редакторы текста по типу (раскрываемая секция «изменить» под мета).
+function enrichEditors(it) {
+  const p = it.payload || {}
+  const v = enrichVisual(it)
+  if (it.type === 'list_card') {
+    const wrap = document.createElement('div'); wrap.className = 'enrEdit'
+    // Заголовок карточки (§3 «редактирование полей: заголовок, строки»).
+    const tlbl = document.createElement('div'); tlbl.className = 'enrEditLbl muted'; tlbl.textContent = 'Заголовок'
+    const tin = document.createElement('input'); tin.type = 'text'; tin.className = 'search enrItemInput'
+    tin.value = p.title || ''; tin.maxLength = 48; tin.placeholder = 'без заголовка'
+    tin.setAttribute('aria-label', 'Заголовок карточки')
+    tin.onclick = (e) => e.stopPropagation()
+    tin.onchange = () => enrichEditPayload(it.id, { title: tin.value.trim() })
+    wrap.appendChild(tlbl); wrap.appendChild(tin)
+    const lbl = document.createElement('div'); lbl.className = 'enrEditLbl muted'; lbl.textContent = 'Пункты / строки'
+    wrap.appendChild(lbl)
+    ;(p.items || []).forEach((li, i) => {
+      const inp = document.createElement('input'); inp.type = 'text'; inp.className = 'search enrItemInput'
+      inp.value = li.text || ''; inp.maxLength = 60
+      inp.setAttribute('aria-label', `Пункт ${i + 1}`)
+      inp.onclick = (e) => e.stopPropagation()
+      inp.onchange = () => enrichEditCardItem(it.id, i, inp.value)
+      wrap.appendChild(inp)
+    })
+    // Карточка-перечисление может рендериться схематическим движком —
+    // тогда показываем переключатель стиля темы.
+    if (v.source === 'schematic') wrap.appendChild(enrichStyleSwitch(it, v))
+    return wrap
+  }
+  if (it.type === 'cta_comment') {
+    const wrap = document.createElement('div'); wrap.className = 'enrEdit'
+    const lbl = document.createElement('div'); lbl.className = 'enrEditLbl muted'; lbl.textContent = 'Вопрос в комментарии'
+    const ta = document.createElement('textarea'); ta.className = 'search enrQInput'; ta.rows = 2; ta.maxLength = 120
+    ta.value = p.question || ''
+    ta.setAttribute('aria-label', 'Текст вопроса для комментариев')
+    ta.onclick = (e) => e.stopPropagation()
+    ta.onchange = () => enrichEditPayload(it.id, { question: ta.value.trim() })
+    wrap.appendChild(lbl); wrap.appendChild(ta)
+    return wrap
+  }
+  if (it.type === 'image' || it.type === 'animation') {
+    const wrap = document.createElement('div'); wrap.className = 'enrEdit'
+    // schematic-картинка (код-схема) — переключатель стиля темы, не путь к файлу.
+    if (v.source === 'schematic') { wrap.appendChild(enrichStyleSwitch(it, v)); return wrap }
+    // Прочие источники (фото-сцена ИИ / сток / своя картинка) — ручная замена
+    // ассета своим файлом. Эмодзи-слоп как иллюстрация убран: только реальный
+    // путь к картинке (значки-эмодзи живут отдельным источником icon).
+    const lbl = document.createElement('div'); lbl.className = 'enrEditLbl muted'; lbl.textContent = 'Своя картинка'
+    const row = document.createElement('div'); row.className = 'routrow'
+    const inp = document.createElement('input'); inp.type = 'text'; inp.className = 'search'
+    inp.placeholder = 'путь к картинке (png, jpg, webp)'
+    inp.value = (p.asset_kind === 'user' || p.asset_kind === 'generate') ? (p.asset_path || '') : ''
+    inp.onclick = (e) => e.stopPropagation()
+    inp.onchange = () => enrichSetAsset(it.id, inp.value.trim())
+    const browse = document.createElement('button'); browse.className = 'btn'
+    browse.innerHTML = icon('folder-open'); browse.title = 'Выбрать папку — путь подставится, допишите имя файла'
+    browse.setAttribute('aria-label', 'Выбрать папку с ассетом')
+    browse.onclick = (e) => {
+      e.stopPropagation()
+      // Серверный пикер показывает папки (файлы-изображения он не индексирует) —
+      // подставляем путь папки с разделителем, юзер дописывает имя файла и Enter
+      // сохраняет (onchange инпута).
+      openFiles(true, (dir) => { if (dir) { inp.value = dir.replace(/[\\/]+$/, '') + '\\'; inp.focus() } })
+    }
+    row.appendChild(inp); row.appendChild(browse)
+    wrap.appendChild(lbl); wrap.appendChild(row)
+    const hint = document.createElement('div'); hint.className = 'hint muted'
+    hint.textContent = v.source === 'none'
+      ? 'Ассет не подобран. Перезапустите «Предложить монтаж» или впишите свой путь к картинке (Enter).'
+      : 'Полный путь к своей картинке — заменит выбранный вариант. Enter — сохранить.'
+    wrap.appendChild(hint)
+    return wrap
+  }
+  return null
+}
+
+// Сменить стиль код-схемы: если среди кандидатов есть готовый вариант этой темы
+// — просто выбрать его (мгновенно, через /api/enrich/select). Иначе записать
+// желаемый schematic_style (WHITELISTED плоское поле ImagePayload) — бэкенд
+// дорендерит при следующем проходе/рендере схемы.
+function enrichSetStyle(id, theme) {
+  const it = enrichLocal(id); if (!it) return
+  const v = enrichVisual(it)
+  const idx = v.candidates.findIndex((c) => c.source === 'schematic' && c.style === theme)
+  if (idx >= 0) { enrichChooseCandidate(id, idx); return }
+  it.payload = { ...(it.payload || {}), schematic_style: theme }
+  enrichQueueSave(id, { payload: { schematic_style: theme } })
+  toast('Стиль «' + theme + '» применится при следующем рендере схемы', 'info')
+  renderEnrich({ silent: true })
+}
+
+// --- мутации + save ---------------------------------------------------------
+let enrSaveTimer = 0
+const enrPending = new Map()   // id -> patch для debounced batch save
+function enrichQueueSave(id, patch) {
+  const prev = enrPending.get(id) || { id }
+  const merged = { ...prev, ...patch }
+  // payload вложенный — мержим на один уровень вглубь, иначе второй {payload:{…}}
+  // в одном окне debounce затирает первый (title vs items vs schematic_style).
+  if (prev.payload || patch.payload) {
+    merged.payload = { ...(prev.payload || {}), ...(patch.payload || {}) }
+  }
+  enrPending.set(id, merged)
+  clearTimeout(enrSaveTimer)
+  enrSaveTimer = setTimeout(enrichFlushSave, 350)
+}
+async function enrichFlushSave() {
+  enrSaveTimer = 0   // таймер отработал — сбросить маркер, чтобы чистый flush не держал beforeunload-гард
+  if (!enrPending.size) return
+  const items = [...enrPending.values()]
+  enrPending.clear()
+  // При сбое вернуть патчи в очередь через enrichQueueSave (тот же коалесинг +
+  // пере-взвод debounce), чтобы правки не потерялись, а повтор дописал их.
+  const requeue = () => { for (const it of items) enrichQueueSave(it.id, it) }
+  let res
+  try { res = await fetch('/api/enrich/save', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ items }) }) }
+  catch (e) { requeue(); toast('Сеть: не удалось сохранить правки монтажа (' + e.message + ') — повтор автоматически', 'error'); return }
+  if (!res.ok) { requeue(); await failToast(res, 'Не удалось сохранить правки монтажа'); return }
+  // POST /api/enrich/save возвращает ТОЛЬКО изменённые items ({ok, items}) —
+  // мержим их в локальный набор (санитизация/клампы/edited применяются), затем
+  // полный GET /api/enrich, чтобы перепланированные статусы соседей и баннер
+  // cutlist_changed стали видны сразу.
+  let j; try { j = await res.json() } catch { j = null }
+  if (j && Array.isArray(j.items)) enrichMergeSaved(j.items)
+  loadEnrichFromCache()
+}
+// Мерж частичного ответа save в st.enrichItems (обновить совпавшие id по месту,
+// дописать новые user-предложения), затем тихий re-render до полного GET.
+function enrichMergeSaved(saved) {
+  const byId = new Map(st.enrichItems.map((it) => [it.id, it]))
+  for (const s of saved) {
+    if (!s || !s.id) continue
+    const i = st.enrichItems.findIndex((it) => it.id === s.id)
+    if (i >= 0) st.enrichItems[i] = s
+    else if (!byId.has(s.id)) st.enrichItems.push(s)
+  }
+  renderEnrich({ silent: true })
+}
+
+function enrichLocal(id) { return st.enrichItems.find((it) => it.id === id) || null }
+
+function enrichSetEnabled(id, on) {
+  const it = enrichLocal(id); if (!it) return
+  it.enabled = !!on
+  // Локально — мгновенно (бейдж/счётчик/трек), на сервер — debounce.
+  const row = $(`.enr-row[data-id="${CSS.escape(id)}"]`)
+  if (row) row.classList.toggle('off', !on)
+  updateTabBadge('enrich', enrichEnabledCount())
+  const cnt = $('#enrichCount'); if (cnt) cnt.textContent = `Включено ${enrichEnabledCount()} из ${st.enrichItems.length}`
+  updateEnrichRenderCheckbox(); updateEnrichTrack()
+  enrichQueueSave(id, { enabled: !!on })
+}
+
+function enrichShift(id, delta) {
+  const it = enrichLocal(id); if (!it) return
+  const dur = Math.max(0.1, (it.t_end || 0) - (it.t_start || 0))
+  let t0 = Math.max(0, Math.min((it.t_start || 0) + delta, st.duration - dur))
+  t0 = round(t0)
+  it.t_start = t0; it.t_end = round(t0 + dur)
+  // Перерисуем строку (таймкод + превью-кадр в новом t) и трек.
+  enrichQueueSave(id, { t_start: it.t_start, t_end: it.t_end })
+  renderEnrich({ silent: true })
+}
+
+function enrichEditCardItem(id, idx, text) {
+  const it = enrichLocal(id); if (!it || !it.payload) return
+  const items = (it.payload.items || []).map((li) => ({ ...li }))
+  if (!items[idx]) return
+  items[idx].text = text
+  it.payload = { ...it.payload, items }
+  enrichQueueSave(id, { payload: { items } })
+  renderEnrich({ silent: true })
+}
+
+function enrichEditPayload(id, patch) {
+  const it = enrichLocal(id); if (!it) return
+  it.payload = { ...(it.payload || {}), ...patch }
+  enrichQueueSave(id, { payload: patch })
+  renderEnrich({ silent: true })
+}
+
+// «Заменить ассет» своей картинкой: путь → asset_kind=user (источник stock).
+// Эмодзи-как-иллюстрация убран (§1: значки только для явного icon, не фолбэк).
+// Чистим candidates/selected, чтобы файл юзера победил сгенерированные варианты
+// (enrichVisual падёт на плоский шим и покажет именно его файл).
+function enrichSetAsset(id, val) {
+  const it = enrichLocal(id); if (!it) return
+  let patch
+  if (!val) {
+    patch = { asset_kind: 'none', asset_path: '', emoji: '', candidates: [], selected: 0 }
+  } else {
+    patch = { asset_kind: 'user', asset_path: val, emoji: '', candidates: [], selected: 0 }
+  }
+  enrichEditPayload(id, patch)
+}
+
+// --- активная карточка + хоткеи j/k/e/Enter ---------------------------------
+function enrichSetActive(id) {
+  st.enrichActive = id || null
+  for (const row of document.querySelectorAll('.enr-row')) row.classList.toggle('sel', row.dataset.id === st.enrichActive)
+  const row = id && $(`.enr-row[data-id="${CSS.escape(id)}"]`)
+  if (row) row.scrollIntoView({ block: 'nearest' })
+}
+function enrichVisibleIds() {
+  return [...document.querySelectorAll('.enr-row')].map((r) => r.dataset.id)
+}
+function enrichNav(dir) {
+  const ids = enrichVisibleIds(); if (!ids.length) return
+  let i = st.enrichActive ? ids.indexOf(st.enrichActive) : -1
+  i = Math.max(0, Math.min(ids.length - 1, i + dir))
+  if (i < 0) i = 0
+  enrichSetActive(ids[i])
+}
+function enrichToggleActive() {
+  if (!st.enrichActive) { enrichNav(1); return }
+  const it = enrichLocal(st.enrichActive); if (!it) return
+  enrichSetEnabled(it.id, !it.enabled)
+  const cb = $(`.enr-row[data-id="${CSS.escape(it.id)}"] .enrTgl input`); if (cb) cb.checked = it.enabled
+}
+function enrichPreviewActive() { const it = enrichLocal(st.enrichActive); if (it) enrichPreview(it) }
+
+// ▶ ЧЕСТНОЕ превью предложения (§3): РЕАЛЬНЫЙ кадр выбранного кандидата
+// (отрендеренный PNG schematic/diffusion) поверх ОСНОВНОГО плеера + seek+play
+// на окно предложения, авто-стоп на t_end (clipsPreview-паттерн). CSS-мокап
+// удалён — превью = тот же ассет, что уйдёт в рендер.
+function enrichPreview(it) {
+  if (!video) return
+  enrichSetActive(it.id)
+  st._enrPreviewItem = it
+  st._enrPreviewEnd = it.t_end
+  enrichShowOverlay(it)
+  st._clipPrevPreview = st.preview
+  st.preview = true
+  const skip = $('#skipCuts'); if (skip) skip.checked = true
+  seek(Math.max(0, (it.t_start || 0)))
+  video.play()
+}
+// Оверлей-превью = РЕАЛЬНЫЙ PNG выбранного кандидата (или честная плашка «нет
+// ассета», если иллюстрировать нечего). Позиционирование PiP — по payload
+// (как в рендере: угол + ширина); полнокадровые схемы — на весь оверлей.
+function enrichShowOverlay(it) {
+  const el = $('#enrichOverlay'); if (!el) return
+  el.replaceChildren()
+  const v = enrichVisual(it)
+  const chosen = v.candidates[v.chosen] || v.candidates[0]
+  const src = chosen ? enrichPreviewSrc(chosen.preview) : ''
+  if (!src) {
+    // Лучше честно «нет», чем CSS-мокап-лажа.
+    const none = document.createElement('div'); none.className = 'enrOverNone'
+    none.innerHTML = icon('image') + '<span>' + (v.source === 'none' ? 'нечего иллюстрировать' : 'вариант ещё не готов — нажмите «Предложить монтаж»') + '</span>'
+    el.appendChild(none)
+    el.classList.remove('hidden')
+    return
+  }
+  const p = it.payload || {}
+  const img = document.createElement('img'); img.className = 'enrOverImg'
+  img.src = src; img.alt = 'Превью кадра'
+  img.onerror = () => { img.remove(); const n = document.createElement('div'); n.className = 'enrOverNone'; n.innerHTML = icon('image') + '<span>ассет недоступен</span>'; el.appendChild(n) }
+  // image/animation = PiP в углу; list_card/схемы = крупно (cut-out со сдвигом
+  // вправо под talking-head слева, как в эталонных кадрах §2).
+  if (it.type === 'image' || it.type === 'animation') {
+    img.classList.add('pip')
+    img.classList.add(p.position === 'top_left' ? 'tl' : 'tr')
+    img.style.width = Math.round((p.width_frac || 0.3) * 100) + '%'
+  } else {
+    img.classList.add('full')
+  }
+  el.appendChild(img)
+  el.classList.remove('hidden')
+}
+// V2: превью = готовый PNG (текст/пункты уже впечатаны движком), CSS-караоке
+// больше не нужно. Хук оставлен пустым для совместимости вызова из onFrame.
+function enrichUpdateOverlayKaraoke() { /* honest PNG preview — no CSS karaoke */ }
+function enrichHideOverlay() {
+  const el = $('#enrichOverlay'); if (el) { el.classList.add('hidden'); el.replaceChildren() }
+  st._enrPreviewItem = null; st._enrPreviewEnd = null
+}
+// Полное завершение ▶-превью (идемпотентно): снять мокап + вернуть прежний
+// режим «пропускать вырезы». Зовётся из onFrame (авто-стоп) и из pause-события.
+function enrichEndPreview() {
+  if (!st._enrPreviewItem && st._enrPreviewEnd == null) return
+  enrichHideOverlay()
+  if (!st.afterMode) {
+    st.preview = !!st._clipPrevPreview
+    const sk = $('#skipCuts'); if (sk) sk.checked = st.preview
+  }
+}
+
+// --- тонкая дорожка enrich-маркеров на таймлайне ----------------------------
+function updateEnrichTrack() {
+  const track = $('#enrichTrack'); if (!track) return
+  const items = st.enrichItems.filter((it) => it.enabled)
+  track.classList.toggle('hidden', !items.length || !st.duration)
+  track.replaceChildren()
+  if (!items.length || !st.duration) return
+  for (const it of items) {
+    const a = Math.max(0, (it.t_start || 0)) / st.duration
+    const w = Math.max(0.004, ((it.t_end || 0) - (it.t_start || 0)) / st.duration)
+    const m = document.createElement('div')
+    m.className = 'enrTick ' + ENR_GROUP_CLASS[ENR_GROUP(it.type)]
+    m.style.left = (a * 100) + '%'; m.style.width = (w * 100) + '%'
+    m.title = `${ENR_TYPE_RU[it.type] || it.type} · ${fmt(it.t_start)}`
+    m.onclick = () => { setActiveTab('enrich'); enrichSetActive(it.id); seek(it.t_start || 0) }
+    track.appendChild(m)
+  }
+}
+
+// --- интеграция с рендер- и автопак-модалками -------------------------------
+function updateEnrichRenderCheckbox() {
+  const lbl = $('#rEnrichCount')
+  const n = enrichRenderable()
+  if (lbl) lbl.textContent = n ? `(${n} включённых)` : '(нет включённых)'
+  const cb = $('#rEnrich')
+  // Нет ни одного применимого предложения — чекбокс бессмыслен (но не прячем,
+  // чтобы юзер видел, что фича есть).
+  if (cb) { cb.disabled = !n; if (!n) cb.checked = false }
+}
+
+// --- модалка запуска «Предложить монтаж» ------------------------------------
+const ENR_TYPE_IDS = { image: '#enType_image', animation: '#enType_animation', list_card: '#enType_list_card', cta: '#enType_cta' }
+function seedEnrichModal() {
+  const o = st.enrichOpts || st.enrichParams || {}
+  const types = (o.types && typeof o.types === 'object') ? o.types : {}
+  // params.types ключи: image/animation/list_card/cta (cta объединяет cta_*).
+  $('#enType_image').checked = types.image !== false
+  $('#enType_animation').checked = types.animation !== false
+  $('#enType_list_card').checked = types.list_card !== false
+  $('#enType_cta').checked = types.cta !== false
+  $('#enDensity').value = ['min', 'normal', 'aggressive'].includes(o.density) ? o.density : 'normal'
+  // V2-движки: предпочитаем новое поле o.sources; для старых params восстанавливаем
+  // из легаси image_source (auto→авто-роутер; generate→схемы+фото; user_folder→сток).
+  const srcs = (o.sources && typeof o.sources === 'object') ? o.sources : null
+  const legacy = o.image_source
+  const auto = srcs ? srcs.auto !== false : (legacy === 'auto' || legacy == null)
+  $('#enSrcAuto').checked = auto
+  $('#enSrcSchematic').checked = srcs ? srcs.schematic !== false : (legacy !== 'user_folder')
+  $('#enSrcDiffusion').checked = srcs ? !!srcs.diffusion : (legacy === 'auto' || legacy === 'generate' || legacy == null)
+  $('#enSrcStock').checked = srcs ? !!srcs.stock : (legacy === 'user_folder')
+  $('#enUserFolder').value = o.user_folder || ''
+  // vision-роутер: дефолт приходит с бэкенда (там он берётся из config.yaml),
+  // пер-запусковый выбор юзера побеждает.
+  $('#enVision').checked = !!o.vision
+  enrichToggleUserFolder()
+  const off = !st.llmReady
+  $('#enrichModalLlm').classList.toggle('hidden', !off)
+  $('#btnEnrichRun').disabled = off
+}
+// Состояние источников из чекбоксов модалки (с учётом авто-роутера).
+function enrichSourcesState() {
+  const auto = $('#enSrcAuto').checked
+  // В авто-режиме движки управляются роутером, но чекбоксы остаются как «разрешения».
+  return {
+    auto,
+    schematic: $('#enSrcSchematic').checked,
+    diffusion: $('#enSrcDiffusion').checked,
+    stock: $('#enSrcStock').checked,
+  }
+}
+function enrichToggleUserFolder() {
+  const s = enrichSourcesState()
+  // Под-набор движков активен и читаем всегда, но в авто-режиме это лишь «разрешения».
+  $('#enSrcSub').classList.toggle('autoOn', s.auto)
+  // Папка-сток показывается, когда сток разрешён.
+  $('#enUserFolderRow').classList.toggle('hidden', !s.stock)
+  // Движок фото-сцен (диффузия) разрешён → инфо про ~4 ГБ модель; если SD не
+  // настроена → честный warning, что фото-сцены пропускаются.
+  const usesGen = s.diffusion
+  $('#enGenInfoRow').classList.toggle('hidden', !(usesGen && st.imagegenReady))
+  $('#enGenWarnRow').classList.toggle('hidden', !(usesGen && !st.imagegenReady))
+}
+// Свести V2-источники к легаси image_source — ЕДИНСТВЕННОМУ ключу, который
+// сервер реально белосписочит (_sanitize_enrich_opts: auto/emoji/user_folder/
+// generate; ключ sources он игнорирует). Критично: выключенные «Фото-сцены
+// (ИИ)» ОБЯЗАНЫ давать значение без SD (emoji/user_folder), иначе сервер
+// запустит генерацию (~4 ГБ модель, минуты GPU) вопреки явному запрету юзера.
+// Схемы image_source не гейтит — schematic-кандидаты строятся при любом значении.
+function enrichLegacyImageSource(s) {
+  if (!s.diffusion) return s.stock ? 'user_folder' : 'emoji'
+  if (s.auto || s.stock) return 'auto'
+  return 'generate'
+}
+function openEnrichModal() {
+  if (!st.hasSession) return
+  if (!st.words.length) { toast('Сначала транскрибируйте ролик — анализировать нечего', 'info'); return }
+  // Вырезы (детект) для анализа желательны, но сервер сам ответит 409, если их
+  // нет — не дублируем гард на фронте.
+  seedEnrichModal()
+  openOverlay('#enrichModal')
+}
+async function runEnrichSuggest() {
+  if (st.task) { toast('Дождитесь завершения текущей задачи', 'info'); return }
+  if (!st.llmReady) { toast('ИИ выключен (Ollama не найдена) — монтаж недоступен', 'info'); return }
+  const sources = enrichSourcesState()
+  const body = {
+    types: {
+      image: $('#enType_image').checked,
+      animation: $('#enType_animation').checked,
+      list_card: $('#enType_list_card').checked,
+      cta: $('#enType_cta').checked,
+    },
+    density: $('#enDensity').value,
+    // V2-движки (новый бэкенд читает sources/router); image_source — легаси-щит
+    // для текущего сервера, выводится из тех же чекбоксов.
+    sources,
+    image_source: enrichLegacyImageSource(sources),
+    user_folder: $('#enUserFolder').value.trim(),
+    vision: $('#enVision').checked,
+  }
+  closeOverlay('#enrichModal')
+  setActiveTab('enrich')
+  await save()   // зафиксировать несохранённые правки вырезов: анализ идёт по катлисту
+  let res
+  try { res = await fetch('/api/enrich/suggest', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }) }
+  catch (e) { toast('Сеть: не удалось запустить монтаж (' + e.message + ')', 'error'); return }
+  if (!res.ok) { await failToast(res, 'Не удалось запустить монтаж'); return }
+  let j; try { j = await res.json() } catch { j = {} }
+  if (j && j.ok === false && j.reason === 'llm_off') { toast('ИИ выключен — монтаж недоступен', 'info'); return }
+  followTask('enrich')
+}
+
+// --- bulk-меню --------------------------------------------------------------
+function toggleEnrichBulkMenu(force) {
+  const menu = $('#enrichBulkMenu'); const btn = $('#btnEnrichBulk'); if (!menu) return
+  const show = force != null ? force : menu.classList.contains('hidden')
+  if (show && !st.enrichItems.length) { toast('Сначала «Предложить монтаж»', 'info'); return }
+  menu.classList.toggle('hidden', !show)
+  if (btn) btn.setAttribute('aria-expanded', String(show))
+  if (show) renderEnrichBulkMenu()
+}
+function renderEnrichBulkMenu() {
+  const menu = $('#enrichBulkMenu'); if (!menu) return
+  menu.replaceChildren()
+  const mk = (label, fn) => {
+    const b = document.createElement('button'); b.type = 'button'; b.className = 'enrBulkItem'; b.setAttribute('role', 'menuitem')
+    b.textContent = label
+    // После выполнения пункт удаляется (replaceChildren) — фокус вернём на
+    // кнопку-триггер, иначе у клавиатурного юзера он провалится в <body>.
+    b.onclick = () => { fn(); toggleEnrichBulkMenu(false); const bb = $('#btnEnrichBulk'); if (bb) bb.focus() }
+    menu.appendChild(b)
+  }
+  mk('Включить всё', () => enrichBulk(() => true))
+  mk('Только уверенные (оценка ≥ 70)', () => enrichBulk((it) => (it.score || 0) >= 70))
+  mk('Выключить всё', () => enrichBulk(() => false))
+  // Выключить по типу — только присутствующие группы.
+  const present = new Set(st.enrichItems.map((it) => ENR_GROUP(it.type)))
+  for (const g of ['image', 'animation', 'list_card', 'cta']) {
+    if (present.has(g)) mk(`Выключить: ${ENR_GROUP_RU[g]}`, () => enrichBulk((it) => ENR_GROUP(it.type) === g ? false : it.enabled))
+  }
+  mk('Сбросить (как предложил ИИ)', () => enrichResetToServer())
+}
+// Применить решение функцией к каждому предложению; одна batch-сохранялка.
+function enrichBulk(decide) {
+  const patches = []
+  for (const it of st.enrichItems) {
+    const on = !!decide(it)
+    if (on !== it.enabled) { it.enabled = on; patches.push({ id: it.id, enabled: on }) }
+  }
+  if (!patches.length) { renderEnrich({ silent: true }); return }
+  renderEnrich({ silent: true })
+  enrichSaveBatch(patches)
+}
+async function enrichSaveBatch(items) {
+  let res
+  try { res = await fetch('/api/enrich/save', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ items }) }) }
+  catch (e) { toast('Сеть: не удалось сохранить (' + e.message + ')', 'error'); return }
+  if (!res.ok) { await failToast(res, 'Не удалось сохранить'); return }
+  // {ok, items}: только изменённые — мерж + полный GET (как enrichFlushSave).
+  let j; try { j = await res.json() } catch { j = null }
+  if (j && Array.isArray(j.items)) enrichMergeSaved(j.items)
+  loadEnrichFromCache()
+}
+// «Сбросить»: вернуть enabled, как предложил планировщик (status ok → on).
+function enrichResetToServer() {
+  enrichBulk((it) => (it.status === 'ok' || !it.status))
+}
+
 /* ---------- modal / overlay management (a11y) ---------- */
 let lastFocus = null
-const OVERLAY_IDS = ['#help', '#results', '#files', '#renderModal', '#queueModal', '#privacyModal', '#modelsModal', '#clipsModal', '#detectModal', '#autopackModal']
+const OVERLAY_IDS = ['#help', '#results', '#files', '#renderModal', '#queueModal', '#privacyModal', '#modelsModal', '#clipsModal', '#detectModal', '#autopackModal', '#enrichModal']
 function openOverlay(id) {
   const ov = $(id); if (!ov) return
   lastFocus = document.activeElement
@@ -3014,12 +4240,12 @@ function trapTab(e, ov) {
 
 /* ---------- search ---------- */
 function doSearch(q) {
-  q = q.trim().toLowerCase()
+  q = dictKey(q.trim())   // #70: фолд ё→е + lowercase, как в дедупе словаря — «еще» находит «ещё»
   if (!virtOn) {
     let first = null
     const spans = st.spans || (st.spans = $('#transcript').querySelectorAll('.w'))
     for (const sp of spans) {
-      const hit = q && sp.textContent.toLowerCase().includes(q)
+      const hit = q && dictKey(sp.textContent).includes(q)
       sp.classList.toggle('match', hit); if (hit && !first) first = sp
     }
     if (first) first.scrollIntoView({ block: 'center' })
@@ -3030,7 +4256,7 @@ function doSearch(q) {
   virtMatches = q ? new Set() : null
   let firstIdx = -1
   if (q) for (const w of st.words) {
-    if (w.word.toLowerCase().includes(q)) { virtMatches.add(w.i); if (firstIdx < 0) firstIdx = w.i }
+    if (dictKey(w.word).includes(q)) { virtMatches.add(w.i); if (firstIdx < 0) firstIdx = w.i }
   }
   forEachShownSpan((sp) => { sp.classList.toggle('match', !!(virtMatches && virtMatches.has(+sp.dataset.i))) })
   if (firstIdx >= 0) {
@@ -3057,6 +4283,9 @@ function bindUI() {
   $('#btnCloseRender').onclick = () => closeOverlay('#renderModal')
   $('#btnCancelRender').onclick = () => closeOverlay('#renderModal')
   $('#btnDoRender').onclick = submitRender
+  // Кнопка «Сбросить» настройки рендера к умолчаниям (mirror btnDetectReset).
+  // Guarded: элемента может ещё не быть в index.html — тогда просто нет кнопки.
+  { const brr = $('#btnRenderReset'); if (brr) brr.onclick = () => { seedRenderModal(); flash('Настройки рендера сброшены к умолчаниям') } }
   if ($('#btnExportNle')) $('#btnExportNle').onclick = exportNle
   $('#rEncoder').onchange = (e) => seedQuality(e.target.value, null)
   $('#rQuality').oninput = (e) => $('#rQualVal').textContent = `${qualLabel($('#rEncoder').value)} ${e.target.value}`
@@ -3136,9 +4365,41 @@ function bindUI() {
     $('#clipsModal').classList.add('hidden')
     openFiles(true, (dir) => { if (dir) $('#cOutDir').value = dir; openOverlay('#clipsModal') })
   }
+  // P4 — авто-обогащение: вкладка «Монтаж» + модалка запуска + bulk
+  $('#btnEnrichSuggest').onclick = openEnrichModal
+  $('#btnEnrichBulk').onclick = () => toggleEnrichBulkMenu()
+  $('#btnCloseEnrich').onclick = () => closeOverlay('#enrichModal')
+  $('#btnEnrichCancel').onclick = () => closeOverlay('#enrichModal')
+  $('#btnEnrichRun').onclick = runEnrichSuggest
+  // V2-движки: любой из чекбоксов источников меняет видимость папки-стока/инфо.
+  for (const id of ['#enSrcAuto', '#enSrcSchematic', '#enSrcDiffusion', '#enSrcStock']) {
+    const el = $(id); if (el) el.onchange = enrichToggleUserFolder
+  }
+  $('#btnEnPickFolder').onclick = () => {
+    $('#enrichModal').classList.add('hidden')
+    openFiles(true, (dir) => { if (dir) $('#enUserFolder').value = dir; openOverlay('#enrichModal') })
+  }
+  // Клик вне bulk-меню — закрыть (как нативный popup).
+  document.addEventListener('click', (e) => {
+    const menu = $('#enrichBulkMenu')
+    if (menu && !menu.classList.contains('hidden')
+        && !e.target.closest('#enrichBulkMenu') && !e.target.closest('#btnEnrichBulk')) {
+      toggleEnrichBulkMenu(false)
+    }
+  })
   for (const el of document.querySelectorAll('.metaCopyBtn')) { el.onclick = () => copyField(el.dataset.field) }
   $('#btnMetaCopyAll').onclick = copyAllMeta
   $('#metaTitle').addEventListener('input', () => { const l = $('#metaTitleLen'); const t = ($('#metaTitle').textContent || '').trim(); if (l) l.textContent = t ? `(${t.length}/100)` : '' })
+  // #36: чистая вставка (без rich-HTML) + флаг «есть ручные правки меты» для beforeunload.
+  for (const sel of ['#metaTitle', '#metaDesc', '#metaTags', '#metaHook']) {
+    const el = $(sel); if (!el) continue
+    el.addEventListener('paste', (e) => {
+      e.preventDefault()
+      const txt = (e.clipboardData || window.clipboardData).getData('text/plain')
+      document.execCommand('insertText', false, txt)
+    })
+    el.addEventListener('input', () => { st.metaDirty = true })
+  }
   $('#btnPrevCut').onclick = prevCut
   $('#btnNextCut').onclick = nextCut
   $('#btnSplit').onclick = () => {
@@ -3235,7 +4496,17 @@ function bindKeys() {
     else if (k === 'o' || k === 'щ') { st.outP = video.currentTime; flash(`метка O: ${fmt(st.outP)}`) }
     else if (k === 'm' || k === 'ь') cutFromMarks()
     else if (k === 'x' || k === 'ч') cutSelection()
-    else if (k === 'Enter') { if (st.selected) toggleEnabled(st.selected) }
+    else if (k === 'Enter') {
+      // P4: на вкладке «Монтаж» Enter — превью активной карточки (Linear-паттерн).
+      if (activeTab === 'enrich' && st.enrichActive) { e.preventDefault(); enrichPreviewActive() }
+      else if (st.selected) {
+        // Фокус на кнопке/ссылке — Enter принадлежит этому контролу (его нативный
+        // click), а не глобальному тумблеру: иначе двойное действие (#69).
+        const ae2 = document.activeElement
+        if (ae2 && (ae2.tagName === 'BUTTON' || ae2.tagName === 'A')) return
+        toggleEnabled(st.selected)
+      }
+    }
     else if (k === 'c' || k === 'с') { if (st.selected) cycleAction(st.selected) }
     else if (k === 'Delete' || k === 'Backspace') {
       // Выделенный текст транскрипта → вырез (как ✂/X); гарды те же, что у X:
@@ -3259,8 +4530,21 @@ function bindKeys() {
     else if (k === '2') setActiveTab('chapters')
     else if (k === '3') setActiveTab('meta')
     else if (k === '4') setActiveTab('clips')
+    else if (k === '5') setActiveTab('enrich')
+    // P4 — навигация по карточкам «Монтаж» работает только на активной вкладке.
+    else if ((k === 'j' || k === 'о') && activeTab === 'enrich') { e.preventDefault(); enrichNav(1) }
+    else if ((k === 'k' || k === 'л') && activeTab === 'enrich') { e.preventDefault(); enrichNav(-1) }
+    else if ((k === 'e' || k === 'у') && activeTab === 'enrich') { e.preventDefault(); enrichToggleActive() }
     else if (k === '?' || k === 'h') openOverlay('#help')
     else if (k === 'Escape') {
+      // P4: открытое bulk-меню «Действия» (role=menu) Esc закрывает первым —
+      // фокус возвращается на кнопку-триггер, выбор карточки/выреза не трогаем.
+      const bulk = $('#enrichBulkMenu')
+      if (bulk && !bulk.classList.contains('hidden')) {
+        e.preventDefault(); toggleEnrichBulkMenu(false)
+        const bb = $('#btnEnrichBulk'); if (bb) bb.focus()
+        return
+      }
       // F7: активная правка границ клипа — Esc сначала выходит из неё (без
       // сохранения), не сбрасывая выбор выреза/карточки.
       if (st.clipEdit) { clipEditCancel(); return }
@@ -3434,15 +4718,14 @@ async function openQueueModal() {
 
 // Текущие настройки рендера для постановки клипа в очередь: дефолты + текущая папка вывода.
 function currentRenderOpts() {
-  const d = st.rdefaults || {}
-  return {
-    encoder: d.encoder || 'nvenc',
-    quality: (d.quality != null) ? d.quality : null,
-    audio_bitrate: d.audio_bitrate || '320k',
-    censor_method: d.censor_method || 'partial',
-    subtitles: true, chapters: true,
-    out_dir: st.outDir || '',
-  }
+  // Постановка в очередь должна вести себя как ручной рендер: берём ПОЛНЫЙ набор
+  // из полей модалки рендера (collectRenderOpts), засеяв их дефолтами сессии,
+  // если модалку в этой сессии ни разу не открывали (паттерн openAutopackModal).
+  // Убираем только per-file filename — сервер подставит basename каждого входа.
+  if (!st._rSeeded) seedRenderModal()
+  const o = collectRenderOpts()
+  delete o.filename
+  return o
 }
 
 async function queuePost(url, body) {
@@ -3483,8 +4766,13 @@ async function stopQueue() {
 }
 
 async function clearQueue() {
-  const r = await queuePost('/api/queue/clear', {})
-  if (r && r.ok) { if (r.removed) toast(`Удалено заданий: ${r.removed}`, 'info'); loadQueueList() }
+  // «Очистить завершённые» — чистим ТОЛЬКО завершённые задания (done/error);
+  // ожидающие задания (например, поставленные на ночной прогон) не трогаем.
+  const r = await queuePost('/api/queue/clear', { statuses: ['done', 'error'] })
+  if (r && r.ok) {
+    toast(r.removed ? `Очищено завершённых: ${r.removed}` : 'Завершённых заданий нет', 'info')
+    loadQueueList()
+  }
 }
 
 async function removeQueueJob(id) {
@@ -3495,7 +4783,20 @@ async function removeQueueJob(id) {
 async function loadQueueList() {
   let j
   try { const res = await fetch('/api/queue'); if (!res.ok) throw new Error('HTTP ' + res.status); j = await res.json() }
-  catch (e) { toast('Не удалось загрузить очередь: ' + e.message, 'error'); return }
+  catch (e) {
+    // Опрос идёт каждые 1.5с: не заливать тостами. Первые сбои глотаем молча,
+    // после 3-го — останавливаем опрос и показываем ОДИН sticky-тост. Ручной
+    // вызов (без активного таймера) по-прежнему тостит сразу, как раньше.
+    st.queuePollFails = (st.queuePollFails || 0) + 1
+    if (st.queuePollTimer && st.queuePollFails >= 3) {
+      stopQueuePoll()
+      toast('Очередь недоступна — опрос остановлен (' + e.message + '). Перезапустите сервер и обновите страницу.', 'error')
+    } else if (!st.queuePollTimer) {
+      toast('Не удалось загрузить очередь: ' + e.message, 'error')
+    }
+    return
+  }
+  st.queuePollFails = 0
   st.queueJobs = j.jobs || []
   st.queueRunning = !!j.running
   renderQueueList()
